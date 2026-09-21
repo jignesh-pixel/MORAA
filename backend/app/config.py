@@ -72,30 +72,29 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     ANTHROPIC_API_KEY: str = ""
 
+    # Google Gemini (Primary AI)
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    GEMINI_MODEL: str = "gemini-2.5-flash"
+
     # --- Model Settings ---
-    # Model name for Gemini API (e.g. "gemini-1.5-flash", "gemini-1.5-pro")
-    GEMINI_MODEL: str = "gemini-1.5-flash"
     # Model name for OpenAI Vision API (e.g. "gpt-4o", "gpt-4o-mini")
     OPENAI_MODEL: str = "gpt-4o-mini"
 
     # --- Image Generation ---
+
     # Primary provider for image generation.
-    # Options: "gemini", "openai"
-    # ChatGPT image generation (OpenAI gpt-image-1) is PRIMARY; it accepts
-    # the uploaded reference image via /v1/images/edits for product
-    # preservation. Gemini is the automatic fallback on recoverable failures.
-    PRIMARY_IMAGE_PROVIDER: str = "openai"
+    PRIMARY_IMAGE_PROVIDER: str = "gemini"
 
     # Fallback provider for image generation if primary fails.
     # Options: "gemini", "openai"
-    FALLBACK_IMAGE_PROVIDER: str = "gemini"
+    FALLBACK_IMAGE_PROVIDER: str = "openai"
 
     # Model name for Gemini image generation. Default is the current
     # generation image model ("gemini-3.1-flash-image" / Nano Banana 2),
     # which delivers significantly better reference-image fidelity than the
     # deprecated "gemini-2.5-flash-image" (Nano Banana v1). Must support
     # image output via generate_content with response_modalities=["IMAGE"].
-    GEMINI_IMAGE_MODEL: str = "gemini-3.1-flash-image"
+    GEMINI_IMAGE_MODEL: str = "gemini-2.5-flash-image"
 
     # Model name for OpenAI image generation. Default "gpt-image-1" is the
     # ChatGPT image model — it supports reference-image editing
@@ -103,6 +102,13 @@ class Settings(BaseSettings):
     # the uploaded product. "dall-e-3" remains available via env override
     # (text-to-image only, reference image ignored).
     OPENAI_IMAGE_MODEL: str = "gpt-image-1"
+
+    # Operator-facing startup probe: when True, the backend verifies once at
+    # boot (once per process) that the configured Gemini image model is
+    # actually accessible and logs an actionable diagnosis when it is not
+    # (see app/services/gemini_diagnostics.py). Never blocks startup and
+    # stays off by default so tests/dev never issue billable probes.
+    IMAGE_PROVIDER_STARTUP_DIAGNOSTICS: bool = False
 
     # --- Prompt Fusion Intelligence Engine (PFIE) — DISABLED ---
     # Prompt Fusion is no longer used: the final image-generation prompt

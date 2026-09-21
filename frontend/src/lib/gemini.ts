@@ -49,7 +49,7 @@ export function getGeminiClient(): GoogleGenAI {
     );
   }
 
-  _client = new GoogleGenAI({ apiKey });
+  _client = new GoogleGenAI({ apiKey, apiVersion: 'v1beta' });
   return _client;
 }
 

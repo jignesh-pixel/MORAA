@@ -9,9 +9,9 @@
  * gemini-3.6-flash supports vision (image) input via inlineData.
  */
 export const SUPPORTED_GEMINI_MODELS = {
-  VISION: "gemini-3.6-flash",
-  FAST: "gemini-3.5-flash-lite",
-  POWERFUL: "gemini-3.1-pro-preview",
+  VISION: "gemini-2.5-flash",
+  FAST: "gemini-2.5-flash-lite",
+  POWERFUL: "gemini-2.5-pro",
 } as const;
 
 export type GeminiModelName = (typeof SUPPORTED_GEMINI_MODELS)[keyof typeof SUPPORTED_GEMINI_MODELS];
