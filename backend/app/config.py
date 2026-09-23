@@ -1,10 +1,15 @@
 """Application configuration management using Pydantic v2 Settings."""
 
+import logging
 import os
+import secrets
 from pathlib import Path
 from typing import List, Optional
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_config_logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -32,7 +37,11 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "sqlite:///./data/moraa_gemvision.db"
 
     # JWT Authentication
-    SECRET_KEY: str = "moraa-gemvision-super-secret-key-change-in-production"
+    # No hardcoded default — set via SECRET_KEY in the environment/.env for
+    # production so JWTs stay valid across restarts and multiple workers. If
+    # unset, a random per-process key is generated (see _default_secret_key
+    # below) so the app never ships a known, guessable secret.
+    SECRET_KEY: Optional[str] = None
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
@@ -170,14 +179,20 @@ class Settings(BaseSettings):
     # generates conversational replies — it returns strict JSON only.
     ONBOARDING_PARSER_MODEL: str = "gemini-1.5-flash"
 
+    # Cost safety net for the onboarding parser above (audit: paid Gemini
+    # call per registration message, no cap). Only matters once
+    # ENABLE_ONBOARDING_GATE is turned on -- defaults are generous so
+    # nothing changes for existing behavior until someone lowers them.
+    ONBOARDING_PARSER_MAX_CALLS_PER_DAY: int = 500
+    ONBOARDING_PARSER_QUOTA_COOLDOWN_SECONDS: int = 300
+
     # --- Wallet gate (Scenarios 2, 3 and 4) ---
-    # When False (DEFAULT) the image pipeline behaves EXACTLY as before:
-    # every inbound image is stored and style-selection buttons are sent,
-    # with no wallet checks, no batching limits and no AI pre-validation.
-    # When True the paid journey is active: registered customers are gated on
-    # their wallet balance, extra images are held as 'pending_payment' and
-    # funded images are quality-checked before any credits are spent.
-    ENABLE_WALLET_GATE: bool = False
+    # The wallet-balance gate in app/api/routes/meta_webhook.py is always
+    # active (there is no toggle for it) — every inbound image is checked
+    # against the customer's wallet balance before it is processed. A
+    # previous ENABLE_WALLET_GATE flag was removed here because it gated
+    # nothing (the live webhook route never read it) and its presence
+    # falsely implied wallet checks could be switched off.
 
     # Price charged per generated image, in whole Indian Rupees.
     WALLET_IMAGE_PRICE_RUPEES: int = 500
@@ -187,11 +202,25 @@ class Settings(BaseSettings):
     # ('recharge_500' / "💳 Recharge to use") that the onboarding flow already
     # uses. No payment gateway SDK or credential is required by this code —
     # the button only opens the PSP-hosted page.
-    RECHARGE_PAYMENT_URL: str = ""
+    RECHARGE_PAYMENT_URL: str = "https://rzp.io/rzp/FbuLh9je"
+
+    # Zero-cost WhatsApp test mode. Must be a Settings field: pydantic-settings
+    # reads backend/.env into this object only -- it never exports .env into
+    # os.environ, so the old os.getenv() read silently ignored .env.
+    DRY_RUN_IMAGE_MODE: bool = False
+
+    # --- Generation spend guard (app/services/spend_guard.py) ---
+    # Hard kill switch: set False to pause all image generation immediately
+    # without a redeploy. Defaults to True (generation allowed) so adding
+    # these settings does not change current behavior.
+    GENERATION_ENABLED: bool = True
+    # Safety ceiling on generations/day if spend_guard.can_generate() is
+    # wired into the generation path. A high default keeps this a no-op
+    # until someone deliberately lowers it.
+    MAX_GENERATIONS_PER_DAY: int = 100000
 
     # --- AI image pre-validation (Scenario 4) ---
     # Fast Gemini quality inspection of a funded image before generation.
-    # Only consulted when ENABLE_WALLET_GATE=True.
     IMAGE_PREVALIDATION_ENABLED: bool = True
     IMAGE_PREVALIDATION_MODEL: str = "gemini-2.5-flash"
     # When the inspector cannot run (no API key, outage, unparseable reply):
@@ -227,6 +256,23 @@ class Settings(BaseSettings):
 
     # Number of Celery worker processes (only used when not eager)
     CELERY_WORKER_CONCURRENCY: int = 2
+
+    @model_validator(mode="after")
+    def _default_secret_key(self) -> "Settings":
+        """Generate a random per-process SECRET_KEY when none is configured.
+
+        Never falls back to a hardcoded/known value. A generated key means
+        JWTs won't survive a restart or be shared across multiple workers —
+        set SECRET_KEY explicitly in production to avoid that.
+        """
+        if not self.SECRET_KEY:
+            self.SECRET_KEY = secrets.token_urlsafe(32)
+            _config_logger.warning(
+                "SECRET_KEY is not set — generated a random per-process key. "
+                "Set SECRET_KEY in the environment for production so JWTs "
+                "remain valid across restarts and multiple workers."
+            )
+        return self
 
     @property
     def ALLOWED_EXTENSIONS_LIST(self) -> List[str]:

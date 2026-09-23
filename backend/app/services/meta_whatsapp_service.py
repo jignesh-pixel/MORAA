@@ -15,6 +15,7 @@ Responsibilities:
 import asyncio
 import hashlib
 import io
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -40,12 +41,42 @@ CATALOG_PACK_STYLES: List[Tuple[str, str]] = [
     ("UGC Style", "prompt_ugc"),
 ]
 
+# ─── DEVELOPMENT THROTTLE (temporary credit safeguard) ────────────────────
+# While developing/testing, only the FIRST catalog style is generated instead of
+# fanning out to all 6 parallel styles, which stops the credit leak.
+# Set to None to restore the full 6-style pack behaviour.
+MAX_STYLES_PER_PACK: Optional[int] = 1
+
+
+def _pack_style_count_label() -> str:
+    """Human-readable style count for user-facing copy, kept in sync with the throttle."""
+    if MAX_STYLES_PER_PACK is None:
+        return f"all {len(CATALOG_PACK_STYLES)} styles"
+    count = max(MAX_STYLES_PER_PACK, 1)
+    return "1 test style" if count == 1 else f"{count} test styles"
+
+
 CATALOG_PACK_ACK_TEMPLATE = (
-    "✨ Processing your Earring Catalog Pack (generating all 6 styles)... "
+    f"✨ Processing your Earring Catalog Pack (generating {_pack_style_count_label()})... "
     "Please allow 20-30 seconds."
 )
 
 CATALOG_PACK_SEND_THROTTLE_SECONDS = 0.8
+
+# ─── ZERO-COST TEST MODE (dry-run) ────────────────────────────────────────
+# When DRY_RUN_IMAGE_MODE=true the Gemini / Nano Banana image-generation API is
+# NEVER called. The uploaded reference image is echoed back as the "generated"
+# style, so the whole WhatsApp pipeline (reference image -> Meta media upload ->
+# delivery) can be exercised end-to-end at ZERO image-generation cost.
+# Set to false (the default) to restore real generation.
+DRY_RUN_IMAGE_MODE: bool = bool(settings.DRY_RUN_IMAGE_MODE) or (
+    os.getenv("DRY_RUN_IMAGE_MODE", "false").lower() == "true"
+)
+
+# Fixed user-facing confirmation sent while in zero-cost test mode.
+DRY_RUN_DELIVERY_MESSAGE = (
+    "[TEST MODE - No API Charge] 1/1 Style processed successfully."
+)
 
 
 # ─── Webhook payload parsing ─────────────────────────────────────────────
@@ -628,24 +659,32 @@ async def send_6_pack_images_to_whatsapp(
     balance_text: str,
     reply_to_message_id: Optional[str] = None,
 ) -> bool:
-    """Deliver the complete 6-style Earring Catalog Pack to WhatsApp with contextual quote."""
+    """Deliver the generated Earring Catalog Pack styles to WhatsApp with
+    contextual quote. Returns the number of images actually sent (0..total)
+    so the caller can tell a partial delivery apart from a total failure."""
     if not recipient_id or not image_urls:
-        return False
+        return 0
 
-    total = len(CATALOG_PACK_STYLES)
-    all_sent = True
+    # Caption counts reflect what is actually delivered, so the throttled
+    # single-style test pack does not claim to be a complete 6-style pack.
+    total = len(image_urls)
+    known_styles = len(CATALOG_PACK_STYLES)
+    sent_count = 0
 
     for index, media_id in enumerate(image_urls, start=1):
         style_title = (
             CATALOG_PACK_STYLES[index - 1][0]
-            if index <= total
+            if index <= known_styles
             else f"Style {index}"
         )
 
-        if index == total:
+        if DRY_RUN_IMAGE_MODE:
+            # ZERO-COST TEST MODE — fixed confirmation copy, no API charge made.
+            caption = DRY_RUN_DELIVERY_MESSAGE
+        elif index == total:
             caption = (
                 f"{index}/{total} {style_title} ✨\n"
-                "Here's your complete 6-style E-commerce Pack 📦\n"
+                "Here's your Earring Catalog Pack 📦\n"
                 f"Remaining balance: {balance_text}"
             )
         else:
@@ -659,17 +698,18 @@ async def send_6_pack_images_to_whatsapp(
             caption=caption,
             reply_to_message_id=quote_id,
         )
-        if not send_ok:
-            all_sent = False
+        if send_ok:
+            sent_count += 1
+        else:
             logger.error(
-                f"6-pack delivery: image {index}/{total} failed — "
+                f"Catalog pack delivery: image {index}/{total} failed — "
                 f"recipient={recipient_id} media_id={media_id}"
             )
 
         if index < len(image_urls):
             await asyncio.sleep(CATALOG_PACK_SEND_THROTTLE_SECONDS)
 
-    return all_sent
+    return sent_count
 
 
 # Backwards-compatibility alias
@@ -689,29 +729,40 @@ async def upload_media_to_meta(
         return None
 
     url = META_MEDIA_UPLOAD_URL.format(phone_number_id=settings.META_PHONE_NUMBER_ID)
+    ext_map = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}
+    ext = ext_map.get(mime_type, ".png")
 
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            ext_map = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}
-            ext = ext_map.get(mime_type, ".png")
+    # g8: bounded retry for transient network/5xx failures -- a single
+    # blip previously dropped the image permanently with no recovery.
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(
+                    url,
+                    headers={"Authorization": f"Bearer {settings.META_WHATSAPP_TOKEN}"},
+                    files={"file": (f"generated{ext}", image_bytes, mime_type)},
+                    data={"messaging_product": "whatsapp", "type": mime_type},
+                )
 
-            response = await client.post(
-                url,
-                headers={"Authorization": f"Bearer {settings.META_WHATSAPP_TOKEN}"},
-                files={"file": (f"generated{ext}", image_bytes, mime_type)},
-                data={"messaging_product": "whatsapp", "type": mime_type},
-            )
+                if response.status_code not in (200, 201):
+                    logger.error(
+                        f"Meta media upload failed (attempt {attempt}/{max_attempts}): "
+                        f"status={response.status_code}"
+                    )
+                    if response.status_code < 500 and response.status_code != 429:
+                        return None  # non-retryable client error
+                else:
+                    data = response.json()
+                    return data.get("id")
 
-            if response.status_code not in (200, 201):
-                logger.error(f"Meta media upload failed: status={response.status_code}")
-                return None
+        except Exception as e:
+            logger.error(f"Meta media upload exception (attempt {attempt}/{max_attempts}): {e}")
 
-            data = response.json()
-            return data.get("id")
+        if attempt < max_attempts:
+            await asyncio.sleep(1.5 * attempt)
 
-    except Exception as e:
-        logger.error(f"Meta media upload exception: {e}")
-        return None
+    return None
 
 
 # ─── Generation trigger ──────────────────────────────────────────────────
@@ -866,6 +917,16 @@ def _data_url_to_bytes(data_url: str) -> Optional[bytes]:
         return None
 
 
+def _bytes_to_data_url(
+    image_bytes: bytes, mime_type: Optional[str] = None
+) -> str:
+    """Encode raw image bytes as a base64 data URL (inverse of _data_url_to_bytes)."""
+    import base64
+    resolved_mime = mime_type or "image/jpeg"
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:{resolved_mime};base64,{encoded}"
+
+
 # ─── 6-Style Catalog Pack generation orchestrator ────────────────────────
 
 
@@ -878,6 +939,15 @@ async def _generate_single_pack_style(
     request_id: str,
 ) -> Optional[str]:
     """Generate one style of the catalog pack and return its image data URL."""
+    if DRY_RUN_IMAGE_MODE:
+        # ZERO-COST TEST MODE — never call the Gemini / Nano Banana API. Echo the
+        # uploaded reference image back so the rest of the pipeline still runs.
+        logger.warning(
+            f"[TEST MODE - No API Charge] dry-run generation for style='{style_title}' "
+            f"ingestion_id={ingestion_id}: returning input image, no provider call made"
+        )
+        return _bytes_to_data_url(reference_image_bytes, reference_mime_type)
+
     try:
         from app.ai.image_generation_manager import ImageGenerationManager
 
@@ -907,7 +977,11 @@ async def _generate_single_pack_style(
 
 
 async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
-    """Generate all 6 catalog styles in parallel and deliver them to WhatsApp."""
+    """Generate the catalog styles in parallel and deliver them to WhatsApp.
+
+    The number of styles is capped by ``MAX_STYLES_PER_PACK`` (1 during the
+    development throttle) instead of always fanning out to all 6 styles.
+    """
     from app.database import SessionLocal
     from app.models.image import Image
     from app.models.whatsapp_ingestion import WhatsAppIngestion
@@ -971,13 +1045,19 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
                 continue
             style_jobs.append((style_title, builder()))
 
+        # Development throttle — cap the pack to MAX_STYLES_PER_PACK styles
+        # (1 during development) so we do not burn 6 parallel generations.
+        if MAX_STYLES_PER_PACK is not None:
+            style_jobs = style_jobs[: max(MAX_STYLES_PER_PACK, 1)]
+
         if not style_jobs:
             _fail_ingestion(db, ingestion, "No valid style prompt builders available")
             return False
 
         logger.info(
-            f"6-pack generation started: ingestion_id={ingestion_id} "
-            f"styles={len(style_jobs)}"
+            f"Catalog pack generation started: ingestion_id={ingestion_id} "
+            f"styles={len(style_jobs)} dev_throttle={MAX_STYLES_PER_PACK} "
+            f"dry_run={DRY_RUN_IMAGE_MODE}"
         )
 
         gather_results = await asyncio.gather(
@@ -999,7 +1079,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         ]
 
         if not generated_data_urls:
-            _fail_ingestion(db, ingestion, "All 6 catalog style generations failed")
+            _fail_ingestion(db, ingestion, "All catalog style generations failed")
             return False
 
         ingestion.status = "generated"
@@ -1027,23 +1107,44 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         rem_bal = int(cust.wallet_balance or 0) if cust else 0
         balance_text = f"₹{rem_bal:,}"
 
-        delivered = await send_6_pack_images_to_whatsapp(
+        sent_count = await send_6_pack_images_to_whatsapp(
             recipient_id=ingestion.external_user_id,
             image_urls=media_ids,
             balance_text=balance_text,
             reply_to_message_id=ingestion.external_message_id,
         )
+        total_images = len(media_ids)
 
-        if not delivered:
-            _fail_delivery(db, ingestion, "6-pack Meta message delivery failed")
+        if sent_count == 0:
+            _fail_delivery(db, ingestion, "Catalog pack Meta message delivery failed")
+            # g2: nothing reached the customer -- refund the slot instead of
+            # leaving the charge in place with no delivery.
+            try:
+                if cust is not None:
+                    from app.services.wallet_service import refund_generation_charge, price_per_image
+                    refund_generation_charge(db, cust.whatsapp_id, price_per_image())
+            except Exception as e:
+                logger.error(f"Catalog pack refund-on-total-failure failed: {e}")
             return False
+
+        if sent_count < total_images:
+            # Partial delivery: the customer already received real value, so
+            # this is not refunded -- just kept distinct from full success.
+            ingestion.status = "delivered_partial"
+            ingestion.error_message = f"Delivered {sent_count}/{total_images} images"
+            db.commit()
+            logger.warning(
+                f"Catalog pack partially delivered: ingestion_id={ingestion_id} "
+                f"sent={sent_count}/{total_images} recipient={ingestion.external_user_id}"
+            )
+            return True
 
         ingestion.status = "delivered"
         ingestion.error_message = None
         db.commit()
 
         logger.info(
-            f"6-pack delivered: ingestion_id={ingestion_id} images={len(media_ids)} "
+            f"Catalog pack delivered: ingestion_id={ingestion_id} images={len(media_ids)} "
             f"recipient={ingestion.external_user_id}"
         )
         return True
