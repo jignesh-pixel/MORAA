@@ -1,10 +1,17 @@
 """Meta WhatsApp Cloud API webhook routes.
 
 Funded-slot batch gate:
-- Every image = one ₹500 Earring Catalog Pack (7 styles).
-- slots = wallet_balance // 500 -> exactly that many packs execute.
+- Every image = one Earring Catalog Pack (7 styles), priced at
+  ``wallet_service.price_per_image()`` (configured via
+  ``WALLET_IMAGE_PRICE_RUPEES``, default ₹500).
+- slots = wallet_balance // price -> exactly that many packs execute.
 - Every unfunded image immediately receives the exact recharge hold message.
 - Funded packs execute via FastAPI BackgroundTasks (no Celery/Redis dependency).
+
+Deduction and refund both go through ``app.services.wallet_service`` —
+the single authoritative wallet-balance-mutation path (atomic guarded
+UPDATE for charges, so a concurrent delivery can never overspend or drive
+the balance negative).
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -16,12 +23,17 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request,
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 
+from app.api.dependencies import require_auth
 from app.config import settings
 from app.database import get_db
 from app.models.customer import Customer
 from app.models.whatsapp_ingestion import WhatsAppIngestion
 from app.repositories.base import BaseRepository
-from app.services.image_quality_guard import validate_jewelry_image_with_gemini
+from app.services.generation_metrics import (
+    TARGET_FAILURE_RATE,
+    compute_generation_failure_rate,
+)
+from app.services.image_prevalidation_service import check_image_quality
 from app.services.meta_whatsapp_service import (
     CATALOG_PACK_ACK_TEMPLATE,
     download_media,
@@ -35,20 +47,27 @@ from app.services.meta_whatsapp_service import (
 )
 from app.services.razorpay_service import create_recharge_payment_link
 from app.services.upload_service import UploadService
-from app.services.wallet_service import get_customer
+from app.services.wallet_service import (
+    charge_customer_balance,
+    format_rupees,
+    get_customer,
+    price_per_image,
+    refund_generation_charge,
+)
 from app.utils.logger import logger
 
 router = APIRouter(prefix="/api/meta", tags=["Meta WhatsApp Webhook"])
 
-DEFAULT_PAYMENT_URL = "https://rzp.io/rzp/FbuLh9je"
-COST_PER_PRODUCT = 500
+DEFAULT_PAYMENT_URL = settings.RECHARGE_PAYMENT_URL
 
-# Exact unfunded-image hold message (sent quoted against the user's photo).
-HOLD_MESSAGE_TEMPLATE = (
-    "⚠️ Your balance is ₹0 for this image.\n\n"
-    "₹500 required to generate photos for this design.\n"
-    f"Tap to recharge: {DEFAULT_PAYMENT_URL}"
-)
+
+def _hold_message(price: int) -> str:
+    """Unfunded-image hold message (sent quoted against the user's photo)."""
+    return (
+        f"⚠️ Your balance is ₹0 for this image.\n\n"
+        f"{format_rupees(price)} required to generate photos for this design.\n"
+        f"Tap to recharge: {DEFAULT_PAYMENT_URL}"
+    )
 
 
 def _find_customer_safe(db: Session, sender: str) -> Optional[Customer]:
@@ -61,20 +80,19 @@ def _find_customer_safe(db: Session, sender: str) -> Optional[Customer]:
 
 
 def _refund_pack_charge(db: Session, customer: Optional[Customer]) -> None:
-    """Refund a single ₹500 pack charge after a post-deduction failure."""
+    """Refund a single pack charge after a post-deduction failure."""
     if customer is None:
         return
-    customer.wallet_balance = int(customer.wallet_balance or 0) + COST_PER_PRODUCT
-    db.commit()
+    price = price_per_image()
+    refund_generation_charge(db, customer.whatsapp_id, price)
     db.refresh(customer)
-    logger.warning(f"Refunded ₹{COST_PER_PRODUCT} pack charge: whatsapp_id={customer.whatsapp_id}")
 
 
 # ─── Background generation trigger ──────────────────────────────────────
 
 
 async def _trigger_generation(ingestion_id: str) -> None:
-    """Background task that re-runs the 7-style catalog pack for an ingestion.
+    """Background task that re-runs the catalog pack for an ingestion.
 
     Called via BackgroundTasks after successful image ingestion (and by the
     manual retry endpoint). This keeps the webhook response fast (< 5s) while
@@ -130,6 +148,17 @@ async def receive_webhook(
         signature = request.headers.get("X-Hub-Signature-256")
         if not verify_webhook_signature(raw_body, signature):
             return {"status": "error", "message": "Invalid signature"}
+    elif not settings.DEBUG:
+        # Fail closed outside DEBUG mode: an unconfigured META_APP_SECRET in
+        # a non-dev deployment must not silently accept unsigned webhook
+        # payloads. DEBUG defaults to True and stays True for local/dev use,
+        # so this does not change behavior there -- it only refuses unsigned
+        # traffic once DEBUG is turned off for a real deployment.
+        logger.error(
+            "Webhook rejected: META_APP_SECRET is not configured and DEBUG "
+            "is False -- refusing to accept an unsigned payload."
+        )
+        return {"status": "error", "message": "Webhook not configured"}
 
     if payload.get("object") == "whatsapp_business_account" and "entry" not in payload:
         return {"status": "ok"}
@@ -179,7 +208,18 @@ async def receive_webhook(
                         elif "gst" in l_low and ":" in line_clean:
                             extracted_gst = line_clean.split(":", 1)[1].strip()
                             if extracted_gst:
-                                gst_val = extracted_gst
+                                # t9: only accept a value that either looks like a
+                                # real 15-char GSTIN or is an explicit "no GST"
+                                # answer; anything else falls back to N/A instead
+                                # of silently storing malformed text.
+                                _gst_norm = extracted_gst.replace(" ", "").upper()
+                                _gst_none = extracted_gst.strip().lower() in ("na", "n/a", "none", "no", "nil", "-")
+                                _gst_valid = bool(re.match(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]$", _gst_norm))
+                                if _gst_valid:
+                                    gst_val = _gst_norm
+                                elif _gst_none:
+                                    gst_val = "N/A"
+                                # else: leave gst_val at its previous value (default "N/A")
                         elif "address" in l_low and ":" in line_clean:
                             extracted_addr = line_clean.split(":", 1)[1].strip()
                             if extracted_addr:
@@ -216,7 +256,8 @@ async def receive_webhook(
 
                     confirm_msg = (
                         f"Congratulations {user_name}! You’re registered with Moraa Studio 🎉\n"
-                        f"You’re all set to start creating stunning product photos."
+                        f"You’re all set to start creating stunning product photos.\n\n"
+                        f"Need to update your details later? Just send the same form again anytime."
                     )
                     try:
                         pay_url = await create_recharge_payment_link(
@@ -320,9 +361,10 @@ async def receive_webhook(
     # real balance. Exactly `slots` images execute a full 7-style pack; every
     # remaining image immediately receives the exact hold message — never a
     # silent drop.
+    price = price_per_image()
     customer = db.query(Customer).filter(Customer.whatsapp_id.contains(phone_suffix)).first()
     current_bal = int(customer.wallet_balance or 0) if customer else 0
-    slots = current_bal // COST_PER_PRODUCT
+    slots = current_bal // price
 
     processed_ingestion_ids: List[str] = []
 
@@ -353,7 +395,7 @@ async def receive_webhook(
             # Unfunded image — exact hold message, quoted against the photo.
             await send_whatsapp_text(
                 recipient_id=sender,
-                message_text=HOLD_MESSAGE_TEMPLATE,
+                message_text=_hold_message(price),
                 reply_to_message_id=message_id,
             )
             continue
@@ -363,38 +405,42 @@ async def receive_webhook(
         if existing:
             continue
 
-        # REAL balance deduction — directly on the ORM row, then persist and
-        # re-read so every subsequent iteration (and the 7/7 delivery caption)
-        # sees the true remaining balance. No separate UPDATE statement that
-        # can diverge from the identity-mapped object.
-        customer.wallet_balance = int(customer.wallet_balance or 0) - COST_PER_PRODUCT
-        db.commit()
-        db.refresh(customer)
-        slots -= 1
-
+        # Fetch and validate BEFORE charging: an unreadable or rejected photo
+        # costs the customer nothing and never reaches generation.
         media_url = await get_media_url(media_id)
         if not media_url:
-            _refund_pack_charge(db, customer)
             continue
 
         download_result: Optional[Tuple[bytes, str]] = await download_media(media_url)
         if not download_result:
-            _refund_pack_charge(db, customer)
             continue
 
         image_bytes, content_type = download_result
         is_valid, _validation_error = validate_image(image_bytes, content_type)
         if not is_valid:
-            _refund_pack_charge(db, customer)
             continue
 
-        # AI Quality Guard (Gemini) — reject unusable jewellery photos.
-        ai_valid, tip_msg = await validate_jewelry_image_with_gemini(image_bytes, content_type)
-        if not ai_valid:
-            _refund_pack_charge(db, customer)
-            reject_text = f"Photo quality check ⚠️\n\n{tip_msg}\n\nPlease snap a new photo and upload again!"
-            await send_whatsapp_text(sender, reject_text, reply_to_message_id=message_id)
+        if settings.IMAGE_PREVALIDATION_ENABLED:
+            quality = await check_image_quality(image_bytes, content_type)
+            if not quality.approved:
+                await send_whatsapp_text(
+                    sender, quality.rejection_message, reply_to_message_id=message_id
+                )
+                continue
+
+        # Atomic guarded-UPDATE deduction (app.services.wallet_service) — the
+        # single authoritative wallet-debit path, shared with charge_generation().
+        # Declines safely (no charge) if the balance changed concurrently since
+        # `slots` was computed, instead of ever overspending.
+        charged, _balance_after = charge_customer_balance(db, customer, price)
+        if not charged:
+            await send_whatsapp_text(
+                recipient_id=sender,
+                message_text=_hold_message(price),
+                reply_to_message_id=message_id,
+            )
             continue
+        slots -= 1
 
         ext_map = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
         ext = ext_map.get(content_type, "jpg")
@@ -455,9 +501,14 @@ async def receive_webhook(
 async def retry_delivery(
     ingestion_id: str,
     background_tasks: BackgroundTasks,
+    current_user: Any = Depends(require_auth),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    """Retry a failed WhatsApp ingestion."""
+    """Retry a failed WhatsApp ingestion.
+
+    Requires an authenticated user. This endpoint re-runs a billable
+    generation task, so it must never be publicly executable.
+    """
     ingestion = db.query(WhatsAppIngestion).filter(
         WhatsAppIngestion.id == ingestion_id
     ).first()
@@ -539,4 +590,30 @@ async def webhook_health() -> Dict[str, Any]:
         "phone_number_id_configured": bool(settings.META_PHONE_NUMBER_ID),
         "app_secret_configured": bool(settings.META_APP_SECRET),
         "generation_enabled": bool(settings.OPENAI_API_KEY or settings.GEMINI_API_KEY),
+    }
+
+
+@router.get(
+    "/webhook/failure-rate",
+    summary="Windowed generation failure rate",
+    description=(
+        "Failed / total completed WhatsApp catalog-pack generation attempts "
+        "over a trailing window, computed from the existing "
+        "WhatsAppIngestion status field. No customer-identifying data is "
+        "included. Target ceiling: 15%."
+    ),
+)
+async def get_generation_failure_rate(
+    window_hours: int = 24,
+    current_user: Any = Depends(require_auth),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    report = compute_generation_failure_rate(db, window_hours=window_hours)
+    return {
+        "window_hours": report.window_hours,
+        "total_attempts": report.total_attempts,
+        "failed_attempts": report.failed_attempts,
+        "failure_rate": report.failure_rate,
+        "target_failure_rate": TARGET_FAILURE_RATE,
+        "exceeds_target": report.exceeds_target,
     }

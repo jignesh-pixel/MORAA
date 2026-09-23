@@ -892,11 +892,74 @@ async def process_whatsapp_generation(
         db.close()
 
 
+REFUND_AUDIT_ACTION = "whatsapp_generation_refund"
+
+
+def _refund_failed_ingestion(db, ingestion) -> None:
+    """Return the slot charge for an ingestion that delivered nothing.
+
+    Idempotent per ingestion (an audit_logs row marks it refunded), so a
+    manual retry that fails again never refunds twice. Never raises.
+    ponytail: check-then-refund-then-record; a DB error between the refund
+    commit and the audit commit could allow one extra refund on a later retry.
+    """
+    try:
+        import json
+
+        from app.models.audit_log import AuditLog
+        from app.models.customer import Customer
+        from app.services.wallet_service import price_per_image, refund_generation_charge
+
+        already = (
+            db.query(AuditLog.id)
+            .filter(
+                AuditLog.action == REFUND_AUDIT_ACTION,
+                AuditLog.resource_id == ingestion.id,
+            )
+            .first()
+        )
+        if already:
+            return
+
+        clean_id = (ingestion.external_user_id or "").lstrip("+").strip()
+        suffix = clean_id[-10:]
+        cust = (
+            db.query(Customer).filter(Customer.whatsapp_id.contains(suffix)).first()
+            if suffix
+            else None
+        )
+        if cust is None:
+            logger.error(f"Refund skipped, customer not found: ingestion_id={ingestion.id}")
+            return
+
+        price = price_per_image()
+        if not refund_generation_charge(db, cust.whatsapp_id, price):
+            return
+        db.add(
+            AuditLog(
+                action=REFUND_AUDIT_ACTION,
+                resource_id=ingestion.id,
+                resource_type="whatsapp_ingestion",
+                status="success",
+                details=json.dumps({"whatsapp_id": cust.whatsapp_id, "amount": price}),
+            )
+        )
+        db.commit()
+        logger.info(f"Refunded ₹{price} for failed ingestion_id={ingestion.id}")
+    except Exception as e:
+        logger.error(f"Refund for failed ingestion failed: ingestion_id={ingestion.id} error={e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
 def _fail_ingestion(db, ingestion, error_message: str) -> None:
     ingestion.status = "failed"
     ingestion.error_message = error_message
     db.commit()
     logger.error(f"WhatsApp generation failed: ingestion_id={ingestion.id} error={error_message}")
+    _refund_failed_ingestion(db, ingestion)
 
 
 def _fail_delivery(db, ingestion, error_message: str) -> None:
@@ -904,6 +967,7 @@ def _fail_delivery(db, ingestion, error_message: str) -> None:
     ingestion.error_message = error_message
     db.commit()
     logger.error(f"WhatsApp delivery failed: ingestion_id={ingestion.id} error={error_message}")
+    _refund_failed_ingestion(db, ingestion)
 
 
 def _data_url_to_bytes(data_url: str) -> Optional[bytes]:
@@ -1117,14 +1181,6 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
 
         if sent_count == 0:
             _fail_delivery(db, ingestion, "Catalog pack Meta message delivery failed")
-            # g2: nothing reached the customer -- refund the slot instead of
-            # leaving the charge in place with no delivery.
-            try:
-                if cust is not None:
-                    from app.services.wallet_service import refund_generation_charge, price_per_image
-                    refund_generation_charge(db, cust.whatsapp_id, price_per_image())
-            except Exception as e:
-                logger.error(f"Catalog pack refund-on-total-failure failed: {e}")
             return False
 
         if sent_count < total_images:
