@@ -105,7 +105,33 @@ def get_balance(db: Session, whatsapp_id: str) -> int:
     return customer.balance_rupees if customer else 0
 
 
-def credit_wallet(db: Session, whatsapp_id: str, amount: int) -> int:
+def find_customer_by_phone(db: Session, phone: str) -> Optional[Customer]:
+    """Exact, index-backed customer lookup across the stored number formats.
+
+    WhatsApp senders arrive as ``919876543210``; Razorpay contacts may arrive as
+    ``+919876543210`` or ``9876543210``. Equality on the known variants replaces
+    the old leading-wildcard ``.contains()`` scan with the same matches.
+    """
+    raw = (phone or "").strip()
+    digits = raw.lstrip("+")
+    if not digits:
+        return None
+    last10 = digits[-10:]
+    candidates = {raw, digits, "+" + digits, last10, "91" + last10, "+91" + last10}
+    try:
+        rows = db.query(Customer).filter(Customer.whatsapp_id.in_(candidates)).all()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Wallet: phone lookup failed: {e}")
+        return None
+    for preferred in (digits, raw):
+        for row in rows:
+            if row.whatsapp_id == preferred:
+                return row
+    return rows[0] if rows else None
+
+
+def credit_wallet(db: Session, whatsapp_id: str, amount: int, commit: bool = True) -> int:
     """Add funds (payment captured or refund). Returns the new balance."""
     amount = max(int(amount), 0)
     if amount == 0 or not whatsapp_id:
@@ -120,6 +146,9 @@ def credit_wallet(db: Session, whatsapp_id: str, amount: int) -> int:
                 synchronize_session=False,
             )
         )
+        if not commit:
+            # Caller commits (atomically with its own writes); report rows hit.
+            return updated
         db.commit()
         if updated != 1:
             logger.warning(
@@ -136,6 +165,8 @@ def credit_wallet(db: Session, whatsapp_id: str, amount: int) -> int:
     except Exception as e:
         db.rollback()
         logger.error(f"Wallet credit failed: {e}")
+        if not commit:
+            raise  # caller's transaction is gone -- let it handle the failure
         return get_balance(db, whatsapp_id)
 
 
@@ -217,7 +248,11 @@ class BatchPlan:
 
 
 def build_batch_plan(db: Session, whatsapp_id: str, total_images: int) -> BatchPlan:
-    """Build the funding plan for a customer's image batch."""
+    """Build the funding plan for a customer's image batch.
+
+    Slot maths lives in ``Customer.affordable_image_count`` -- the live
+    WhatsApp webhook uses the same helper, so the two cannot drift.
+    """
     total = max(int(total_images), 1)
     price = price_per_image()
     customer = get_customer(db, whatsapp_id)
@@ -226,7 +261,7 @@ def build_batch_plan(db: Session, whatsapp_id: str, total_images: int) -> BatchP
 
     funded_slots = 0
     if is_registered:
-        funded_slots = min(balance // price, total)
+        funded_slots = customer.affordable_image_count(total)
 
     plan = BatchPlan(
         whatsapp_id=whatsapp_id,
@@ -483,26 +518,20 @@ def is_generation_allowed(ingestion: Optional[WhatsAppIngestion]) -> bool:
     return (ingestion.status or "") not in BLOCKED_GENERATION_STATUSES
 
 
-def charge_generation(
+def charge_customer_balance(
     db: Session,
-    ingestion: WhatsAppIngestion,
+    customer: Customer,
+    price: int,
 ) -> Tuple[bool, int]:
-    """Atomically debit one image's price for a generation dispatch.
+    """Atomically debit ``price`` from an already-resolved customer's wallet.
 
     Returns ``(charged, balance_after)``. The WHERE clause carries the
     affordability check, so a concurrent tap can never overspend or push the
-    balance below zero.
+    balance below zero. This is the one place a wallet debit happens —
+    ``charge_generation`` and the WhatsApp funded-slot gate
+    (``app/api/routes/meta_webhook.py``) both call it, so there is a single
+    authoritative deduction path.
     """
-    price = price_per_image()
-    whatsapp_id = ingestion.external_user_id or ""
-
-    customer = get_customer(db, whatsapp_id)
-    if customer is None:
-        logger.warning(
-            f"Wallet charge skipped — unknown customer whatsapp_id={whatsapp_id}"
-        )
-        return False, 0
-
     try:
         updated = (
             db.query(Customer)
@@ -525,16 +554,37 @@ def charge_generation(
 
     if updated != 1:
         logger.warning(
-            f"Wallet charge declined: whatsapp_id={whatsapp_id} "
+            f"Wallet charge declined: whatsapp_id={customer.whatsapp_id} "
             f"balance={customer.balance_rupees} price={price}"
         )
         return False, customer.balance_rupees
 
     logger.info(
-        f"Wallet charged: whatsapp_id={whatsapp_id} amount={price} "
-        f"balance={customer.balance_rupees} ingestion_id={ingestion.id}"
+        f"Wallet charged: whatsapp_id={customer.whatsapp_id} amount={price} "
+        f"balance={customer.balance_rupees}"
     )
     return True, customer.balance_rupees
+
+
+def charge_generation(
+    db: Session,
+    ingestion: WhatsAppIngestion,
+) -> Tuple[bool, int]:
+    """Atomically debit one image's price for a generation dispatch.
+
+    Returns ``(charged, balance_after)``.
+    """
+    price = price_per_image()
+    whatsapp_id = ingestion.external_user_id or ""
+
+    customer = get_customer(db, whatsapp_id)
+    if customer is None:
+        logger.warning(
+            f"Wallet charge skipped — unknown customer whatsapp_id={whatsapp_id}"
+        )
+        return False, 0
+
+    return charge_customer_balance(db, customer, price)
 
 
 def refund_generation_charge(

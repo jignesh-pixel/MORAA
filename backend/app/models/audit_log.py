@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, String, Text
+from sqlalchemy import DateTime, Index, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -17,6 +17,22 @@ class AuditLog(Base):
     """
 
     __tablename__ = "audit_logs"
+    # One row per captured payment / per refunded ingestion: a concurrent
+    # duplicate insert fails at the database, so money moves at most once.
+    __table_args__ = (
+        Index(
+            "uq_audit_logs_money_once",
+            "action",
+            "resource_id",
+            unique=True,
+            postgresql_where=text(
+                "action IN ('razorpay_payment_captured', 'whatsapp_generation_refund')"
+            ),
+            sqlite_where=text(
+                "action IN ('razorpay_payment_captured', 'whatsapp_generation_refund')"
+            ),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(
         String(36),

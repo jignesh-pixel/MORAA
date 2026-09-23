@@ -209,15 +209,15 @@ class Settings(BaseSettings):
     # os.environ, so the old os.getenv() read silently ignored .env.
     DRY_RUN_IMAGE_MODE: bool = False
 
-    # --- Generation spend guard (app/services/spend_guard.py) ---
-    # Hard kill switch: set False to pause all image generation immediately
-    # without a redeploy. Defaults to True (generation allowed) so adding
-    # these settings does not change current behavior.
+    # --- Generation spend guard (app/ai/image_generation_manager.py) ---
+    # Hard kill switch: set False to pause all image generation immediately.
     GENERATION_ENABLED: bool = True
-    # Safety ceiling on generations/day if spend_guard.can_generate() is
-    # wired into the generation path. A high default keeps this a no-op
-    # until someone deliberately lowers it.
+    # Daily ceiling on ImageGenerationManager.generate_image() calls.
     MAX_GENERATIONS_PER_DAY: int = 100000
+
+    # Styles generated per WhatsApp Earring Catalog Pack (6 styles exist).
+    # 1 = current throttled behaviour; empty/None = all styles.
+    MAX_STYLES_PER_PACK: Optional[int] = 1
 
     # --- AI image pre-validation (Scenario 4) ---
     # Fast Gemini quality inspection of a funded image before generation.

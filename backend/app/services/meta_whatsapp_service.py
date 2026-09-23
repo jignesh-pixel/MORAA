@@ -41,11 +41,9 @@ CATALOG_PACK_STYLES: List[Tuple[str, str]] = [
     ("UGC Style", "prompt_ugc"),
 ]
 
-# ─── DEVELOPMENT THROTTLE (temporary credit safeguard) ────────────────────
-# While developing/testing, only the FIRST catalog style is generated instead of
-# fanning out to all 6 parallel styles, which stops the credit leak.
-# Set to None to restore the full 6-style pack behaviour.
-MAX_STYLES_PER_PACK: Optional[int] = 1
+# ─── Styles per pack (settings.MAX_STYLES_PER_PACK, default 1) ─────────────
+# Set MAX_STYLES_PER_PACK in .env (or leave it empty for all styles).
+MAX_STYLES_PER_PACK: Optional[int] = settings.MAX_STYLES_PER_PACK
 
 
 def _pack_style_count_label() -> str:
@@ -653,7 +651,7 @@ async def send_document_to_whatsapp(
 # ─── 6-Pack catalog delivery ─────────────────────────────────────────────
 
 
-async def send_6_pack_images_to_whatsapp(
+async def send_catalog_pack_images_to_whatsapp(
     recipient_id: str,
     image_urls: list,
     balance_text: str,
@@ -713,7 +711,8 @@ async def send_6_pack_images_to_whatsapp(
 
 
 # Backwards-compatibility alias
-send_7_pack_images_to_whatsapp = send_6_pack_images_to_whatsapp
+send_6_pack_images_to_whatsapp = send_catalog_pack_images_to_whatsapp
+send_7_pack_images_to_whatsapp = send_catalog_pack_images_to_whatsapp
 
 
 # ─── Meta media upload ───────────────────────────────────────────────────
@@ -921,13 +920,9 @@ def _refund_failed_ingestion(db, ingestion) -> None:
         if already:
             return
 
-        clean_id = (ingestion.external_user_id or "").lstrip("+").strip()
-        suffix = clean_id[-10:]
-        cust = (
-            db.query(Customer).filter(Customer.whatsapp_id.contains(suffix)).first()
-            if suffix
-            else None
-        )
+        from app.services.wallet_service import find_customer_by_phone
+
+        cust = find_customer_by_phone(db, ingestion.external_user_id)
         if cust is None:
             logger.error(f"Refund skipped, customer not found: ingestion_id={ingestion.id}")
             return
@@ -954,12 +949,22 @@ def _refund_failed_ingestion(db, ingestion) -> None:
             pass
 
 
+def _check_failure_rate(db) -> None:
+    try:
+        from app.services.generation_metrics import alert_if_failure_rate_exceeded
+
+        alert_if_failure_rate_exceeded(db)
+    except Exception as e:
+        logger.error(f"Failure-rate check failed: {e}")
+
+
 def _fail_ingestion(db, ingestion, error_message: str) -> None:
     ingestion.status = "failed"
     ingestion.error_message = error_message
     db.commit()
     logger.error(f"WhatsApp generation failed: ingestion_id={ingestion.id} error={error_message}")
     _refund_failed_ingestion(db, ingestion)
+    _check_failure_rate(db)
 
 
 def _fail_delivery(db, ingestion, error_message: str) -> None:
@@ -968,6 +973,7 @@ def _fail_delivery(db, ingestion, error_message: str) -> None:
     db.commit()
     logger.error(f"WhatsApp delivery failed: ingestion_id={ingestion.id} error={error_message}")
     _refund_failed_ingestion(db, ingestion)
+    _check_failure_rate(db)
 
 
 def _data_url_to_bytes(data_url: str) -> Optional[bytes]:
@@ -1165,13 +1171,13 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
             _fail_delivery(db, ingestion, "All Meta media uploads failed")
             return False
 
-        clean_id = ingestion.external_user_id.lstrip("+").strip()
-        suffix = clean_id[-10:] if len(clean_id) >= 10 else clean_id
-        cust = db.query(Customer).filter(Customer.whatsapp_id.contains(suffix)).first()
+        from app.services.wallet_service import find_customer_by_phone
+
+        cust = find_customer_by_phone(db, ingestion.external_user_id)
         rem_bal = int(cust.wallet_balance or 0) if cust else 0
         balance_text = f"₹{rem_bal:,}"
 
-        sent_count = await send_6_pack_images_to_whatsapp(
+        sent_count = await send_catalog_pack_images_to_whatsapp(
             recipient_id=ingestion.external_user_id,
             image_urls=media_ids,
             balance_text=balance_text,

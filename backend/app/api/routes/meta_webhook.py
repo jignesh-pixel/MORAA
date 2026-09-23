@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 from app.api.dependencies import require_auth
 from app.config import settings
 from app.database import get_db
+from app.models.audit_log import AuditLog
 from app.models.customer import Customer
 from app.models.whatsapp_ingestion import WhatsAppIngestion
 from app.repositories.base import BaseRepository
@@ -49,6 +50,7 @@ from app.services.razorpay_service import create_recharge_payment_link
 from app.services.upload_service import UploadService
 from app.services.wallet_service import (
     charge_customer_balance,
+    find_customer_by_phone,
     format_rupees,
     get_customer,
     price_per_image,
@@ -72,11 +74,46 @@ def _hold_message(price: int) -> str:
 
 def _find_customer_safe(db: Session, sender: str) -> Optional[Customer]:
     """Helper to find customer regardless of leading + or 91 country code differences."""
-    clean_sender = sender.lstrip("+").strip()
-    c = get_customer(db, clean_sender) or get_customer(db, sender)
-    if not c and len(clean_sender) >= 10:
-        c = db.query(Customer).filter(Customer.whatsapp_id.contains(clean_sender[-10:])).first()
-    return c
+    return find_customer_by_phone(db, sender)
+
+
+FEEDBACK_AUDIT_ACTION = "whatsapp_feedback"
+
+
+def _save_feedback(db: Session, sender: str, button_id: str) -> None:
+    """Persist a thumbs up/down against the ingestion it rates. Never raises.
+
+    Button ids are ``feedback_positive[_<ingestion_id>]`` /
+    ``feedback_negative[_<ingestion_id>]``; without an id suffix the sender's
+    latest ingestion is used.
+    """
+    try:
+        rating = "positive" if button_id.startswith("feedback_positive") else "negative"
+        suffix = button_id.split("_", 2)[2] if button_id.count("_") >= 2 else ""
+        ingestion = None
+        if suffix:
+            ingestion = db.query(WhatsAppIngestion).filter(WhatsAppIngestion.id == suffix).first()
+        if ingestion is None:
+            clean = (sender or "").lstrip("+").strip()
+            ingestion = (
+                db.query(WhatsAppIngestion)
+                .filter(WhatsAppIngestion.external_user_id.in_({sender, clean, "+" + clean}))
+                .order_by(WhatsAppIngestion.created_at.desc())
+                .first()
+            )
+        db.add(
+            AuditLog(
+                action=FEEDBACK_AUDIT_ACTION,
+                resource_id=ingestion.id if ingestion else None,
+                resource_type="whatsapp_ingestion",
+                status=rating,
+                details=json.dumps({"whatsapp_id": sender, "button_id": button_id}),
+            )
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Feedback persistence failed: {e}")
 
 
 def _refund_pack_charge(db: Session, customer: Optional[Customer]) -> None:
@@ -292,7 +329,6 @@ async def receive_webhook(
                         "Business address:"
                     )
                     await send_whatsapp_text(sender, msg_part_1)
-                    await asyncio.sleep(1)
                     await send_whatsapp_text(sender, msg_part_2)
                     continue
 
@@ -334,6 +370,7 @@ async def receive_webhook(
                 sender = event.get("sender", "")
 
                 if b_id.startswith("feedback_"):
+                    _save_feedback(db, sender, b_id)
                     fb_response = (
                         "Thank you so much for the love! Glad you liked it 🎉 Send your next photo anytime!"
                         if b_id.startswith("feedback_positive")
@@ -352,19 +389,16 @@ async def receive_webhook(
 
     sender = image_events[0].get("sender", "")
     raw_sender = sender.strip()
-    clean_sender = raw_sender.lstrip("+").strip()
-    phone_suffix = clean_sender[-10:] if len(clean_sender) >= 10 else clean_sender
 
     # ── FUNDED SLOT GATE ──
-    # Load the customer row ONCE with a clean contains() query (handles
-    # "+91…", "91…" and bare numbers alike), then derive paid slots from the
-    # real balance. Exactly `slots` images execute a full 7-style pack; every
+    # Load the customer row ONCE (exact phone-variant match), then derive paid
+    # slots with the same Customer.affordable_image_count helper the wallet
+    # service uses. Exactly `slots` images execute a catalog pack; every
     # remaining image immediately receives the exact hold message — never a
-    # silent drop.
+    # silent drop. The atomic charge below still guards every debit.
     price = price_per_image()
-    customer = db.query(Customer).filter(Customer.whatsapp_id.contains(phone_suffix)).first()
-    current_bal = int(customer.wallet_balance or 0) if customer else 0
-    slots = current_bal // price
+    customer = find_customer_by_phone(db, raw_sender)
+    slots = customer.affordable_image_count(len(image_events)) if customer else 0
 
     processed_ingestion_ids: List[str] = []
 

@@ -3,13 +3,13 @@
 Handles both standard payment links and Razorpay Payment Pages.
 """
 
-import asyncio
 import hashlib
 import hmac
 import json
 from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -21,7 +21,7 @@ from app.services.meta_whatsapp_service import (
     send_document_to_whatsapp,
     send_whatsapp_text,
 )
-from app.services.wallet_service import credit_wallet, get_customer
+from app.services.wallet_service import credit_wallet, find_customer_by_phone
 from app.utils.logger import logger
 
 router = APIRouter(prefix="/api/payments", tags=["Payments"])
@@ -184,13 +184,7 @@ def _resolve_customer(db: Session, sender_id: str) -> Optional[Customer]:
     if not sender_id:
         return None
 
-    clean_id = sender_id.lstrip("+").strip()
-    customer = (
-        get_customer(db, clean_id)
-        or get_customer(db, sender_id)
-        or db.query(Customer).filter(Customer.whatsapp_id.contains(clean_id[-10:])).first()
-    )
-    return customer
+    return find_customer_by_phone(db, sender_id)
 
 
 def _already_processed(db: Session, payment_reference: str) -> bool:
@@ -212,33 +206,29 @@ def _already_processed(db: Session, payment_reference: str) -> bool:
         return False
 
 
-def _record_payment(
-    db: Session,
+def _payment_audit_row(
     payment_reference: str,
     sender_id: str,
     amount_paid: int,
-) -> None:
-    try:
-        db.add(
-            AuditLog(
-                user_id=None,
-                action=AUDIT_ACTION_PAYMENT_CAPTURED,
-                resource_id=payment_reference,
-                resource_type=AUDIT_RESOURCE_TYPE,
-                status="success",
-                details=json.dumps(
-                    {
-                        "sender_id": sender_id,
-                        "amount_paid": amount_paid,
-                        "currency": "INR",
-                    }
-                ),
-            )
-        )
-        db.commit()
-    except Exception as e:
-        logger.error(f"Audit log write failed: {e}")
-        db.rollback()
+    auto_provisioned: bool = False,
+) -> AuditLog:
+    return AuditLog(
+        user_id=None,
+        action=AUDIT_ACTION_PAYMENT_CAPTURED,
+        resource_id=payment_reference,
+        resource_type=AUDIT_RESOURCE_TYPE,
+        status="success",
+        details=json.dumps(
+            {
+                "sender_id": sender_id,
+                "amount_paid": amount_paid,
+                "currency": "INR",
+                # Payer had no matching customer; money is held on an
+                # unregistered wallet row until they register.
+                "auto_provisioned": auto_provisioned,
+            }
+        ),
+    )
 
 
 @router.post(
@@ -253,11 +243,18 @@ async def razorpay_webhook(
     raw_body = await request.body()
     signature_header = request.headers.get(SIGNATURE_HEADER)
 
-    if not verify_razorpay_signature(raw_body, signature_header):
-        logger.error("Razorpay webhook signature verification failed.")
+    if settings.RAZORPAY_WEBHOOK_SECRET:
+        if not verify_razorpay_signature(raw_body, signature_header):
+            logger.error("Razorpay webhook signature verification failed.")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid Razorpay webhook signature",
+            )
+    elif not settings.DEBUG:
+        logger.error("Razorpay webhook rejected: RAZORPAY_WEBHOOK_SECRET not configured and DEBUG is False.")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid Razorpay webhook signature",
+            detail="Webhook not configured",
         )
 
     try:
@@ -300,10 +297,24 @@ async def razorpay_webhook(
     customer = _resolve_customer(db, sender_id)
     customer_name = "Valued Customer"
 
+    customer_was_created = customer is None
+    # The audit row is the idempotency claim: it is written in the SAME
+    # transaction as the wallet change, and uq_audit_logs_money_once makes a
+    # concurrent duplicate fail -- so a payment credits at most once.
+    db.add(_payment_audit_row(payment_reference, clean_sender, amount_paid, customer_was_created))
+    try:
+        # Claim first: a concurrent duplicate fails here (on PostgreSQL it
+        # waits for the winner's commit, then fails) before any credit.
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        logger.info(f"Payment {payment_reference} already processed concurrently, skipping duplicate.")
+        return {"status": "already_processed"}
+
     if customer is None:
-        # gst_number / address are NOT NULL columns populated by the WhatsApp
-        # onboarding flow; a payer who has not onboarded yet gets the same
-        # "N/A" placeholder values that flow uses for unknown fields.
+        # Payer has no WhatsApp registration yet. Hold the money on an
+        # UNREGISTERED wallet row (placeholder NOT NULL values, as before); the
+        # registration flow adopts this row by phone and fills in real details.
         customer = Customer(
             whatsapp_id=clean_sender,
             full_name="Valued Customer",
@@ -311,22 +322,28 @@ async def razorpay_webhook(
             gst_number="N/A",
             address="N/A",
             wallet_balance=amount_paid,
-            is_registered=True,
+            is_registered=False,
         )
         db.add(customer)
-        try:
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            logger.error(f"Payment webhook: customer creation failed for {clean_sender}: {e}")
-            return {"status": "error", "message": "Customer provisioning failed"}
-        db.refresh(customer)
-    else:
-        credit_wallet(db, customer.whatsapp_id, amount_paid)
-        if getattr(customer, "full_name", None):
-            customer_name = customer.full_name
+    try:
+        if not customer_was_created:
+            if credit_wallet(db, customer.whatsapp_id, amount_paid, commit=False) != 1:
+                raise RuntimeError("customer row not updated")
+            if getattr(customer, "full_name", None):
+                customer_name = customer.full_name
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if _already_processed(db, payment_reference):
+            logger.info(f"Payment {payment_reference} already processed concurrently, skipping duplicate.")
+            return {"status": "already_processed"}
+        logger.error(f"Payment webhook: customer provisioning conflict for {clean_sender}")
+        return {"status": "error", "message": "Customer provisioning failed"}
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Payment webhook: wallet credit failed for {clean_sender}: {e}")
+        return {"status": "error", "message": "Wallet credit failed"}
 
-    _record_payment(db, payment_reference, clean_sender, amount_paid)
     logger.info(f"Wallet credited ₹{amount_paid} for {clean_sender}. Now sending WhatsApp confirmation.")
 
     # WhatsApp Notifications Dispatch
@@ -346,7 +363,6 @@ async def razorpay_webhook(
             amount=amount_paid,
         )
 
-        await asyncio.sleep(1)
         await send_document_to_whatsapp(
             recipient_id=clean_sender,
             document_bytes=pdf_bytes,
@@ -355,7 +371,6 @@ async def razorpay_webhook(
         )
 
         # 3. Balance and tips text
-        await asyncio.sleep(1)
         await send_whatsapp_text(
             recipient_id=clean_sender,
             message_text=PAYMENT_TIPS_MESSAGE.format(amount=amount_paid),
