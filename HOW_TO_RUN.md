@@ -192,10 +192,9 @@ ENABLE_ONBOARDING_GATE=False
 # Gemini text model used ONLY to extract registration fields (strict JSON)
 ONBOARDING_PARSER_MODEL=gemini-1.5-flash
 
-# ─── Wallet / paid generation (Scenarios 2, 3, 4) ──────────
-# false (DEFAULT) = every image is processed exactly as before
-# true            = wallet gate, batch funding and AI pre-validation
-ENABLE_WALLET_GATE=False
+# ─── Wallet / paid generation ───────────────────────────────
+# The wallet-balance gate is always active — there is no toggle for it.
+# Every inbound WhatsApp image is checked against the customer's balance.
 WALLET_IMAGE_PRICE_RUPEES=500
 # PSP-hosted payment page opened by the "Pay ₹500" CTA URL button.
 # Leave empty to fall back to the 'recharge_500' reply button.
@@ -223,8 +222,7 @@ LOG_LEVEL=DEBUG
 | `CELERY_TASK_ALWAYS_EAGER` | When `true`, tasks run synchronously — no Redis required. Set to `false` in production. |
 | `ENABLE_ONBOARDING_GATE` | When `true`, new WhatsApp users are onboarded (welcome → registration → recharge CTA) before using the service. `false` (default) leaves the existing WhatsApp pipeline exactly as it is. |
 | `ONBOARDING_PARSER_MODEL` | Gemini text model used only to extract registration fields from free-form WhatsApp messages (strict JSON). |
-| `ENABLE_WALLET_GATE` | When `true`, images are gated on the customer's wallet balance (Scenarios 2/3) and funded images are AI pre-validated (Scenario 4). `false` (default) leaves the image pipeline exactly as it is. |
-| `WALLET_IMAGE_PRICE_RUPEES` | Price charged per generated image, in whole Rupees. |
+| `WALLET_IMAGE_PRICE_RUPEES` | Price charged per generated image, in whole Rupees. The wallet-balance gate itself is always active and has no on/off toggle. |
 | `RECHARGE_PAYMENT_URL` | PSP-hosted payment page (e.g. a Razorpay link) used by the CTA URL button. Empty = fall back to the `recharge_500` reply button. |
 | `IMAGE_PREVALIDATION_FAIL_OPEN` | When `true` (default), an unavailable quality checker lets the image through instead of blocking a paying customer. |
 

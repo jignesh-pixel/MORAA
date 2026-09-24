@@ -821,7 +821,7 @@ export default function PromptGenerationPanel({
       // PREFERRED: Use Prompt 1 clean e-commerce output as product reference
       // FALLBACK: Use raw uploaded reference if Prompt 1 hasn't been run yet
       const refMime = mimeType || "image/jpeg";
-      const productRefImage = ecommerceState.imageUrl || imageBase64;
+      const productRefImage = imageBase64 || ecommerceState.imageUrl;
       const refImageDataUrl = productRefImage
         ? (productRefImage.startsWith("data:") ? productRefImage : `data:${refMime};base64,${productRefImage}`)
         : undefined;
@@ -1006,7 +1006,7 @@ export default function PromptGenerationPanel({
       // because Prompt 1 already produced a cleaned/standardized representation.
       // FALLBACK: Use the raw uploaded reference if Prompt 1 hasn't been run yet.
       const refMime = mimeType || "image/jpeg";
-      const productRefImage = ecommerceState.imageUrl || imageBase64;
+      const productRefImage = imageBase64 || ecommerceState.imageUrl;
       const refImageDataUrl = productRefImage
         ? (productRefImage.startsWith("data:") ? productRefImage : `data:${refMime};base64,${productRefImage}`)
         : undefined;
@@ -1105,7 +1105,7 @@ export default function PromptGenerationPanel({
       // PREFERRED: Use the Prompt 1 e-commerce output as the product reference
       // FALLBACK: Use the raw uploaded reference if Prompt 1 hasn't been run yet.
       const refMime = mimeType || "image/jpeg";
-      const productRefImage = ecommerceState.imageUrl || imageBase64;
+      const productRefImage = imageBase64 || ecommerceState.imageUrl;
       const refImageDataUrl = productRefImage
         ? (productRefImage.startsWith("data:") ? productRefImage : `data:${refMime};base64,${productRefImage}`)
         : undefined;
@@ -1208,7 +1208,7 @@ export default function PromptGenerationPanel({
       // PREFERRED: Use the Prompt 1 e-commerce output as the product reference
       // FALLBACK: Use the raw uploaded reference if Prompt 1 hasn't been run yet.
       const refMime = mimeType || "image/jpeg";
-      const productRefImage = ecommerceState.imageUrl || imageBase64;
+      const productRefImage = imageBase64 || ecommerceState.imageUrl;
       const refImageDataUrl = productRefImage
         ? (productRefImage.startsWith("data:") ? productRefImage : `data:${refMime};base64,${productRefImage}`)
         : undefined;
@@ -1307,7 +1307,7 @@ export default function PromptGenerationPanel({
       // PREFERRED: Use the Prompt 1 e-commerce output as the product reference
       // FALLBACK: Use the raw uploaded reference if Prompt 1 hasn't been run yet.
       const refMime = mimeType || "image/jpeg";
-      const productRefImage = ecommerceState.imageUrl || imageBase64;
+      const productRefImage = imageBase64 || ecommerceState.imageUrl;
       const refImageDataUrl = productRefImage
         ? (productRefImage.startsWith("data:") ? productRefImage : `data:${refMime};base64,${productRefImage}`)
         : undefined;
@@ -1406,7 +1406,7 @@ export default function PromptGenerationPanel({
       // PREFERRED: Use the Prompt 1 e-commerce output as the product reference
       // FALLBACK: Use the raw uploaded reference if Prompt 1 hasn't been run yet.
       const refMime = mimeType || "image/jpeg";
-      const productRefImage = ecommerceState.imageUrl || imageBase64;
+      const productRefImage = imageBase64 || ecommerceState.imageUrl;
       const refImageDataUrl = productRefImage
         ? (productRefImage.startsWith("data:") ? productRefImage : `data:${refMime};base64,${productRefImage}`)
         : undefined;
@@ -1502,7 +1502,7 @@ export default function PromptGenerationPanel({
       // PREFERRED: Use the Prompt 1 e-commerce output as the product reference
       // FALLBACK: Use the raw uploaded reference if Prompt 1 hasn't been run yet.
       const refMime = mimeType || "image/jpeg";
-      const productRefImage = ecommerceState.imageUrl || imageBase64;
+      const productRefImage = imageBase64 || ecommerceState.imageUrl;
       const refImageDataUrl = productRefImage
         ? (productRefImage.startsWith("data:") ? productRefImage : `data:${refMime};base64,${productRefImage}`)
         : undefined;
@@ -1512,6 +1512,7 @@ export default function PromptGenerationPanel({
         referenceImage: refImageDataUrl,
         referenceMimeType: refMime,
         forceProvider,
+        enforceQualityFloor: true,
       });
 
       if (result.success && result.image_url) {

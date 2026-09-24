@@ -2,7 +2,7 @@
 // gemini.service.ts — Google Gemini API Business Logic
 // MORAA GemVision
 // ============================================================
-// Uses @google/genai SDK with gemini-3.6-flash model which supports
+// Uses @google/genai SDK with gemini-2.5-flash model which supports
 // vision (image) input via inlineData parts.
 // ============================================================
 
@@ -20,6 +20,12 @@ import {
 } from "@/lib/errors";
 
 // ─── Constants ─────────────────────────────────────────────
+
+/**
+ * Pinned analysis model. Kept as an explicit literal so the direct Gemini
+ * route can never be resolved against a non-vision or retired model name.
+ */
+const ANALYSIS_MODEL = "gemini-2.5-flash";
 
 const MAX_RETRIES = 3;
 const BASE_RETRY_DELAY_MS = 1000;
@@ -192,6 +198,7 @@ export async function analyzeImageWithGemini(
   const client = getGeminiClient();
   const config = getGeminiConfig();
   const contents = buildGeminiContents({ prompt, imageBase64, mimeType });
+  const model = ANALYSIS_MODEL;
 
   let lastError: Error | null = null;
 
@@ -202,11 +209,11 @@ export async function analyzeImageWithGemini(
       logger.debug("Gemini API call start", {
         requestId,
         attempt: attempt + 1,
-        model: config.model,
+        model,
       });
 
       const response = await client.models.generateContent({
-        model: config.model,
+        model,
         contents,
         config: {
           temperature: config.temperature,
@@ -229,13 +236,13 @@ export async function analyzeImageWithGemini(
         executionTimeMs,
         promptTokens,
         completionTokens,
-        model: config.model,
+        model,
       });
 
       return {
         text,
         requestId,
-        model: config.model,
+        model,
         promptTokens,
         completionTokens,
         executionTimeMs,

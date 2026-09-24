@@ -53,6 +53,12 @@ export interface GenerateImageRequest {
    * Used for manual provider switching.
    */
   forceProvider?: string;
+  /**
+   * When true, the backend must pass a lightweight deterministic quality
+   * floor (decodable, minimum dimensions) before the image is returned as
+   * a success. Default false/omitted — existing callers are unaffected.
+   */
+  enforceQualityFloor?: boolean;
 }
 
 export interface GenerateImageResponse {

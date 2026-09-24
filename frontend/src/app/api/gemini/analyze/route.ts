@@ -113,6 +113,10 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   } catch (error: unknown) {
     const errMsg = error instanceof Error ? error.message : String(error);
 
+    // Raw SDK/trace output — surfaces request-validation rejections from the
+    // Google GenAI SDK that the structured logger would flatten.
+    console.error("ANALYSIS_ROUTE_ERROR:", error);
+
     logger.error("Unhandled error in /api/gemini/analyze", {
       error: errMsg,
     });

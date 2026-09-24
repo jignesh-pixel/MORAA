@@ -27,6 +27,16 @@ const DEFAULT_CONFIG: GeminiConfig = {
   topK: 40,
 };
 
+// ─── API targeting ─────────────────────────────────────────
+
+/**
+ * Explicit API version for the direct Gemini route. The v1beta surface is the
+ * one that exposes `models.generateContent` with inlineData image parts for
+ * the analysis models below; pinning it here prevents an implicit upgrade to a
+ * version whose request schema rejects the analysis payload.
+ */
+export const GEMINI_API_VERSION = "v1beta" as const;
+
 // ─── Client Singleton ──────────────────────────────────────
 
 let _client: GoogleGenAI | null = null;
@@ -49,7 +59,7 @@ export function getGeminiClient(): GoogleGenAI {
     );
   }
 
-  _client = new GoogleGenAI({ apiKey, apiVersion: 'v1beta' });
+  _client = new GoogleGenAI({ apiKey, apiVersion: GEMINI_API_VERSION });
   return _client;
 }
 

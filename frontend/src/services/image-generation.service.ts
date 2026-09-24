@@ -39,6 +39,7 @@ export async function generateImage(
         reference_mime_type: request.referenceMimeType || "image/jpeg",
         marketplace: request.marketplace,
         force_provider: request.forceProvider || null,
+        enforce_quality_floor: request.enforceQualityFloor || false,
       }),
     });
 

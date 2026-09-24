@@ -211,6 +211,38 @@ The backend supports pluggable AI analysis engines:
 
 Switch between them by setting `AI_ENGINE_TYPE=mock` or `AI_ENGINE_TYPE=vision` in your `.env`.
 
+This is separate from **image generation** (turning a jewellery photo into a
+polished product shot), which is its own provider chain — see below.
+
+---
+
+## 🖼️ Image Generation
+
+`POST /api/generate-image` generates a product image from a text prompt and
+an optional reference image, via `ImageGenerationManager`
+(`backend/app/ai/image_generation_manager.py`):
+
+- **Primary provider:** OpenAI (`gpt-image-1`, reference-aware editing)
+- **Fallback provider:** Gemini — used automatically on recoverable errors
+  (HTTP 429, timeouts, 5xx); quota/billing exhaustion and non-recoverable
+  errors (invalid prompt, safety block) halt immediately with no fallback
+  and no automatic retries.
+- Style-specific prompt builders live in `backend/app/services/*_prompt.py`
+  (e.g. e-commerce main image, macro shot, scale reference) and share a
+  common product-fidelity instruction block
+  (`backend/app/ai/product_fidelity.py`) that tells the model to preserve
+  the uploaded product's geometry, stones, and metal colour exactly.
+
+### WhatsApp catalog pack (paid)
+
+Customers can also send a photo directly over WhatsApp
+(`POST /api/meta/webhook`). Each image is billed one flat price
+(`WALLET_IMAGE_PRICE_RUPEES`, default ₹500) against the customer's prepaid
+wallet balance before a 7-style catalog pack is generated and delivered
+back over WhatsApp — see `backend/app/services/wallet_service.py` and
+`backend/app/services/meta_whatsapp_service.py`. The wallet-balance check
+is always active; there is no configuration flag to disable it.
+
 ---
 
 ## 🛠️ Tech Stack
@@ -271,6 +303,10 @@ alembic downgrade -1
 | GET | `/history` | List analysis history |
 | GET | `/history/{id}` | Get history detail |
 | GET | `/reports/{id}` | Download PDF report |
+| POST | `/api/generate-image` | Generate a product image (OpenAI primary, Gemini fallback) |
+| POST | `/api/meta/webhook` | WhatsApp Cloud API webhook (paid catalog-pack generation) |
+| GET | `/api/meta/webhook/failure-rate` | Windowed generation failure rate (auth required) |
+| POST | `/api/payments/razorpay/webhook` | Razorpay payment webhook (wallet top-up) |
 | GET | `/health` | Health check |
 
 ---
