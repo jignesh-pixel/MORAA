@@ -3,9 +3,11 @@
 Verifies:
 1. Provider chain order — OpenAI (primary) → Gemini (fallback)
 2. Reference priority block appended when reference image present
-3. Fallback logic — recoverable errors trigger fallback, non-recoverable do not
+3. Fallback logic — recoverable errors fall back; non-recoverable errors and
+   quota/billing exhaustion halt the chain (no fallback, no retries)
 4. Provider chain respects config overrides
-5. _is_recoverable_error / _is_non_recoverable_error classification
+5. _is_recoverable_error / _is_non_recoverable_error / _is_quota_exhaustion
+   classification
 """
 
 import asyncio
@@ -20,6 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from app.ai.image_generation_manager import (
     REFERENCE_PRIORITY_BLOCK,
     ImageGenerationManager,
+    _is_quota_exhaustion,
     _is_non_recoverable_error,
     _is_recoverable_error,
 )
@@ -138,7 +141,7 @@ class TestReferencePriorityBlock(unittest.TestCase):
         manager._providers = {"openai": mock_provider}
 
         # Call with reference image
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             manager.generate_image(
                 prompt="A gold ring on marble",
                 reference_image=b"fake_image_bytes",
@@ -177,7 +180,7 @@ class TestReferencePriorityBlock(unittest.TestCase):
         mock_provider.generate_image = capture_generate
         manager._providers = {"openai": mock_provider}
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             manager.generate_image(prompt="A gold ring on marble")
         )
 
@@ -214,7 +217,7 @@ class TestReferencePriorityBlock(unittest.TestCase):
         manager._providers = {"openai": mock_provider}
 
         prompt_with_ref = f"A gold ring. {REFERENCE_PRIORITY_BLOCK}"
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             manager.generate_image(
                 prompt=prompt_with_ref,
                 reference_image=b"fake_image_bytes",
@@ -231,13 +234,15 @@ class TestReferencePriorityBlock(unittest.TestCase):
 
 
 class TestErrorClassification(unittest.TestCase):
-    """Verify the recoverable / non-recoverable error classification."""
+    """Verify recoverable / non-recoverable / quota-halt classification."""
 
     def test_recoverable_429(self):
         self.assertTrue(_is_recoverable_error("Error 429: Too many requests"))
 
-    def test_recoverable_quota(self):
-        self.assertTrue(_is_recoverable_error("Quota exceeded for project"))
+    def test_quota_exhaustion_is_not_recoverable(self):
+        """Quota exhaustion is a project-level halt, never a recoverable error."""
+        self.assertFalse(_is_recoverable_error("Quota exceeded for project"))
+        self.assertTrue(_is_quota_exhaustion("Quota exceeded for project"))
 
     def test_recoverable_timeout(self):
         self.assertTrue(_is_recoverable_error("Request timeout after 60s"))
@@ -245,8 +250,10 @@ class TestErrorClassification(unittest.TestCase):
     def test_recoverable_503(self):
         self.assertTrue(_is_recoverable_error("503 Service Unavailable"))
 
-    def test_recoverable_resource_exhausted(self):
-        self.assertTrue(_is_recoverable_error("RESOURCE_EXHAUSTED: billing limit"))
+    def test_resource_exhausted_is_not_recoverable(self):
+        """RESOURCE_EXHAUSTED / billing exhaustion halts and is never recoverable."""
+        self.assertFalse(_is_recoverable_error("RESOURCE_EXHAUSTED: billing limit"))
+        self.assertTrue(_is_quota_exhaustion("RESOURCE_EXHAUSTED: billing limit"))
 
     def test_non_recoverable_safety(self):
         self.assertTrue(_is_non_recoverable_error("Content blocked by safety filter"))
@@ -323,7 +330,7 @@ class TestFallbackBehaviour(unittest.TestCase):
             "gemini": fallback_provider,
         }
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             manager.generate_image(prompt="A gold ring")
         )
 
@@ -379,13 +386,80 @@ class TestFallbackBehaviour(unittest.TestCase):
             "gemini": fallback_provider,
         }
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             manager.generate_image(prompt="A gold ring")
         )
 
         self.assertFalse(result.success)
         self.assertEqual(result.provider_name, "openai")
         self.assertEqual(len(fallback_called), 0, "Fallback must NOT be called for non-recoverable errors")
+
+    @patch("app.ai.image_generation_manager.settings")
+    def test_quota_exhaustion_halts_and_does_not_retry(self, mock_settings):
+        """Quota exhaustion halts after ONE attempt: no retry, no fallback.
+
+        Under the non-recoverable quota policy, a 429 / resource-exhausted
+        response is a project-level condition. The chain must stop instead of
+        consuming the fallback provider's quota on the same request.
+        """
+        mock_settings.PRIMARY_IMAGE_PROVIDER = "openai"
+        mock_settings.FALLBACK_IMAGE_PROVIDER = "gemini"
+
+        manager = ImageGenerationManager()
+        manager._initialised = True
+
+        primary_calls = []
+
+        primary_provider = MagicMock()
+        primary_provider.is_available = True
+        primary_provider.supports_reference_image.return_value = False
+
+        async def primary_quota(prompt, context, **kwargs):
+            primary_calls.append(True)
+            return ImageGenerationResult(
+                success=False,
+                error="429 Resource exhausted: quota exceeded for this project",
+                provider_name="openai",
+                processing_time=0.2,
+            )
+
+        primary_provider.generate_image = primary_quota
+
+        fallback_calls = []
+
+        fallback_provider = MagicMock()
+        fallback_provider.is_available = True
+        fallback_provider.supports_reference_image.return_value = False
+
+        async def fallback_track(prompt, context, **kwargs):
+            fallback_calls.append(True)
+            return ImageGenerationResult(
+                success=True,
+                image_url="data:image/png;base64,abc",
+                image_data=b"fake",
+                provider_name="gemini",
+                processing_time=2.0,
+            )
+
+        fallback_provider.generate_image = fallback_track
+
+        manager._providers = {
+            "openai": primary_provider,
+            "gemini": fallback_provider,
+        }
+
+        result = asyncio.run(manager.generate_image(prompt="A gold ring"))
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.provider_name, "openai")
+        self.assertTrue(result.metadata.get("non_recoverable"))
+        self.assertEqual(len(primary_calls), 1, "Quota exhaustion must attempt exactly once")
+        self.assertEqual(len(fallback_calls), 0, "Quota exhaustion must never trigger the fallback")
+        self.assertEqual(
+            ImageGenerationManager.MAX_RETRIES_PER_PROVIDER,
+            0,
+            "Provider retries are disabled by the 0-retry policy",
+        )
 
 
 if __name__ == "__main__":

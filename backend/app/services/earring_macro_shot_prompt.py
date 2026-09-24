@@ -7,14 +7,14 @@ Visual-failure fixes in this revision:
 - REMOVED the `- silver/white-gold appearance` line from the preserve list.
   Listing silver as a *preserve target* primed diffusion models to render
   gold earrings as silver at macro scale (silver-hallucination root cause).
-- AFFIRMATIVE metal lock: the prompt now states 100% WARM YELLOW GOLD
+- REFERENCE-BOUND metal lock: the prompt binds metal colour/tone to the
   positively instead of relying on a generic colour-negative list.
 - STRIPPED the 10-point FINAL VERIFICATION checklist and conversational
   clauses — non-functional for image models and token-diluting.
 - CATALOG STILL-LIFE FIX (2026-09-17): the previous framing clause "all
   elements stay sharp and inspectable" forced the model to zoom out and
   render the FULL earring pair as a catalog still life. The framing is now
-  a TIGHT MACRO CROP: one single focal section (emerald-cut stone, golden
+  a TIGHT MACRO CROP: one single focal section (a focal stone from the
   prongs, adjacent marquise leaf facets) fills 85% of the frame, shot on a
   100mm macro lens at f/2.8 with razor-thin depth of field. Full earrings
   in frame is declared a direct task failure.
@@ -66,11 +66,16 @@ from app.services.earring_ecommerce_prompt import (
 # this shot, instead of only what it must not become.
 METAL_AFFIRMATION_INSTRUCTION = (
     "METAL AFFIRMATION — MACRO COLOR LOCK (NON-NEGOTIABLE):\n"
-    "100% WARM YELLOW GOLD. Every visible prong, link, frame, and bezel is "
-    "rich saturated yellow gold matching the reference — under this macro "
-    "studio lighting as well. High dynamic range capture retaining full "
-    "yellow-gold saturation: zero desaturation, zero cooling, and no "
-    "specular highlight blowouts that make yellow gold appear silver."
+    "Match the metal colour and tone of the reference image EXACTLY. The "
+    "reference is the sole authority on metal type: render yellow gold as "
+    "rich saturated yellow gold, white gold as white gold, silver as "
+    "silver, rhodium as rhodium, platinum as platinum, and rose gold as "
+    "rose gold — never substitute one metal for another. Every visible "
+    "prong, link, frame, and bezel takes the reference metal's colour — "
+    "under this macro studio lighting as well. High dynamic range capture "
+    "retaining the reference metal's true saturation: zero desaturation, "
+    "zero cooling, and no specular highlight blowouts that shift the metal "
+    "toward a different colour."
 )
 
 
@@ -79,8 +84,10 @@ _MACRO_STYLE_INSTRUCTION = (
     "MACRO STYLE EXECUTION (NON-NEGOTIABLE):\n"
     "FRAMING & COMPOSITION: TIGHT MACRO CROP. Do NOT show the full earring. "
     "Do NOT show both earrings. Show only ONE tight focal section: an "
-    "extreme close-up of a single emerald-cut stone, its golden prongs, and "
-    "adjacent marquise leaf facets filling 85% of the frame.\n"
+    "extreme close-up of a single focal stone from the reference, its "
+    "reference-matched prongs, and adjacent facets filling 85% of the "
+    "frame — reproduce the gemstone cut actually present in the reference "
+    "(e.g. emerald, round, marquise, pear, oval); never invent a cut.\n"
     "• OPTICS: 100mm macro lens at f/2.8, extreme shallow depth of field. "
     "Razor-sharp focus on prong craftsmanship and gemstone facet reflections "
     "with soft background blur.\n"
@@ -100,7 +107,8 @@ _MACRO_STYLE_INSTRUCTION = (
 
 # ─── Lean global negatives (concise — negative lists do not scale) ──────
 _MACRO_GLOBAL_NEGATIVES = (
-    "DO NOT generate: silver or rhodium metal, oversized or resized "
+    "DO NOT generate: a substitute metal type that differs from the "
+    "reference, oversized or resized "
     "jewellery, added/removed/merged stones or beads, grey background, "
     "full earring pair in frame, entire earring visible, catalog still-life "
     "framing, earring photographed on cloth or fabric, artificial sharpening "
@@ -184,7 +192,8 @@ def build_macro_shot_prompt(
 if __name__ == "__main__":
     prompt = build_macro_shot_prompt()
     assert REFERENCE_PRIORITY_MARKER in prompt
-    assert "WARM YELLOW GOLD" in prompt
+    assert "sole authority on metal type" in prompt
+    assert "never invent a cut" in prompt
     assert "silver/white-gold appearance" not in prompt
     assert "FINAL VERIFICATION" not in prompt
     print(f"lean macro prompt: {len(prompt)} chars")

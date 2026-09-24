@@ -31,7 +31,7 @@ async def validate_jewelry_image_with_gemini(
     Fails open on timeout or API issues to prevent blocking the user pipeline.
     """
     if not settings.GEMINI_API_KEY:
-        logger.warning("GEMINI_API_KEY not found — passing quality guard by default")
+        logger.warning("QUALITY_GUARD_SKIPPED: GEMINI_API_KEY not found — passing by default")
         return True, ""
 
     b64_image = base64.b64encode(image_bytes).decode("utf-8")
@@ -61,7 +61,7 @@ async def validate_jewelry_image_with_gemini(
         async with httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.post(url, json=payload)
             if resp.status_code != 200:
-                logger.error(f"Gemini Guard API failed (status={resp.status_code}): {resp.text[:200]}")
+                logger.error(f"QUALITY_GUARD_SKIPPED: Gemini Guard API failed (status={resp.status_code}): {resp.text[:200]}")
                 return True, ""
 
             data = resp.json()
@@ -73,5 +73,5 @@ async def validate_jewelry_image_with_gemini(
             return is_valid, tip
 
     except Exception as e:
-        logger.error(f"Gemini Guard exception: {e}")
+        logger.error(f"QUALITY_GUARD_SKIPPED: Gemini Guard exception: {e}")
         return True, ""

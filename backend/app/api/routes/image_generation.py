@@ -27,6 +27,7 @@ from app.schemas.image_generation import (
     ImageGenerationRequest,
     ImageGenerationResponse,
 )
+from app.services.image_quality_floor import check_quality_floor
 from app.utils.logger import logger
 
 router = APIRouter(prefix="/api", tags=["Image Generation"])
@@ -123,6 +124,30 @@ async def generate_image(
                 f"fallback={result.fallback_used} "
                 f"time={result.processing_time:.2f}s"
             )
+
+            # Deterministic post-generation quality floor (P1·04) — opt-in,
+            # default off, so every existing caller is unaffected. On
+            # failure this is a single controlled failure (no auto-retry,
+            # no wallet interaction — this endpoint never touches the
+            # wallet), matching the manager's existing zero-auto-retry
+            # philosophy (MAX_RETRIES_PER_PROVIDER = 0).
+            if request.enforce_quality_floor and result.image_data:
+                floor_result = check_quality_floor(result.image_data)
+                if not floor_result.passed:
+                    logger.warning(
+                        f"Image generation quality floor failed: "
+                        f"reason={floor_result.reason} "
+                        f"dimensions={floor_result.width}x{floor_result.height}"
+                    )
+                    return ImageGenerationResponse(
+                        success=False,
+                        provider=result.provider_name,
+                        fallback_used=result.fallback_used,
+                        fallback_reason=result.fallback_reason,
+                        image_url=None,
+                        generation_time=round(result.processing_time, 2),
+                        error=f"quality_check_failed:{floor_result.reason}",
+                    )
 
             # Detect manual provider switch from metadata
             generation_mode = (result.metadata or {}).get("generation_mode", "primary")

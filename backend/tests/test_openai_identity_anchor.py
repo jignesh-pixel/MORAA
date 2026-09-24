@@ -73,7 +73,7 @@ class TestOpenAIIdentityAnchor(unittest.TestCase):
         mock_client.images.edit = capture_edit
 
         with patch("openai.AsyncOpenAI", return_value=mock_client):
-            asyncio.get_event_loop().run_until_complete(
+            asyncio.run(
                 provider.generate_image(
                     prompt="A gold ring on marble",
                     context={"request_id": "test", "aspect_ratio": "1:1"},
@@ -121,7 +121,7 @@ class TestOpenAIIdentityAnchor(unittest.TestCase):
         mock_client.images.generate = capture_generate
 
         with patch("openai.AsyncOpenAI", return_value=mock_client):
-            asyncio.get_event_loop().run_until_complete(
+            asyncio.run(
                 provider.generate_image(
                     prompt="A gold ring on marble",
                     context={"request_id": "test", "aspect_ratio": "1:1"},
@@ -173,7 +173,7 @@ class TestOpenAIIdentityAnchor(unittest.TestCase):
         )
 
         with patch("openai.AsyncOpenAI", return_value=mock_client):
-            asyncio.get_event_loop().run_until_complete(
+            asyncio.run(
                 provider.generate_image(
                     prompt=full_prompt,
                     context={"request_id": "test", "aspect_ratio": "1:1"},
@@ -220,7 +220,7 @@ class TestOpenAIIdentityAnchor(unittest.TestCase):
         reference_bytes = b"EXACT_REFERENCE_IMAGE_BYTES_12345"
 
         with patch("openai.AsyncOpenAI", return_value=mock_client):
-            asyncio.get_event_loop().run_until_complete(
+            asyncio.run(
                 provider.generate_image(
                     prompt="A test prompt",
                     context={"request_id": "test", "aspect_ratio": "1:1"},
@@ -249,7 +249,7 @@ class TestOpenAIIdentityAnchor(unittest.TestCase):
         mock_client.images.generate = AsyncMock(return_value=mock_response)
 
         with patch("openai.AsyncOpenAI", return_value=mock_client):
-            asyncio.get_event_loop().run_until_complete(
+            asyncio.run(
                 provider.generate_image(
                     prompt="A test prompt",
                     context={"request_id": "test", "aspect_ratio": "1:1"},

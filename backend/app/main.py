@@ -80,6 +80,22 @@ async def lifespan(app: FastAPI):
             f"Storage sweep skipped: {e}", extra={"category": "system"}
         )
 
+    # Image provider startup diagnosis (best-effort, non-fatal). Probes the
+    # configured Gemini image model once at boot and logs an actionable cause
+    # when access is broken (invalid model name, disabled API, quota
+    # exhaustion, key restrictions) instead of failing every request.
+    try:
+        from app.services.gemini_diagnostics import (
+            log_startup_image_provider_diagnosis,
+        )
+
+        await log_startup_image_provider_diagnosis()
+    except Exception as e:
+        logger.warning(
+            f"Image provider startup diagnosis skipped: {e}",
+            extra={"category": "system"},
+        )
+
     yield
 
     # Shutdown
@@ -128,14 +144,16 @@ app.include_router(earring_macro_shot.router)
 app.include_router(meta_webhook.router)
 app.include_router(payment_routes.router)
 
-# Serve uploaded files statically
+# Serve uploaded files statically. The directory is created here at import
+# time so a cold server reboot can never silently skip the mount (the
+# lifespan startup hook runs only after module import completes).
 uploads_path = settings.UPLOAD_PATH
-if uploads_path.exists():
-    app.mount(
-        "/uploads",
-        StaticFiles(directory=str(uploads_path)),
-        name="uploads",
-    )
+uploads_path.mkdir(parents=True, exist_ok=True)
+app.mount(
+    "/uploads",
+    StaticFiles(directory=str(uploads_path)),
+    name="uploads",
+)
 
 
 @app.get("/")

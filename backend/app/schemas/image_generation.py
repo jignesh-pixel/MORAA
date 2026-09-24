@@ -55,6 +55,15 @@ class ImageGenerationRequest(BaseModel):
             "When None, uses the default provider chain with automatic failover."
         ),
     )
+    enforce_quality_floor: bool = Field(
+        default=False,
+        description=(
+            "When true, the generated image must pass a lightweight "
+            "deterministic quality floor (decodable, minimum dimensions) "
+            "before being returned as a success. Default false — every "
+            "existing caller is unaffected unless it opts in."
+        ),
+    )
 
 
 class ImageGenerationResponse(BaseModel):

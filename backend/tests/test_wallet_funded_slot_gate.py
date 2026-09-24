@@ -30,6 +30,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 import app.models  # noqa: F401 — register every model with Base.metadata
+from app.config import settings
 from app.database import Base, get_db
 from app.models.customer import Customer
 from app.models.whatsapp_ingestion import WhatsAppIngestion
@@ -129,6 +130,16 @@ class FundedSlotGateTestCase(unittest.TestCase):
             # The 7-style generation itself is out of scope for this gate —
             # never let the background task actually run it.
             patch.object(webhook_module, "process_whatsapp_catalog_pack", new=AsyncMock(return_value=True)),
+            # Photo upload now asks which product to create; capture the
+            # buttons instead of calling Meta.
+            patch.object(
+                webhook_module,
+                "send_product_selection_buttons",
+                new=AsyncMock(return_value=True),
+            ),
+            # Upload + tap doubles the requests per test; keep the per-IP
+            # rate limiter from tripping across the whole suite.
+            patch.object(settings, "RATE_LIMIT_ENABLED", False),
         ]
         for patcher in self.patches:
             patcher.start()
@@ -142,6 +153,26 @@ class FundedSlotGateTestCase(unittest.TestCase):
 
     def _balance(self):
         return wallet_service.get_balance(self.session, SENDER)
+
+    def _choose(self, button="gv_pack1", sender=SENDER):
+        """Tap a product button for every photo still awaiting a choice."""
+        rows = (
+            self.session.query(WhatsAppIngestion)
+            .filter(WhatsAppIngestion.status == "awaiting_choice")
+            .order_by(WhatsAppIngestion.external_message_id)
+            .all()
+        )
+        for index, row in enumerate(rows):
+            payload = {
+                "object": "whatsapp_business_account",
+                "entry": [{"changes": [{"field": "messages", "value": {"messages": [{
+                    "type": "interactive", "id": f"wamid.tap.{row.id}.{index}", "from": sender,
+                    "timestamp": "1700000001",
+                    "interactive": {"type": "button_reply", "button_reply": {
+                        "id": f"{button}:{row.id}", "title": "x"}},
+                }]}}]}],
+            }
+            self.assertEqual(self.client.post("/api/meta/webhook", json=payload).status_code, 200)
 
     def _statuses(self):
         return [
@@ -160,21 +191,25 @@ class BalancePointTests(FundedSlotGateTestCase):
         response = self.client.post("/api/meta/webhook", json=_image_payload())
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(self._statuses(), [])
+        self.assertEqual(self._statuses(), ["unfunded"])
         self.assertEqual(self._balance(), 0)
         self.assertTrue(any("recharge" in (t or "").lower() for t in self.sent_texts))
 
     def test_below_one_image_worth_blocks_and_charges_nothing(self):
         _make_customer(self.session, balance=300)
         response = self.client.post("/api/meta/webhook", json=_image_payload())
+        self._choose("gv_pack1")
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(self._statuses(), [])
+        # Pack 1 tap declined: photo stays choosable, nothing charged or queued.
+        self.assertEqual(self._statuses(), ["awaiting_choice"])
         self.assertEqual(self._balance(), 300)
+        self.webhook_module.process_whatsapp_catalog_pack.assert_not_called()
 
     def test_699_funds_exactly_one_image_and_leaves_199(self):
         _make_customer(self.session, balance=699)
         response = self.client.post("/api/meta/webhook", json=_image_payload())
+        self._choose("gv_pack1")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self._statuses(), ["pack_queued"])
@@ -183,6 +218,7 @@ class BalancePointTests(FundedSlotGateTestCase):
     def test_700_funds_exactly_one_image_and_leaves_200(self):
         _make_customer(self.session, balance=700)
         response = self.client.post("/api/meta/webhook", json=_image_payload())
+        self._choose("gv_pack1")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self._statuses(), ["pack_queued"])
@@ -191,6 +227,7 @@ class BalancePointTests(FundedSlotGateTestCase):
     def test_1400_funds_two_images_and_leaves_400(self):
         _make_customer(self.session, balance=1400)
         response = self.client.post("/api/meta/webhook", json=_image_payload(count=2))
+        self._choose("gv_pack1")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self._statuses(), ["pack_queued", "pack_queued"])
@@ -199,25 +236,25 @@ class BalancePointTests(FundedSlotGateTestCase):
     def test_1400_with_three_images_funds_two_and_holds_one(self):
         _make_customer(self.session, balance=1400)
         response = self.client.post("/api/meta/webhook", json=_image_payload(count=3))
+        self._choose("gv_pack1")
 
         self.assertEqual(response.status_code, 200)
-        # Only the two funded images become ingestions; the third is held.
-        self.assertEqual(self._statuses(), ["pack_queued", "pack_queued"])
+        # Two taps are funded; the third photo is held (still choosable).
+        self.assertEqual(self._statuses(), ["pack_queued", "pack_queued", "awaiting_choice"])
         self.assertEqual(self._balance(), 400)
 
 
 class RefundAndRetryTests(FundedSlotGateTestCase):
     def test_failed_generation_dependency_refunds_and_does_not_double_charge(self):
-        """A failure after deduction (e.g. media download) refunds exactly once."""
+        """A media-download failure happens before any charge: nothing is debited."""
         _make_customer(self.session, balance=700)
 
         with patch.object(self.webhook_module, "download_media", new=AsyncMock(return_value=None)):
             response = self.client.post("/api/meta/webhook", json=_image_payload())
 
         self.assertEqual(response.status_code, 200)
-        # Charged then refunded — balance is exactly back to where it started.
         self.assertEqual(self._balance(), 700)
-        self.assertEqual(self._statuses(), [])
+        self.assertEqual(self._statuses(), ["rejected"])
 
     def test_duplicate_webhook_delivery_does_not_double_charge(self):
         """Retried/duplicate Meta deliveries of the same message must never re-charge."""
@@ -226,6 +263,7 @@ class RefundAndRetryTests(FundedSlotGateTestCase):
 
         first = self.client.post("/api/meta/webhook", json=payload)
         second = self.client.post("/api/meta/webhook", json=payload)
+        self._choose("gv_pack1")
 
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 200)

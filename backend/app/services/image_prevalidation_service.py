@@ -282,7 +282,7 @@ async def check_image_quality(
         )
         return _unavailable_result()
 
-    model_name = settings.IMAGE_PREVALIDATION_MODEL or "gemini-2.5-flash"
+    model_name = settings.IMAGE_PREVALIDATION_MODEL or "gemini-3.6-flash"
 
     try:
         client = genai.Client(api_key=settings.GEMINI_API_KEY)

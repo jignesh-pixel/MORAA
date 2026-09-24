@@ -197,6 +197,11 @@ class Settings(BaseSettings):
     # Price charged per generated image, in whole Indian Rupees.
     WALLET_IMAGE_PRICE_RUPEES: int = 500
 
+    # White Background E-Commerce Image (1 image, pure #FFFFFF) — selected by
+    # a WhatsApp image caption of exactly "white" / "plain white". Separate
+    # from WALLET_IMAGE_PRICE_RUPEES, which stays the E-Com Pack 1 price.
+    WHITE_BG_PRICE_RUPEES: int = 50
+
     # Razorpay (or any PSP) payment-page URL used by the "Pay ₹<price>" CTA
     # URL button. Leave empty to fall back to the interactive reply button
     # ('recharge_500' / "💳 Recharge to use") that the onboarding flow already
@@ -222,7 +227,9 @@ class Settings(BaseSettings):
     # --- AI image pre-validation (Scenario 4) ---
     # Fast Gemini quality inspection of a funded image before generation.
     IMAGE_PREVALIDATION_ENABLED: bool = True
-    IMAGE_PREVALIDATION_MODEL: str = "gemini-2.5-flash"
+    # gemini-2.5-flash now returns 404 "no longer available to new users";
+    # Google's error names gemini-3.6-flash as the replacement.
+    IMAGE_PREVALIDATION_MODEL: str = "gemini-3.6-flash"
     # When the inspector cannot run (no API key, outage, unparseable reply):
     # True  -> allow the image through (never block a paying customer)
     # False -> reject the image and ask the customer to resend

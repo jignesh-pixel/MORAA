@@ -927,7 +927,11 @@ def _refund_failed_ingestion(db, ingestion) -> None:
             logger.error(f"Refund skipped, customer not found: ingestion_id={ingestion.id}")
             return
 
-        price = price_per_image()
+        # Refund what was actually debited for this order. Legacy rows
+        # (amount_charged NULL, written before migration 0004) keep the
+        # Pack 1 price -- exactly the previous behaviour.
+        charged = getattr(ingestion, "amount_charged", None)
+        price = int(charged) if charged is not None else price_per_image()
         if not refund_generation_charge(db, cust.whatsapp_id, price):
             return
         db.add(
@@ -1171,10 +1175,10 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
             _fail_delivery(db, ingestion, "All Meta media uploads failed")
             return False
 
-        from app.services.wallet_service import find_customer_by_phone
+        from app.services.wallet_service import find_customer_by_phone, get_balance
 
         cust = find_customer_by_phone(db, ingestion.external_user_id)
-        rem_bal = int(cust.wallet_balance or 0) if cust else 0
+        rem_bal = get_balance(db, cust.whatsapp_id) if cust else 0
         balance_text = f"₹{rem_bal:,}"
 
         sent_count = await send_catalog_pack_images_to_whatsapp(
@@ -1213,6 +1217,273 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
 
     except Exception as e:
         logger.error(f"Catalog pack generation exception: ingestion_id={ingestion_id} error={e}")
+        return False
+    finally:
+        db.close()
+
+
+# ─── White Background E-Commerce Image (₹50, 1 image) ────────────────────
+# The customer picks the product with a WhatsApp reply button AFTER the photo
+# is stored (never from the caption). Button ids carry the ingestion id so the
+# choice is tied to the exact stored photo in the database.
+PRODUCT_BUTTON_WHITE = "gv_white"
+PRODUCT_BUTTON_PACK_1 = "gv_pack1"
+
+# Statuses a paid White order may be (re)generated from: freshly queued by
+# the product-choice handler, or reset to "stored" by the authenticated retry
+# endpoint.
+WHITE_BG_RUNNABLE_STATUSES = ("white_queued", "stored")
+
+WHITE_BG_DRY_RUN_CAPTION = (
+    "[TEST MODE - No API Charge] Ecommerce Shot: your photo is echoed back "
+    "unchanged. No image was generated and your wallet was not charged."
+)
+
+WHITE_BG_AUDIT_ACTION = "whatsapp_white_generated"
+
+
+def product_button_id(button: str, ingestion_id: str) -> str:
+    return f"{button}:{ingestion_id}"
+
+
+def parse_product_button_id(button_id: str) -> Optional[Tuple[str, str]]:
+    """Return (button, ingestion_id) for a product-choice reply id, else None."""
+    button, sep, ingestion_id = (button_id or "").partition(":")
+    if not sep or not ingestion_id or button not in (PRODUCT_BUTTON_WHITE, PRODUCT_BUTTON_PACK_1):
+        return None
+    return button, ingestion_id
+
+
+async def send_product_selection_buttons(
+    recipient_id: str,
+    ingestion_id: str,
+    white_price: int,
+    pack_price: int,
+    balance: int,
+    reply_to_message_id: Optional[str] = None,
+) -> bool:
+    """Ask which product to create for one stored photo (2 reply buttons).
+
+    Meta limits a reply-button title to 20 characters, so the titles are the
+    short forms; the body carries the full product names.
+    """
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": recipient_id,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {
+                "text": (
+                    "Your image is ready to process. What would you like to create?\n\n"
+                    f"• Ecommerce Shot Only — ₹{white_price}: 1 clean product image on pure white\n"
+                    f"• E-Com Pack 1 — ₹{pack_price}\n\n"
+                    f"Wallet balance: ₹{balance:,}"
+                ),
+            },
+            "action": {
+                "buttons": [
+                    {
+                        "type": "reply",
+                        "reply": {
+                            "id": product_button_id(PRODUCT_BUTTON_WHITE, ingestion_id),
+                            "title": f"Ecommerce Shot ₹{white_price}"[:20],
+                        },
+                    },
+                    {
+                        "type": "reply",
+                        "reply": {
+                            "id": product_button_id(PRODUCT_BUTTON_PACK_1, ingestion_id),
+                            "title": f"E-Com Pack 1 ₹{pack_price}"[:20],
+                        },
+                    },
+                ],
+            },
+        },
+    }
+    return await _post_message_payload(
+        payload, "product selection buttons", reply_to_message_id=reply_to_message_id
+    )
+
+
+async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
+    """Generate and deliver exactly ONE Ecommerce Shot (pure white) image.
+
+    Dedicated worker for product WHITE_BG -- never routes through the Pack 1
+    catalog worker. The order is claimed with one guarded UPDATE, so a second
+    trigger for the same ingestion can never run a second generation. Reuses
+    the frozen Prompt 1 builder and the shared ImageGenerationManager (spend
+    guard + Gemini -> OpenAI fallback). Every failure goes through
+    _fail_ingestion / _fail_delivery (refund of amount_charged exactly once)
+    and the customer is told; an unexpected exception is recorded the same
+    way, so a paid order is never left silently stuck in "processing".
+    """
+    import json
+    from pathlib import Path
+
+    from app.database import SessionLocal
+    from app.models.audit_log import AuditLog
+    from app.models.image import Image
+    from app.models.whatsapp_ingestion import PRODUCT_WHITE_BG, WhatsAppIngestion
+    from app.services.ecommerce_shot_prompt import build_ecommerce_shot_prompt
+
+    db = SessionLocal()
+    ingestion = None
+
+    async def _fail(message: str, delivery: bool = False) -> bool:
+        if delivery:
+            _fail_delivery(db, ingestion, message)
+        else:
+            _fail_ingestion(db, ingestion, message)
+        refunded = int(ingestion.amount_charged or 0)
+        try:
+            await send_whatsapp_text(
+                ingestion.external_user_id,
+                (
+                    "Sorry, we couldn't create your Ecommerce Shot this time. "
+                    + (f"₹{refunded} has been refunded to your wallet." if refunded else "You were not charged.")
+                ),
+                reply_to_message_id=ingestion.external_message_id,
+            )
+        except Exception as notify_error:
+            logger.error(f"White BG failure notice not sent: {notify_error}")
+        return False
+
+    try:
+        # Atomic claim: only one caller can move a runnable order to processing.
+        claimed = (
+            db.query(WhatsAppIngestion)
+            .filter(
+                WhatsAppIngestion.id == ingestion_id,
+                WhatsAppIngestion.product_code == PRODUCT_WHITE_BG,
+                WhatsAppIngestion.status.in_(WHITE_BG_RUNNABLE_STATUSES),
+            )
+            .update(
+                {WhatsAppIngestion.status: "processing", WhatsAppIngestion.error_message: None},
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        if claimed != 1:
+            logger.info(f"White BG: ingestion {ingestion_id} not runnable (missing, other product, or already claimed)")
+            return False
+
+        ingestion = db.query(WhatsAppIngestion).filter(WhatsAppIngestion.id == ingestion_id).first()
+        db.refresh(ingestion)
+
+        image_record = db.query(Image).filter(Image.id == ingestion.image_id).first()
+        if not image_record:
+            return await _fail("Image record not found")
+        image_path = Path(image_record.file_path)
+        if not image_path.exists():
+            return await _fail(f"Image file not found: {image_path}")
+        reference_image_bytes = image_path.read_bytes()
+        if not reference_image_bytes:
+            return await _fail("Image file is empty")
+        reference_mime_type = ingestion.mime_type or "image/jpeg"
+
+        provider_name, model_used, fallback_used = "dry_run", "none", False
+        if DRY_RUN_IMAGE_MODE:
+            logger.warning(
+                f"[TEST MODE - No API Charge] White BG dry-run ingestion_id={ingestion_id}: "
+                "echoing input image, no provider call made"
+            )
+            data_url = _bytes_to_data_url(reference_image_bytes, reference_mime_type)
+        else:
+            from app.ai.image_generation_manager import ImageGenerationManager
+
+            # The customer's stored photo goes to the model as the reference
+            # image; the prompt tells it to re-photograph THAT earring on white.
+            result = await ImageGenerationManager().generate_image(
+                prompt=build_ecommerce_shot_prompt(),
+                context={"request_id": ingestion.request_id, "aspect_ratio": "1:1"},
+                reference_image=reference_image_bytes,
+                reference_mime_type=reference_mime_type,
+            )
+            if not result.success or not result.image_url:
+                return await _fail(f"Generation failed: {result.error}")
+            data_url = result.image_url
+            provider_name = result.provider_name or ""
+            model_used = result.model_used or ""
+            fallback_used = bool(result.fallback_used)
+
+        generated_bytes = _data_url_to_bytes(data_url)
+        if not generated_bytes:
+            return await _fail("Failed to decode generated image data")
+
+        # Keep the delivered image next to the stored original, and record
+        # which provider/model produced it (non-fatal: delivery is what the
+        # customer paid for).
+        output_path = image_path.parent / f"white_bg_{ingestion.id}.png"
+        try:
+            output_path.write_bytes(generated_bytes)
+        except Exception as store_error:
+            logger.error(f"White BG: could not store output for {ingestion_id}: {store_error}")
+            output_path = None
+        db.add(
+            AuditLog(
+                action=WHITE_BG_AUDIT_ACTION,
+                resource_id=ingestion.id,
+                resource_type="whatsapp_ingestion",
+                status="success",
+                details=json.dumps({
+                    "provider": provider_name,
+                    "model": model_used,
+                    "fallback_used": fallback_used,
+                    "dry_run": DRY_RUN_IMAGE_MODE,
+                    "output_path": str(output_path) if output_path else None,
+                }),
+            )
+        )
+        ingestion.status = "generated"
+        db.commit()
+
+        media_id = await upload_media_to_meta(generated_bytes)
+        if not media_id:
+            return await _fail("Meta media upload failed", delivery=True)
+
+        if DRY_RUN_IMAGE_MODE:
+            caption = WHITE_BG_DRY_RUN_CAPTION
+        else:
+            from app.services.wallet_service import find_customer_by_phone, get_balance
+
+            cust = find_customer_by_phone(db, ingestion.external_user_id)
+            rem_bal = get_balance(db, cust.whatsapp_id) if cust else 0
+            caption = (
+                "Here's your Ecommerce Shot ✨\n"
+                f"Remaining balance: ₹{rem_bal:,}"
+            )
+
+        sent = await send_image_to_whatsapp(
+            recipient_id=ingestion.external_user_id,
+            media_id=media_id,
+            caption=caption,
+            reply_to_message_id=ingestion.external_message_id,
+        )
+        if not sent:
+            return await _fail("Meta message send failed", delivery=True)
+
+        ingestion.status = "delivered"
+        ingestion.error_message = None
+        db.commit()
+        logger.info(
+            f"White BG delivered: ingestion_id={ingestion_id} provider={provider_name} model={model_used}"
+        )
+        return True
+
+    except Exception as e:
+        logger.error(f"White BG unexpected error: ingestion_id={ingestion_id} error={e}")
+        try:
+            db.rollback()
+            if ingestion is not None:
+                db.refresh(ingestion)
+                if ingestion.status not in ("failed", "delivery_failed", "delivered"):
+                    return await _fail(f"Unexpected error: {e}"[:1000])
+        except Exception as fail_error:
+            logger.error(
+                f"White BG could not record failure: ingestion_id={ingestion_id} "
+                f"error={fail_error}"
+            )
         return False
     finally:
         db.close()

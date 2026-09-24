@@ -100,9 +100,26 @@ def get_customer(db: Session, whatsapp_id: str) -> Optional[Customer]:
 
 
 def get_balance(db: Session, whatsapp_id: str) -> int:
-    """Current wallet balance in Rupees (0 when the customer is unknown)."""
-    customer = get_customer(db, whatsapp_id)
-    return customer.balance_rupees if customer else 0
+    """Current wallet balance in Rupees (0 when the customer is unknown).
+
+    Single source of truth for every balance shown to a customer. A
+    column-only query always goes to the database, so it never returns a
+    Customer object cached earlier in this session (which could be seconds
+    old while a payment or a charge commits in another request).
+    """
+    if not whatsapp_id:
+        return 0
+    try:
+        value = (
+            db.query(Customer.wallet_balance)
+            .filter(Customer.whatsapp_id == whatsapp_id)
+            .scalar()
+        )
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Wallet: balance lookup failed: {e}")
+        return 0
+    return max(int(value or 0), 0)
 
 
 def find_customer_by_phone(db: Session, phone: str) -> Optional[Customer]:

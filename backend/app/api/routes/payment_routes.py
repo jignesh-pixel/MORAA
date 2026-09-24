@@ -21,7 +21,7 @@ from app.services.meta_whatsapp_service import (
     send_document_to_whatsapp,
     send_whatsapp_text,
 )
-from app.services.wallet_service import credit_wallet, find_customer_by_phone
+from app.services.wallet_service import credit_wallet, find_customer_by_phone, get_balance
 from app.utils.logger import logger
 
 router = APIRouter(prefix="/api/payments", tags=["Payments"])
@@ -33,7 +33,7 @@ AUDIT_ACTION_PAYMENT_CAPTURED = "razorpay_payment_captured"
 AUDIT_RESOURCE_TYPE = "razorpay_payment"
 
 PAYMENT_TIPS_MESSAGE = (
-    "Current balance: ₹{amount} 💰\n\n"
+    "Payment of ₹{paid} received. Current balance: ₹{balance} 💰\n\n"
     "You’re ready to go! For the best results:\n"
     "📸 Shoot in a well-lit space\n"
     "💎 Only one pair of earrings per photo\n"
@@ -290,7 +290,7 @@ async def razorpay_webhook(
         return {"status": "missing_phone"}
 
     if _already_processed(db, payment_reference):
-        logger.info(f"Payment {payment_reference} already processed, skipping duplicate.")
+        logger.info(f"Payment {payment_reference} already processed, skipping duplicate (event={event}, no credit).")
         return {"status": "already_processed"}
 
     clean_sender = sender_id.lstrip("+").strip()
@@ -344,7 +344,11 @@ async def razorpay_webhook(
         logger.error(f"Payment webhook: wallet credit failed for {clean_sender}: {e}")
         return {"status": "error", "message": "Wallet credit failed"}
 
-    logger.info(f"Wallet credited ₹{amount_paid} for {clean_sender}. Now sending WhatsApp confirmation.")
+    logger.info(
+        f"Wallet credited ₹{amount_paid} for {clean_sender}: event={event} "
+        f"payment_id={payment_reference} balance_after={get_balance(db, customer.whatsapp_id)}. "
+        "Now sending WhatsApp confirmation."
+    )
 
     # WhatsApp Notifications Dispatch
     try:
@@ -373,7 +377,13 @@ async def razorpay_webhook(
         # 3. Balance and tips text
         await send_whatsapp_text(
             recipient_id=clean_sender,
-            message_text=PAYMENT_TIPS_MESSAGE.format(amount=amount_paid),
+            # Read the balance from the database at send time (it includes
+            # this credit and anything else that committed meanwhile); never
+            # echo the payment amount as the balance.
+            message_text=PAYMENT_TIPS_MESSAGE.format(
+                paid=f"{amount_paid:,}",
+                balance=f"{get_balance(db, customer.whatsapp_id):,}",
+            ),
         )
         logger.info(f"Successfully sent confirmation, invoice and tips to {clean_sender}")
     except Exception as e:

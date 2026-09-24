@@ -60,7 +60,7 @@ class TestMarketplaceAspectRatio(unittest.TestCase):
         mock_provider.generate_image = capture_generate
         manager._providers = {"openai": mock_provider}
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             manager.generate_image(
                 prompt="A gold earring",
                 context={"aspect_ratio": "4:5", "request_id": "test-1"},
@@ -102,7 +102,7 @@ class TestMarketplaceAspectRatio(unittest.TestCase):
         mock_provider.generate_image = capture_generate
         manager._providers = {"openai": mock_provider}
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             manager.generate_image(
                 prompt="A gold earring",
                 context={"aspect_ratio": "16:9", "request_id": "test-2"},
@@ -144,7 +144,7 @@ class TestMarketplaceAspectRatio(unittest.TestCase):
         mock_provider.generate_image = capture_generate
         manager._providers = {"openai": mock_provider}
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             manager.generate_image(
                 prompt="A gold ring",
                 context={"aspect_ratio": "4:5", "request_id": "test-3"},
@@ -186,7 +186,7 @@ class TestMarketplaceAspectRatio(unittest.TestCase):
         mock_provider.generate_image = capture_generate
         manager._providers = {"openai": mock_provider}
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             manager.generate_image(
                 prompt="A gold ring",
                 context={"aspect_ratio": "4:5", "request_id": "test-4"},
@@ -228,7 +228,7 @@ class TestMarketplaceAspectRatio(unittest.TestCase):
         mock_provider.generate_image = capture_generate
         manager._providers = {"openai": mock_provider}
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             manager.generate_image(
                 prompt="A gold earring",
                 context={"request_id": "test-5"},
@@ -268,7 +268,7 @@ class TestMarketplaceAspectRatio(unittest.TestCase):
         manager._providers = {"openai": mock_provider}
 
         original_context = {"aspect_ratio": "4:5", "request_id": "test-6"}
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             manager.generate_image(
                 prompt="A gold earring",
                 context=original_context,

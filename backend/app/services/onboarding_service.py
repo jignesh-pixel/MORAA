@@ -33,6 +33,7 @@ Pay, image pre-validation, Celery/generation changes, Scenarios 2-4.
 import asyncio
 import json
 import re
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -524,6 +525,49 @@ def _coerce_llm_payload(payload: Dict[str, Any], text: str) -> RegistrationData:
     return data.recompute_completeness()
 
 
+# --- Cost safety net (audit: unbounded paid Gemini calls if this gate is
+# ever enabled). Lightweight and in-process on purpose: this whole path is
+# disabled by default (ENABLE_ONBOARDING_GATE=False) and unused today, so a
+# new DB table isn't warranted -- this only caps spend once someone flips
+# the gate on. Mirrors the quota-exhaustion pattern already used in
+# app/ai/image_generation_manager.py.
+_QUOTA_EXHAUSTION_PATTERNS = (
+    "quota exceeded",
+    "resource exhausted",
+    "resource_exhausted",
+    "credit_balance_exhausted",
+    "billing",
+    "rate limit",
+    "429",
+)
+_onboarding_quota_cooldown_until: float = 0.0
+_onboarding_daily_call_count: int = 0
+_onboarding_daily_call_day: Optional[str] = None
+
+
+def _is_onboarding_quota_exhaustion(error_text: str) -> bool:
+    lowered = error_text.lower()
+    return any(pattern in lowered for pattern in _QUOTA_EXHAUSTION_PATTERNS)
+
+
+def _onboarding_budget_ok() -> bool:
+    """False when the paid Gemini parser call should be skipped this time:
+    a quota-exhaustion cooldown is active, or today's call budget is spent.
+    Callers fall back to the deterministic heuristic parser either way."""
+    global _onboarding_daily_call_count, _onboarding_daily_call_day
+
+    now = time.time()
+    if now < _onboarding_quota_cooldown_until:
+        return False
+
+    today = time.strftime("%Y-%m-%d", time.gmtime(now))
+    if _onboarding_daily_call_day != today:
+        _onboarding_daily_call_day = today
+        _onboarding_daily_call_count = 0
+
+    return _onboarding_daily_call_count < settings.ONBOARDING_PARSER_MAX_CALLS_PER_DAY
+
+
 async def _extract_via_gemini(text: str) -> Optional[RegistrationData]:
     """Call the Gemini text model and return parsed fields, or None on failure.
 
@@ -544,7 +588,17 @@ async def _extract_via_gemini(text: str) -> Optional[RegistrationData]:
         )
         return None
 
+    if not _onboarding_budget_ok():
+        logger.warning(
+            "Onboarding: Gemini parser skipped (daily budget spent or quota "
+            "cooldown active) -- using fallback parser"
+        )
+        return None
+
     model_name = settings.ONBOARDING_PARSER_MODEL or settings.GEMINI_MODEL
+
+    global _onboarding_daily_call_count
+    _onboarding_daily_call_count += 1
 
     try:
         client = genai.Client(api_key=settings.GEMINI_API_KEY)
@@ -580,6 +634,13 @@ async def _extract_via_gemini(text: str) -> Optional[RegistrationData]:
     except Exception as e:
         # Never log tokens/secrets — only the error summary.
         logger.error(f"Onboarding: Gemini parser failed: {e}")
+        if _is_onboarding_quota_exhaustion(str(e)):
+            global _onboarding_quota_cooldown_until
+            _onboarding_quota_cooldown_until = time.time() + settings.ONBOARDING_PARSER_QUOTA_COOLDOWN_SECONDS
+            logger.error(
+                "Onboarding: Gemini quota/rate exhaustion detected — pausing "
+                f"parser calls for {settings.ONBOARDING_PARSER_QUOTA_COOLDOWN_SECONDS}s"
+            )
         return None
 
 

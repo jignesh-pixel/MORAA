@@ -17,6 +17,12 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.database import Base
 
 
+# Product codes stored on each paid ingestion. NULL (legacy rows written
+# before migration 0004) is treated as PRODUCT_PACK_1 everywhere.
+PRODUCT_PACK_1 = "PACK_1"
+PRODUCT_WHITE_BG = "WHITE_BG"
+
+
 class WhatsAppIngestion(Base):
     """Records an incoming WhatsApp message and its internal processing state.
 
@@ -106,6 +112,18 @@ class WhatsAppIngestion(Base):
         Text,
         nullable=True,
         comment="Error details if ingestion failed at any stage",
+    )
+
+    # ── Product purchased (migration 0004) ─────────────────────────────
+    product_code: Mapped[str] = mapped_column(
+        String(20),
+        nullable=True,
+        comment="PACK_1 | WHITE_BG. NULL = legacy row, treated as PACK_1",
+    )
+    amount_charged: Mapped[int] = mapped_column(
+        Integer,
+        nullable=True,
+        comment="Rupees actually debited for this order; refunds use this. NULL = legacy",
     )
 
     # ── Timestamps ─────────────────────────────────────────────────────

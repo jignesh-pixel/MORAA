@@ -38,3 +38,10 @@ build/
 # Logs
 *.log
 logs/
+
+# Ad-hoc experiment/scratch outputs (generated during development)
+task2_outputs/
+task3_outputs/
+task4_outputs/
+task5_outputs/
+prompt_experiment_outputs/

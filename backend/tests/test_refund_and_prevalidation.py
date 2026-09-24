@@ -100,6 +100,7 @@ class PrevalidationBeforeChargeTests(FundedSlotGateTestCase):
         with patch.object(settings, "IMAGE_PREVALIDATION_ENABLED", enabled), \
              patch.object(self.webhook_module, "check_image_quality", new=check):
             self.assertEqual(self.client.post("/api/meta/webhook", json=_image_payload()).status_code, 200)
+        self._choose("gv_pack1")  # the customer picks E-Com Pack 1
         return check
 
     def test_rejection_no_charge_no_generation(self):
@@ -107,7 +108,7 @@ class PrevalidationBeforeChargeTests(FundedSlotGateTestCase):
         check = self._post(enabled=True, approved=False)
         check.assert_awaited_once()
         self.assertEqual(self._balance(), 700)
-        self.assertEqual(self._statuses(), [])
+        self.assertEqual(self._statuses(), ["rejected"])
         self.webhook_module.process_whatsapp_catalog_pack.assert_not_called()
         self.assertIn("bad photo", self.sent_texts)
 

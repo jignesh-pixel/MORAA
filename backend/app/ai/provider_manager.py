@@ -37,6 +37,22 @@ _PROVIDER_REGISTRY: Dict[str, type[BaseAIProvider]] = {
     "local_vision": LocalVisionProvider,
 }
 
+# Same quota/billing halt used in image_generation_manager.py: on a
+# quota-exhaustion-class error, stop escalating through the rest of the
+# provider chain instead of burning a call against every paid provider.
+_QUOTA_EXHAUSTION_PATTERNS = (
+    "quota exceeded",
+    "resource exhausted",
+    "resource_exhausted",
+    "credit_balance_exhausted",
+    "billing",
+)
+
+
+def _is_quota_exhaustion(error_text: str) -> bool:
+    lowered = (error_text or "").lower()
+    return any(p in lowered for p in _QUOTA_EXHAUSTION_PATTERNS)
+
 
 class AIProviderManager:
     """Orchestrates AI analysis with automatic provider failover.
@@ -44,11 +60,14 @@ class AIProviderManager:
     The manager:
     - Selects the primary provider from ``settings.PRIMARY_AI_PROVIDER``
     - Falls back to ``settings.BACKUP_AI_PROVIDER`` then ``local_vision``
-    - Retries each provider up to ``MAX_RETRIES_PER_PROVIDER`` times
+    - Performs ONE controlled attempt per provider (no hidden retries)
     - Logs every step, retry, and fallback event
     """
 
-    MAX_RETRIES_PER_PROVIDER: int = 2
+    # Zero retries: a single attempt per provider. Matches
+    # ImageGenerationManager so neither manager can silently burn credits in
+    # an uncontrolled retry loop. Fallback still occurs on transient errors.
+    MAX_RETRIES_PER_PROVIDER: int = 0
     RETRY_DELAY_SECONDS: float = 2.0
 
     def __init__(self):
@@ -170,6 +189,17 @@ class AIProviderManager:
                         f"Provider '{provider_name}' attempt {attempt + 1} "
                         f"failed: {last_error} request_id={request_id}"
                     )
+                    if _is_quota_exhaustion(last_error):
+                        logger.error(
+                            f"Provider '{provider_name}' quota/billing exhausted - "
+                            f"halting chain instead of escalating request_id={request_id}"
+                        )
+                        return ProviderResult(
+                            success=False,
+                            error=last_error,
+                            provider_name=provider_name,
+                            fallback_used=fallback_used,
+                        )
 
                 except Exception as e:
                     last_error = str(e)
@@ -177,6 +207,17 @@ class AIProviderManager:
                         f"Provider '{provider_name}' attempt {attempt + 1} "
                         f"exception: {last_error} request_id={request_id}"
                     )
+                    if _is_quota_exhaustion(last_error):
+                        logger.error(
+                            f"Provider '{provider_name}' quota/billing exhausted - "
+                            f"halting chain instead of escalating request_id={request_id}"
+                        )
+                        return ProviderResult(
+                            success=False,
+                            error=last_error,
+                            provider_name=provider_name,
+                            fallback_used=fallback_used,
+                        )
 
             # All retries exhausted for this provider
             logger.warning(
