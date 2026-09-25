@@ -33,13 +33,11 @@ AUDIT_ACTION_PAYMENT_CAPTURED = "razorpay_payment_captured"
 AUDIT_RESOURCE_TYPE = "razorpay_payment"
 
 PAYMENT_TIPS_MESSAGE = (
-    "Payment of ₹{paid} received. Current balance: ₹{balance} 💰\n\n"
-    "You’re ready to go! For the best results:\n"
-    "📸 Shoot in a well-lit space\n"
-    "💎 Only one pair of earrings per photo\n"
-    "🔍 Keep it sharp — avoid lens blur\n"
-    "📱 Upload in HD\n\n"
-    "Send your photo whenever you’re ready!"
+    "Payment Received 💳\n\n"
+    "₹{paid} has been added to your wallet.\n"
+    "Current Balance: ₹{balance}\n\n"
+    "Send your earring photo whenever you're ready! 📸\n"
+    "(Tip: Good lighting and sharp focus produce the best studio results)"
 )
 
 
@@ -352,10 +350,14 @@ async def razorpay_webhook(
 
     # WhatsApp Notifications Dispatch
     try:
-        # 1. Immediate confirmation
+        # 1. Payment receipt with the balance read from the DB at send time
+        # (includes this credit; never echoes the payment amount as balance).
         await send_whatsapp_text(
             recipient_id=clean_sender,
-            message_text="Payment received, thank you 🙏",
+            message_text=PAYMENT_TIPS_MESSAGE.format(
+                paid=f"{amount_paid:,}",
+                balance=f"{get_balance(db, customer.whatsapp_id):,}",
+            ),
         )
 
         # 2. PDF Invoice Dispatch
@@ -374,17 +376,6 @@ async def razorpay_webhook(
             caption="",
         )
 
-        # 3. Balance and tips text
-        await send_whatsapp_text(
-            recipient_id=clean_sender,
-            # Read the balance from the database at send time (it includes
-            # this credit and anything else that committed meanwhile); never
-            # echo the payment amount as the balance.
-            message_text=PAYMENT_TIPS_MESSAGE.format(
-                paid=f"{amount_paid:,}",
-                balance=f"{get_balance(db, customer.whatsapp_id):,}",
-            ),
-        )
         logger.info(f"Successfully sent confirmation, invoice and tips to {clean_sender}")
     except Exception as e:
         logger.error(f"Post-payment WhatsApp dispatch failed: {e}")

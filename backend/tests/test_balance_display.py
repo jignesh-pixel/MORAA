@@ -71,9 +71,14 @@ class PaymentConfirmationShowsRealBalanceTests(unittest.TestCase):
             app.dependency_overrides.clear()
         self.assertEqual(r.status_code, 200)
         self.assertEqual(wallet_service.get_balance(db, SENDER), 2000)
-        tips = [t for t in texts if "Current balance" in (t or "")]
-        self.assertEqual(len(tips), 1)
-        self.assertIn("Payment of ₹500 received. Current balance: ₹2,000", tips[0])
+        receipts = [t for t in texts if "Current Balance" in (t or "")]
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(
+            receipts[0],
+            "Payment Received 💳\n\n₹500 has been added to your wallet.\nCurrent Balance: ₹2,000\n\n"
+            "Send your earring photo whenever you're ready! 📸\n"
+            "(Tip: Good lighting and sharp focus produce the best studio results)",
+        )
         db.close()
         engine.dispose()
 

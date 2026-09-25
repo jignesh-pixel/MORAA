@@ -52,5 +52,50 @@ class GreetingAndRegistrationNeverTouchBalanceTests(FundedSlotGateTestCase):
         self.assertEqual(wallet_service.get_balance(self.session, SENDER), 0)
 
 
+NEW_FORM = "• Name: Anurag Mehta\n• Brand Name: Moraa Jewels\n• City: Surat\n• GSTIN (Optional):"
+
+
+class NewRegistrationTemplateTests(FundedSlotGateTestCase):
+    def _post(self, payload):
+        self.assertEqual(self.client.post("/api/meta/webhook", json=payload).status_code, 200)
+
+    def test_hi_sends_the_new_registration_request(self):
+        self._post(_text("Hi"))
+        self.assertEqual(self.sent_texts, [
+            "Welcome to Moraa Studio ✨\n\n"
+            "We transform your raw jewelry photos into studio-grade product visuals in seconds.\n\n"
+            "Let’s quickly set up your account!",
+            "Quick Setup 📋\n\nPlease reply with your details:\n\n"
+            "• Name:\n• Brand Name:\n• City:\n• GSTIN (Optional):",
+        ])
+
+    def test_new_form_with_bullets_and_blank_gstin_registers_at_zero(self):
+        from unittest.mock import AsyncMock, patch
+
+        cta = AsyncMock(return_value=True)
+        with patch.object(self.webhook_module, "send_whatsapp_cta_url_button", new=cta), \
+             patch.object(self.webhook_module, "create_recharge_payment_link", new=AsyncMock(return_value="https://pay")):
+            self._post(_text(NEW_FORM, message_id="wamid.new"))
+        cust = self.session.query(Customer).filter_by(whatsapp_id=SENDER).one()
+        self.assertEqual((cust.full_name, cust.business_name, cust.gst_number, cust.address, cust.wallet_balance),
+                         ("Anurag", "Moraa Jewels", "N/A", "Surat", 0))
+        kwargs = cta.await_args.kwargs
+        self.assertEqual(kwargs["body_text"],
+                         "You're all set, Anurag! 🎉\n\nYour account is ready.\n"
+                         "Wallet Balance: ₹0\n\nRecharge your wallet below to get started:")
+        self.assertEqual(kwargs["button_label"], "Recharge Wallet")
+
+    def test_confirmation_shows_existing_balance(self):
+        from unittest.mock import AsyncMock, patch
+
+        _make_customer(self.session, balance=2500)
+        cta = AsyncMock(return_value=True)
+        with patch.object(self.webhook_module, "send_whatsapp_cta_url_button", new=cta), \
+             patch.object(self.webhook_module, "create_recharge_payment_link", new=AsyncMock(return_value="https://pay")):
+            self._post(_text(NEW_FORM, message_id="wamid.new2"))
+        self.assertIn("Wallet Balance: ₹2,500", cta.await_args.kwargs["body_text"])
+        self.assertEqual(self._balance(), 2500)
+
+
 if __name__ == "__main__":
     unittest.main()

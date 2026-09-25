@@ -439,8 +439,9 @@ class RazorpayWebhookRouteTests(unittest.TestCase):
         self.assertEqual(len(audits), 1)
         self.assertEqual(audits[0].resource_id, PAYMENT_ID)
 
-        # Confirmation text + invoice + tips = 3 messages.
-        self.assertEqual(len(self.sent_texts), 2)
+        # One "Payment Received" receipt (with the updated balance) + invoice.
+        self.assertEqual(len(self.sent_texts), 1)
+        self.assertIn("Payment Received 💳", self.sent_texts[0][1])
         self.assertEqual(len(self.sent_docs), 1)
         self.assertEqual(self.sent_docs[0][0], SENDER)
         self.assertIn(".pdf", self.sent_docs[0][1])

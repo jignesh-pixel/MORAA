@@ -17,6 +17,7 @@ from app.models.version_history import VersionHistory
 from app.models.whatsapp_ingestion import WhatsAppIngestion
 from app.models.customer import Customer
 from app.models.onboarding_session import OnboardingSession
+from app.models.whatsapp_payment_order import WhatsAppPaymentOrder
 
 __all__ = [
     "User",
@@ -32,4 +33,5 @@ __all__ = [
     "WhatsAppIngestion",
     "Customer",
     "OnboardingSession",
+    "WhatsAppPaymentOrder",
 ]

@@ -69,6 +69,7 @@ def init_db() -> None:
         User,
         VersionHistory,
         WhatsAppIngestion,
+        WhatsAppPaymentOrder,
     )
 
     Base.metadata.create_all(bind=engine)

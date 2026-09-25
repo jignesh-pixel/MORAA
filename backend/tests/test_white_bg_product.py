@@ -82,12 +82,16 @@ class ButtonPayloadTests(unittest.TestCase):
         self.assertEqual(p["type"], "interactive")
         self.assertEqual(p["to"], SENDER)
         self.assertEqual(p["interactive"]["type"], "button")
-        self.assertIn("What would you like to create?", p["interactive"]["body"]["text"])
-        self.assertIn("Ecommerce Shot Only — ₹50", p["interactive"]["body"]["text"])
-        self.assertIn("E-Com Pack 1 — ₹500", p["interactive"]["body"]["text"])
+        self.assertEqual(
+            p["interactive"]["body"]["text"],
+            "Photo received 📸\n\nWhat would you like to create for this design?\n\n"
+            "• Clean Studio Shot (₹50) — 1 polished product image on pure white with natural soft shadows.\n"
+            "• Full Catalog Pack (₹500) — Multi-angle commercial set with lifestyle staging.\n\n"
+            "Wallet Balance: ₹700",
+        )
         buttons = [b["reply"] for b in p["interactive"]["action"]["buttons"]]
         self.assertEqual([b["id"] for b in buttons], ["gv_white:ing-1", "gv_pack1:ing-1"])
-        self.assertEqual([b["title"] for b in buttons], ["Ecommerce Shot ₹50", "E-Com Pack 1 ₹500"])
+        self.assertEqual([b["title"] for b in buttons], ["Studio Shot — ₹50", "Catalog Pack — ₹500"])
         for b in buttons:
             self.assertLessEqual(len(b["title"]), 20)  # Meta reply-button title limit
             self.assertLessEqual(len(b["id"]), 256)
@@ -199,7 +203,7 @@ class ProductChoiceWebhookTests(FundedSlotGateTestCase):
         self.assertEqual((row.status, row.product_code), ("awaiting_choice", None))
         self.assertEqual(self._balance(), 499)
         self.pack_worker.assert_not_called()
-        self.assertTrue(any("Your wallet balance is ₹499" in t and "₹500 is required for E-Com Pack 1" in t
+        self.assertTrue(any("Your wallet balance is ₹499" in t and "₹500 is required for Full Catalog Pack" in t
                             for t in self._texts()))
         self._post(_tap(f"gv_white:{row.id}", message_id="wamid.t2"))
         self.assertEqual(self._balance(), 449)
