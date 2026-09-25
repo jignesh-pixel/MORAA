@@ -78,3 +78,5 @@ Thumbs.db
 .vscode/
 .idea/
 nul
+
+.claude/settings.local.json
