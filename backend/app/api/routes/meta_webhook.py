@@ -23,6 +23,7 @@ import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 import re
+import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.responses import PlainTextResponse
@@ -52,6 +53,7 @@ from app.services.meta_whatsapp_service import (
     parse_product_button_id,
     process_whatsapp_white_bg,
     send_product_selection_buttons,
+    send_registration_flow,
     download_media,
     get_media_url,
     parse_webhook_entry,
@@ -63,6 +65,10 @@ from app.services.meta_whatsapp_service import (
 )
 from app.services.razorpay_service import create_recharge_payment_link
 from app.services.upload_service import UploadService
+from app.services.whatsapp_pay_service import (
+    handle_payment_status_event,
+    try_send_native_recharge,
+)
 from app.services.wallet_service import (
     charge_customer_balance,
     find_customer_by_phone,
@@ -77,6 +83,12 @@ from app.utils.logger import logger
 router = APIRouter(prefix="/api/meta", tags=["Meta WhatsApp Webhook"])
 
 DEFAULT_PAYMENT_URL = settings.RECHARGE_PAYMENT_URL
+
+
+def _hold_body(price: int, balance: Optional[int] = None, product: str = "this image") -> str:
+    """_hold_message without the link line, for the in-chat WhatsApp Pay order."""
+    balance_line = f"Your wallet balance is {format_rupees(balance)}.\n" if balance is not None else ""
+    return f"⚠️ {balance_line}{format_rupees(price)} is required for {product}.\nRecharge your wallet below:"
 
 
 def _hold_message(price: int, balance: Optional[int] = None, product: str = "this image") -> str:
@@ -173,7 +185,238 @@ async def _trigger_generation(ingestion_id: str) -> None:
 # restarts, multiple workers and late taps). The wallet is debited only when
 # a button is tapped, through wallet_service.charge_customer_balance.
 
-PRODUCT_LABELS = {PRODUCT_WHITE_BG: "Ecommerce Shot Only", PRODUCT_PACK_1: "E-Com Pack 1"}
+PRODUCT_LABELS = {PRODUCT_WHITE_BG: "Clean Studio Shot", PRODUCT_PACK_1: "Full Catalog Pack"}
+
+WELCOME_MESSAGE = (
+    "Welcome to Moraa Studio ✨\n\n"
+    "We transform your raw jewelry photos into studio-grade product visuals in seconds.\n\n"
+    "Let’s quickly set up your account!"
+)
+
+REGISTRATION_REQUEST_MESSAGE = (
+    "Quick Setup 📋\n\n"
+    "Please reply with your details:\n\n"
+    "• Name:\n"
+    "• Brand Name:\n"
+    "• City:\n"
+    "• GSTIN (Optional):"
+)
+
+REGISTRATION_CONFIRMATION_TEMPLATE = (
+    "You're all set, {name}! 🎉\n\n"
+    "Your account is ready.\n"
+    "Wallet Balance: ₹{balance}\n\n"
+    "Recharge your wallet below to get started:"
+)
+
+# GSTIN rules used by BOTH the text and the Flow registration paths: a valid
+# 15-char GSTIN is stored uppercase without spaces; anything else (empty,
+# "NA"/"none"/..., malformed) is stored as the "N/A" convention.
+_GSTIN_RE = re.compile(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]$")
+
+
+def _normalize_gst(value: Any) -> str:
+    if not isinstance(value, str):
+        return "N/A"
+    gst_norm = value.replace(" ", "").upper()
+    return gst_norm if _GSTIN_RE.match(gst_norm) else "N/A"
+
+
+def _upsert_registered_customer(
+    db: Session,
+    sender: str,
+    full_name: str,
+    business_name: str,
+    gst_number: str,
+    address: str,
+) -> Optional[Customer]:
+    """Write the registration profile onto the sender's customer row.
+
+    Registration only ever writes profile fields. The wallet balance is never
+    credited or reset here: an existing customer (including an unregistered
+    placeholder row created by a payment) keeps their exact balance, a new
+    one starts at ₹0. Money is added only by the signed Razorpay webhook.
+    """
+    clean_sender = sender.lstrip("+").strip()
+    cust = _find_customer_safe(db, sender)
+    if cust is not None:
+        cust.full_name = full_name
+        cust.business_name = business_name
+        cust.gst_number = gst_number
+        cust.address = address
+        cust.is_registered = True
+        db.commit()
+        return cust
+    try:
+        return BaseRepository(Customer, db).create(
+            whatsapp_id=clean_sender,
+            full_name=full_name,
+            business_name=business_name,
+            gst_number=gst_number,
+            address=address,
+            wallet_balance=0,
+            is_registered=True,
+        )
+    except Exception as create_error:
+        db.rollback()
+        logger.error(f"Onboarding customer creation failed: {create_error}")
+        return _find_customer_safe(db, sender)
+
+
+async def _send_registration_confirmation(
+    db: Session, sender: str, cust: Customer, display_name: str
+) -> None:
+    """"You're all set" + Recharge Wallet CTA (fresh ₹500 Razorpay link)."""
+    confirm_msg = REGISTRATION_CONFIRMATION_TEMPLATE.format(
+        name=display_name,
+        balance=f"{get_balance(db, cust.whatsapp_id):,}",
+    )
+    if await try_send_native_recharge(db, sender, 500, confirm_msg):
+        return
+    try:
+        pay_url = await create_recharge_payment_link(
+            customer_phone=sender,
+            customer_name=display_name,
+            amount=500,
+        )
+    except Exception as e:
+        logger.error("Failed to generate registration recharge link: {}", e)
+        pay_url = DEFAULT_PAYMENT_URL
+
+    await send_whatsapp_cta_url_button(
+        recipient_id=sender,
+        body_text=confirm_msg,
+        button_label="Recharge Wallet",
+        url=pay_url or DEFAULT_PAYMENT_URL,
+    )
+
+
+# ─── WhatsApp Flow registration ──────────────────────────────────────────
+# A Flow submission is claimed once per WhatsApp message id with an audit row
+# (resource_id = uuid5 of the message id, which fits the 36-char column). A
+# Meta retry of the same submission finds that row and does nothing: no
+# profile rewrite, no new payment link, no second confirmation.
+
+REGISTRATION_FLOW_AUDIT_ACTION = "whatsapp_registration_flow"
+_FLOW_DEDUPE_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "moraa-gemvision/whatsapp-registration-flow")
+
+
+def _flow_dedupe_key(message_id: str) -> str:
+    return str(uuid.uuid5(_FLOW_DEDUPE_NAMESPACE, message_id))
+
+
+def _flow_already_processed(db: Session, dedupe_key: str) -> bool:
+    return (
+        db.query(AuditLog.id)
+        .filter(
+            AuditLog.action == REGISTRATION_FLOW_AUDIT_ACTION,
+            AuditLog.resource_id == dedupe_key,
+        )
+        .first()
+        is not None
+    )
+
+
+def _flow_text(value: Any, max_len: Optional[int] = None) -> str:
+    """Trim + collapse whitespace; the full value is kept (column cap only)."""
+    if not isinstance(value, str):
+        return ""
+    cleaned = " ".join(value.split())
+    return cleaned[:max_len] if max_len else cleaned
+
+
+async def _handle_registration_flow(db: Session, event: Dict[str, Any]) -> bool:
+    """Create/update the sender's customer from a registration Flow submission.
+
+    Returns True only when this call registered the customer and sent the
+    confirmation. Never raises.
+    """
+    sender = (event.get("sender") or "").strip()
+    message_id = (event.get("message_id") or "").strip()
+    data = event.get("flow_response") or {}
+    if not sender:
+        return False
+
+    full_name = _flow_text(data.get("full_name"), 255)
+    business_name = _flow_text(data.get("business_name"), 255)
+    address = _flow_text(data.get("address")) or "N/A"
+    gst_number = _normalize_gst(data.get("gst_number"))
+
+    dedupe_key = _flow_dedupe_key(message_id) if message_id else None
+    if dedupe_key and _flow_already_processed(db, dedupe_key):
+        logger.info(f"Duplicate registration Flow ignored: message_id={message_id[:40]}")
+        return False
+
+    if not full_name or not business_name:
+        logger.warning(f"Registration Flow missing name/business: sender={sender}")
+        await send_whatsapp_text(sender, REGISTRATION_REQUEST_MESSAGE)
+        return False
+
+    cust: Optional[Customer] = None
+    for _attempt in range(2):
+        try:
+            existing = _find_customer_safe(db, sender)
+            if existing is not None:
+                # Row lock (PostgreSQL) serialises concurrent copies of the
+                # same submission; the loser then sees the winner's claim.
+                cust = (
+                    db.query(Customer)
+                    .filter(Customer.id == existing.id)
+                    .with_for_update()
+                    .one()
+                )
+                if dedupe_key and _flow_already_processed(db, dedupe_key):
+                    db.rollback()
+                    logger.info(f"Duplicate registration Flow ignored: message_id={message_id[:40]}")
+                    return False
+                cust.full_name = full_name
+                cust.business_name = business_name
+                cust.gst_number = gst_number
+                cust.address = address
+                cust.is_registered = True
+            else:
+                cust = Customer(
+                    whatsapp_id=sender.lstrip("+").strip(),
+                    full_name=full_name,
+                    business_name=business_name,
+                    gst_number=gst_number,
+                    address=address,
+                    wallet_balance=0,
+                    is_registered=True,
+                )
+                db.add(cust)
+            if dedupe_key:
+                db.add(
+                    AuditLog(
+                        action=REGISTRATION_FLOW_AUDIT_ACTION,
+                        resource_id=dedupe_key,
+                        resource_type="whatsapp_message",
+                        status="success",
+                        details=json.dumps({
+                            "whatsapp_id": sender,
+                            "message_id": message_id,
+                            "flow_token": data.get("flow_token"),
+                        }),
+                    )
+                )
+            db.commit()
+            break
+        except IntegrityError:
+            # A concurrent request created this customer first (unique
+            # whatsapp_id): retry once against the now-existing row.
+            db.rollback()
+            cust = None
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Registration Flow save failed for {sender}: {e}")
+            return False
+    if cust is None:
+        logger.error(f"Registration Flow could not be saved for {sender}")
+        return False
+
+    await _send_registration_confirmation(db, sender, cust, full_name)
+    return True
+
 
 ALREADY_CHOSEN_MESSAGE = (
     "This photo already has an order, so nothing new was charged. "
@@ -249,11 +492,15 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
         ingestion.status = "unfunded"
         ingestion.error_message = f"Balance {balance} below minimum {min_price} at upload"
         db.commit()
+        hold_balance = get_balance(db, customer.whatsapp_id) if customer else 0
+        if customer is not None and await try_send_native_recharge(
+            db, sender, max(min_price, 500), _hold_body(min_price, hold_balance, "an order"),
+            reply_to_message_id=message_id,
+        ):
+            return None
         await send_whatsapp_text(
             recipient_id=sender,
-            message_text=_hold_message(
-                min_price, get_balance(db, customer.whatsapp_id) if customer else 0, "an order"
-            ),
+            message_text=_hold_message(min_price, hold_balance, "an order"),
             reply_to_message_id=message_id,
         )
         return None
@@ -382,6 +629,10 @@ async def _handle_product_choice(
         )
         db.commit()
         balance = get_balance(db, customer.whatsapp_id) if customer else 0
+        if await try_send_native_recharge(
+            db, sender, max(price, 500), _hold_body(price, balance, label), reply_to_message_id=quote_id,
+        ):
+            return None
         await send_whatsapp_text(
             recipient_id=sender,
             message_text=_hold_message(price, balance, label),
@@ -397,7 +648,7 @@ async def _handle_product_choice(
     if product == PRODUCT_WHITE_BG:
         await send_whatsapp_text(
             sender,
-            "✨ Processing your Ecommerce Shot (1 image"
+            "✨ Processing your Clean Studio Shot (1 image"
             + (", test mode - no charge" if dry_run else f", ₹{price}")
             + ")... Please allow 20-30 seconds.",
             reply_to_message_id=quote_id,
@@ -479,6 +730,10 @@ async def receive_webhook(
         for event in events:
             event_type = event.get("type", "")
 
+            if event_type == "payment_status":
+                await handle_payment_status_event(db, event)
+                continue
+
             if event_type == "status":
                 continue
 
@@ -488,116 +743,59 @@ async def receive_webhook(
                 lower_text = raw_text.lower()
                 logger.info("Text message received: sender={} text='{}'", sender, raw_text)
 
-                if "name:" in lower_text and ("business" in lower_text or "gst" in lower_text):
+                if "name:" in lower_text and any(k in lower_text for k in ("business", "brand", "gst", "city")):
                     user_name = "there"
                     biz_name = "Jewelry Business"
                     gst_val = "N/A"
                     addr_val = "N/A"
 
                     for line in raw_text.splitlines():
-                        line_clean = line.strip()
+                        # Customers often paste the "• Name:" bullets back.
+                        line_clean = line.strip().lstrip("•*-–· ").strip()
                         l_low = line_clean.lower()
                         if l_low.startswith("name:"):
                             extracted = line_clean.split(":", 1)[1].strip()
                             if extracted:
                                 user_name = extracted.split()[0]
-                        elif "business name" in l_low and ":" in line_clean:
+                        elif ("business name" in l_low or "brand name" in l_low) and ":" in line_clean:
                             extracted_biz = line_clean.split(":", 1)[1].strip()
                             if extracted_biz:
                                 biz_name = extracted_biz
                         elif "gst" in l_low and ":" in line_clean:
                             extracted_gst = line_clean.split(":", 1)[1].strip()
                             if extracted_gst:
-                                # t9: only accept a value that either looks like a
-                                # real 15-char GSTIN or is an explicit "no GST"
-                                # answer; anything else falls back to N/A instead
-                                # of silently storing malformed text.
-                                _gst_norm = extracted_gst.replace(" ", "").upper()
-                                _gst_none = extracted_gst.strip().lower() in ("na", "n/a", "none", "no", "nil", "-")
-                                _gst_valid = bool(re.match(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]$", _gst_norm))
-                                if _gst_valid:
-                                    gst_val = _gst_norm
-                                elif _gst_none:
-                                    gst_val = "N/A"
-                                # else: leave gst_val at its previous value (default "N/A")
-                        elif "address" in l_low and ":" in line_clean:
+                                # t9: only a real 15-char GSTIN is stored;
+                                # "NA"/"none"/malformed text becomes N/A.
+                                gst_val = _normalize_gst(extracted_gst)
+                        elif ("address" in l_low or l_low.startswith("city")) and ":" in line_clean:
                             extracted_addr = line_clean.split(":", 1)[1].strip()
                             if extracted_addr:
                                 addr_val = extracted_addr
 
-                    clean_sender = sender.lstrip("+").strip()
-                    cust = _find_customer_safe(db, sender)
-
-                    # Registration only ever writes profile fields. The wallet
-                    # balance is never credited or reset here: an existing
-                    # customer keeps their exact balance, a new one starts at
-                    # ₹0. Money is added only by the signed Razorpay webhook.
-                    if cust is not None:
-                        cust.full_name = user_name
-                        cust.business_name = biz_name
-                        cust.gst_number = gst_val
-                        cust.address = addr_val
-                        cust.is_registered = True
-                        db.commit()
-                    else:
-                        try:
-                            cust = BaseRepository(Customer, db).create(
-                                whatsapp_id=clean_sender,
-                                full_name=user_name,
-                                business_name=biz_name,
-                                gst_number=gst_val,
-                                address=addr_val,
-                                wallet_balance=0,
-                                is_registered=True,
-                            )
-                        except Exception as create_error:
-                            db.rollback()
-                            logger.error(f"Onboarding customer creation failed: {create_error}")
-                            cust = _find_customer_safe(db, sender)
-
+                    cust = _upsert_registered_customer(
+                        db, sender, user_name, biz_name, gst_val, addr_val
+                    )
                     if cust is None:
                         continue
 
-                    confirm_msg = (
-                        f"Congratulations {user_name}! You’re registered with Moraa Studio 🎉\n"
-                        f"You’re all set to start creating stunning product photos.\n"
-                        f"Wallet balance: ₹{get_balance(db, cust.whatsapp_id):,}\n\n"
-                        f"Need to update your details later? Just send the same form again anytime."
-                    )
-                    try:
-                        pay_url = await create_recharge_payment_link(
-                            customer_phone=sender,
-                            customer_name=user_name,
-                            amount=500,
-                        )
-                    except Exception as e:
-                        logger.error("Failed to generate registration recharge link: {}", e)
-                        pay_url = DEFAULT_PAYMENT_URL
-
-                    await send_whatsapp_cta_url_button(
-                        recipient_id=sender,
-                        body_text=confirm_msg,
-                        button_label="Recharge to use",
-                        url=pay_url or DEFAULT_PAYMENT_URL,
-                    )
+                    await _send_registration_confirmation(db, sender, cust, user_name)
                     continue
 
                 if re.search(r"\b(hi|hii|hello|hey|start)\b", lower_text):
-                    msg_part_1 = (
-                        "Hi there! Welcome to Moraa Studio ✨\n"
-                        "We help you turn raw jewelry photos into polished, e-commerce ready images "
-                    )
-                    msg_part_2 = (
-                        "Let’s get you set up, it only takes a minute!\n\n"
-                        "Quick registration 📋\n"
-                        "Copy this, fill in your details and send it right back:\n\n"
-                        "Name:\n"
-                        "Business name:\n"
-                        "GST number:\n"
-                        "Business address:"
-                    )
-                    await send_whatsapp_text(sender, msg_part_1)
-                    await send_whatsapp_text(sender, msg_part_2)
+                    # Two separate messages: welcome first, then the form.
+                    # New / unregistered senders get the registration Flow;
+                    # when it is not configured or Meta rejects it (and for
+                    # registered customers, as before) the text form is sent.
+                    await send_whatsapp_text(sender, WELCOME_MESSAGE)
+                    greet_cust = _find_customer_safe(db, sender)
+                    if greet_cust is None or not greet_cust.is_registered:
+                        if await send_registration_flow(sender):
+                            continue
+                        logger.warning(
+                            "Registration Flow not sent (unconfigured or rejected by Meta) — "
+                            "falling back to text registration: sender={}", sender
+                        )
+                    await send_whatsapp_text(sender, REGISTRATION_REQUEST_MESSAGE)
                     continue
 
                 recharge_match = re.search(r"\b(?:recharge|pay|add)\s*(?:rs\.?|inr|₹)?\s*(\d+)\b", lower_text)
@@ -610,6 +808,11 @@ async def receive_webhook(
                         )
                         continue
 
+                    if await try_send_native_recharge(
+                        db, sender, requested_amount,
+                        f"Recharge your Moraa Studio wallet with ₹{requested_amount} 💳",
+                    ):
+                        continue
                     cust = _find_customer_safe(db, sender)
                     cust_name = getattr(cust, "full_name", "Customer") if cust else "Customer"
                     try:
@@ -630,6 +833,10 @@ async def receive_webhook(
                     )
                     continue
 
+                continue
+
+            if event_type == "interactive" and event.get("subtype") == "nfm_reply":
+                await _handle_registration_flow(db, event)
                 continue
 
             if event_type == "interactive" and event.get("subtype") == "button_reply":

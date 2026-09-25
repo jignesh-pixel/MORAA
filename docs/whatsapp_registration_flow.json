@@ -1,0 +1,60 @@
+{
+  "version": "7.3",
+  "screens": [
+    {
+      "id": "REGISTRATION",
+      "title": "Business Setup",
+      "terminal": true,
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "TextBody",
+            "text": "Set up your MORAA GemVision account. It takes less than a minute."
+          },
+          {
+            "type": "TextInput",
+            "name": "full_name",
+            "label": "Full Name",
+            "input-type": "text",
+            "required": true
+          },
+          {
+            "type": "TextInput",
+            "name": "business_name",
+            "label": "Business / Store Name",
+            "input-type": "text",
+            "required": true
+          },
+          {
+            "type": "TextArea",
+            "name": "address",
+            "label": "Address",
+            "required": true
+          },
+          {
+            "type": "TextInput",
+            "name": "gst_number",
+            "label": "GSTIN (Optional)",
+            "input-type": "text",
+            "required": false,
+            "helper-text": "15 characters, e.g. 24ABCDE1234F1Z5. Leave blank if none."
+          },
+          {
+            "type": "Footer",
+            "label": "Submit",
+            "on-click-action": {
+              "name": "complete",
+              "payload": {
+                "full_name": "${form.full_name}",
+                "business_name": "${form.business_name}",
+                "address": "${form.address}",
+                "gst_number": "${form.gst_number}"
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

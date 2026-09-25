@@ -154,6 +154,42 @@ class Settings(BaseSettings):
     META_APP_SECRET: str = ""
     # Maximum WhatsApp image download size (bytes) — 5 MB safety limit
     META_MAX_MEDIA_BYTES: int = 5 * 1024 * 1024
+    # WhatsApp Flow used for new-customer registration (Name / Brand /
+    # Address / GSTIN). Leave META_REGISTRATION_FLOW_ID empty to keep the
+    # plain-text "Quick Setup" registration message. The screen is the ID of
+    # the Flow's first screen (defined in the Flow JSON, not by Meta).
+    # META_REGISTRATION_FLOW_MODE: "draft" (default, unpublished Flow) or
+    # "published" once the Flow is published in WhatsApp Manager.
+    META_REGISTRATION_FLOW_ID: str = ""
+    META_REGISTRATION_FLOW_SCREEN: str = "REGISTRATION"
+    META_REGISTRATION_FLOW_MODE: str = "draft"
+
+    # --- WhatsApp Pay (native in-chat order_details, India) ---
+    # OFF by default: while False nothing below is used and every recharge
+    # prompt behaves exactly as before (Razorpay payment link CTA / text).
+    # When True, recharge prompts send a native order_details message using
+    # the Razorpay payment configuration named WHATSAPP_PAY_CONFIGURATION_NAME
+    # (must match the name created in WhatsApp Manager exactly, max 60 chars);
+    # any dispatch failure silently falls back to the Razorpay link CTA.
+    WHATSAPP_PAY_ENABLED: bool = False
+    WHATSAPP_PAY_CONFIGURATION_NAME: str = ""
+    # Comma-separated WhatsApp numbers for a pilot; empty = everyone.
+    WHATSAPP_PAY_ALLOWLIST: str = ""
+    WHATSAPP_PAY_GOODS_TYPE: str = "digital-goods"
+    WHATSAPP_PAY_ITEM_NAME: str = "Moraa Studio Wallet Recharge"
+    WHATSAPP_PAY_ORDER_EXPIRY_SECONDS: int = 900  # Meta minimum is 300
+    # Tax line (required by Meta). Default 0 = price is the full amount;
+    # confirm the GST treatment with your accountant before going live.
+    WHATSAPP_PAY_TAX_PERCENT: int = 0
+    WHATSAPP_PAY_TAX_DESCRIPTION: str = "Inclusive of taxes"
+    # Required by Meta when no catalog_id is used (per order item).
+    WHATSAPP_PAY_COUNTRY_OF_ORIGIN: str = "IN"
+    WHATSAPP_PAY_IMPORTER_NAME: str = "MORAA STUDIO"
+    WHATSAPP_PAY_IMPORTER_ADDRESS_LINE1: str = ""
+    WHATSAPP_PAY_IMPORTER_ADDRESS_LINE2: str = ""
+    WHATSAPP_PAY_IMPORTER_CITY: str = ""
+    WHATSAPP_PAY_IMPORTER_ZONE_CODE: str = ""  # state code, e.g. "MH", "GJ"
+    WHATSAPP_PAY_IMPORTER_POSTAL_CODE: str = ""
 
     # --- Razorpay Payments (wallet recharge) ---
     # API credentials used to create dynamic recharge payment links.

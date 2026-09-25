@@ -15,6 +15,7 @@ Responsibilities:
 import asyncio
 import hashlib
 import io
+import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -91,6 +92,11 @@ def parse_webhook_entry(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
         statuses = value.get("statuses", [])
         if statuses:
             for status in statuses:
+                if isinstance(status, dict) and status.get("type") == "payment":
+                    # WhatsApp Pay (India) payment status update.
+                    from app.services.whatsapp_pay_service import parse_payment_status
+                    events.append(parse_payment_status(status))
+                    continue
                 events.append({
                     "type": "status",
                     "message_id": status.get("id", ""),
@@ -143,6 +149,19 @@ def parse_webhook_entry(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
                             "title": button_reply.get("title", ""),
                         },
                     })
+                elif interactive_type == "nfm_reply":
+                    # WhatsApp Flow submission. Meta sends the submitted
+                    # fields as a JSON *string* in nfm_reply.response_json.
+                    nfm_reply = interactive_data.get("nfm_reply") or {}
+                    events.append({
+                        "type": "interactive",
+                        "subtype": "nfm_reply",
+                        "message_id": msg_id,
+                        "sender": sender,
+                        "timestamp": timestamp,
+                        "flow_name": nfm_reply.get("name", ""),
+                        "flow_response": parse_flow_response_json(nfm_reply.get("response_json")),
+                    })
                 else:
                     events.append({
                         "type": "unsupported",
@@ -161,6 +180,20 @@ def parse_webhook_entry(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
                 })
 
     return events
+
+
+def parse_flow_response_json(raw: Any) -> Dict[str, Any]:
+    """Decode a Flow ``response_json`` safely. Never raises; {} on bad input."""
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, (str, bytes)) or not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        logger.warning("Flow response_json is not valid JSON — ignored")
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 # ─── Media retrieval ─────────────────────────────────────────────────────
@@ -575,6 +608,65 @@ async def send_interactive_cta_button(
     }
 
     return await _post_message_payload(payload, "interactive CTA button", reply_to_message_id=reply_to_message_id)
+
+
+# ─── WhatsApp Flow (registration form) ──────────────────────────────────
+
+REGISTRATION_FLOW_TOKEN_PREFIX = "moraa_reg_"
+REGISTRATION_FLOW_CTA = "Setup Account"
+REGISTRATION_FLOW_BODY = (
+    "Quick Setup 📋\n\n"
+    "Tap below to share your name, brand name, address and GSTIN (optional)."
+)
+
+
+async def send_registration_flow(
+    recipient_id: str,
+    reply_to_message_id: Optional[str] = None,
+) -> bool:
+    """Send the registration WhatsApp Flow. Returns False (never raises) when
+    the Flow is not configured or Meta rejects the message, so the caller can
+    fall back to the plain-text registration request.
+
+    Payload per Meta "Sending a Flow" docs: interactive.type "flow",
+    action.name "flow", parameters flow_message_version "3", flow_id,
+    flow_cta, flow_token, flow_action "navigate" + flow_action_payload.screen.
+    """
+    flow_id = (settings.META_REGISTRATION_FLOW_ID or "").strip()
+    screen = (settings.META_REGISTRATION_FLOW_SCREEN or "").strip()
+    if not recipient_id or not flow_id or not screen:
+        logger.info("Registration Flow not configured — using text registration")
+        return False
+
+    mode = (settings.META_REGISTRATION_FLOW_MODE or "").strip().lower() or "draft"
+    parameters: Dict[str, Any] = {
+        "flow_message_version": "3",
+        "flow_token": f"{REGISTRATION_FLOW_TOKEN_PREFIX}{recipient_id.lstrip('+')}",
+        "flow_id": flow_id,
+        "flow_cta": REGISTRATION_FLOW_CTA,
+        "flow_action": "navigate",
+        "flow_action_payload": {"screen": screen},
+        "mode": mode,
+    }
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient_id,
+        "type": "interactive",
+        "interactive": {
+            "type": "flow",
+            "body": {"text": REGISTRATION_FLOW_BODY},
+            "action": {"name": "flow", "parameters": parameters},
+        },
+    }
+    try:
+        return await _post_message_payload(
+            payload, "registration flow", reply_to_message_id=reply_to_message_id
+        )
+    except Exception as e:  # _post_message_payload already never raises
+        logger.error(f"Registration flow send failed: {e}")
+        return False
 
 
 # ─── WhatsApp message send ───────────────────────────────────────────────
@@ -1235,7 +1327,7 @@ PRODUCT_BUTTON_PACK_1 = "gv_pack1"
 WHITE_BG_RUNNABLE_STATUSES = ("white_queued", "stored")
 
 WHITE_BG_DRY_RUN_CAPTION = (
-    "[TEST MODE - No API Charge] Ecommerce Shot: your photo is echoed back "
+    "[TEST MODE - No API Charge] Clean Studio Shot: your photo is echoed back "
     "unchanged. No image was generated and your wallet was not charged."
 )
 
@@ -1275,10 +1367,11 @@ async def send_product_selection_buttons(
             "type": "button",
             "body": {
                 "text": (
-                    "Your image is ready to process. What would you like to create?\n\n"
-                    f"• Ecommerce Shot Only — ₹{white_price}: 1 clean product image on pure white\n"
-                    f"• E-Com Pack 1 — ₹{pack_price}\n\n"
-                    f"Wallet balance: ₹{balance:,}"
+                    "Photo received 📸\n\n"
+                    "What would you like to create for this design?\n\n"
+                    f"• Clean Studio Shot (₹{white_price}) — 1 polished product image on pure white with natural soft shadows.\n"
+                    f"• Full Catalog Pack (₹{pack_price}) — Multi-angle commercial set with lifestyle staging.\n\n"
+                    f"Wallet Balance: ₹{balance:,}"
                 ),
             },
             "action": {
@@ -1287,14 +1380,14 @@ async def send_product_selection_buttons(
                         "type": "reply",
                         "reply": {
                             "id": product_button_id(PRODUCT_BUTTON_WHITE, ingestion_id),
-                            "title": f"Ecommerce Shot ₹{white_price}"[:20],
+                            "title": f"Studio Shot — ₹{white_price}"[:20],
                         },
                     },
                     {
                         "type": "reply",
                         "reply": {
                             "id": product_button_id(PRODUCT_BUTTON_PACK_1, ingestion_id),
-                            "title": f"E-Com Pack 1 ₹{pack_price}"[:20],
+                            "title": f"Catalog Pack — ₹{pack_price}"[:20],
                         },
                     },
                 ],
@@ -1340,7 +1433,7 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
             await send_whatsapp_text(
                 ingestion.external_user_id,
                 (
-                    "Sorry, we couldn't create your Ecommerce Shot this time. "
+                    "Sorry, we couldn't create your Clean Studio Shot this time. "
                     + (f"₹{refunded} has been refunded to your wallet." if refunded else "You were not charged.")
                 ),
                 reply_to_message_id=ingestion.external_message_id,
@@ -1450,7 +1543,7 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
             cust = find_customer_by_phone(db, ingestion.external_user_id)
             rem_bal = get_balance(db, cust.whatsapp_id) if cust else 0
             caption = (
-                "Here's your Ecommerce Shot ✨\n"
+                "Here's your Clean Studio Shot ✨\n"
                 f"Remaining balance: ₹{rem_bal:,}"
             )
 
