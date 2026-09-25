@@ -243,12 +243,13 @@ ANTI_REDESIGN_INSTRUCTION = (
 
 # ─── Complete Prompt Builder ───────────────────────────────────────────
 
-def build_earring_ecommerce_prompt(
+def build_earring_ecommerce_prompt_v1(
     earring_type: Optional[str] = None,
 ) -> str:
-    """Build the single authoritative earring e-commerce main-image prompt.
+    """v1 (live default): the original earring e-commerce main-image prompt.
 
     Enforces 100% pure white (#FFFFFF) background and 1:1 physical identity preservation.
+    Kept byte-for-byte identical to the pre-v2 builder output.
     """
     parts: list[str] = []
 
@@ -343,3 +344,107 @@ def build_earring_ecommerce_prompt(
     )
 
     return "\n\n".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v2 — de-duplicated prompt (opt-in via EARRING_PROMPT_VERSION=v2)
+# ═══════════════════════════════════════════════════════════════════════
+# Same rules as v1, each stated once, positive phrasing where possible.
+# Resolves two v1 contradictions: "realistic size" vs "~85% of the frame",
+# and the Amazon reference inside this marketplace-independent module.
+# Keeps REFERENCE_PRIORITY_MARKER so ImageGenerationManager still skips
+# appending REFERENCE_PRIORITY_BLOCK (no extra tokens, no double block).
+
+V2_TASK = (
+    "TASK: Product photography of the exact Fashion Jewellery earring shown "
+    "in the reference image, as a single e-commerce main image on a pure "
+    "white (#FFFFFF) background. This is photography, not design: only the "
+    "background, lighting and framing change."
+)
+
+V2_IDENTITY = (
+    "PRODUCT IDENTITY — reproduce the reference as an exact 1:1 replica:\n"
+    "• Silhouette, geometry and proportions of every part.\n"
+    "• Stones: count, cut (e.g. round, pear, marquise, baguette), size, "
+    "colour, position, spacing and setting/prongs.\n"
+    "• Metal: colour, finish (polished, brushed, matte, hammered) and plating.\n"
+    "• Attachments: hooks, posts, clasps, lever-backs, chains and connectors.\n"
+    "• Decoration and surface: filigree, engraving, milgrain, cut-outs, texture.\n"
+    "Keep any asymmetry and irregularity exactly as shown; they are part of "
+    "the product. Do not mirror, straighten, smooth, resize, add or remove "
+    "anything."
+)
+
+V2_COLOUR = (
+    "MATERIAL & COLOUR: the reference is the only authority. Lighting changes "
+    "brightness only, never material or colour: silver stays silver, gold "
+    "stays gold, stones keep their exact hue without added saturation, and "
+    "colour temperature matches the reference. The white background does "
+    "not make the jewellery white."
+)
+
+V2_CLEANUP = (
+    "CLEANUP: remove hands and fingers, display cards and backing, "
+    "packaging, polybags and film, tables and surfaces, clutter, and "
+    "cast shadows. Never remove a part of the jewellery (hook, post, clasp, "
+    "chain, connector, lever-back); when unsure, keep it. Parts hidden in "
+    "the reference stay unreconstructed — show only what is visible."
+)
+
+V2_ANGLE = (
+    "ANGLE: keep the orientation and viewpoint of the reference; do not "
+    "rotate or re-pose the earring for a prettier composition."
+)
+
+V2_PRESENTATION = (
+    "PRESENTATION: seamless pure white (#FFFFFF) with no surface, horizon, "
+    "podium, vignette or gradient; at most a faint natural contact shadow "
+    "directly beneath the piece. The earring is the only object, centred "
+    "and filling most of the frame with even margins, true proportions "
+    "between its parts. Bright, even, high-key studio light; sharp detail; "
+    "no props, stands, text, watermarks or equipment reflections."
+)
+
+
+def build_earring_ecommerce_prompt_v2(
+    earring_type: Optional[str] = None,
+) -> str:
+    """v2: de-duplicated earring e-commerce prompt (same rules as v1)."""
+    type_block = EARRING_TYPE_PRESERVATION.get(earring_type or "", GENERIC_EARRING_PRESERVATION)
+    return "\n\n".join([
+        V2_TASK,
+        REFERENCE_PRIORITY_MARKER,
+        V2_IDENTITY,
+        type_block,
+        V2_COLOUR,
+        V2_CLEANUP,
+        V2_ANGLE,
+        V2_PRESENTATION,
+    ])
+
+
+PROMPT_VERSIONS = {
+    "v1": build_earring_ecommerce_prompt_v1,
+    "v2": build_earring_ecommerce_prompt_v2,
+}
+
+
+def _active_prompt_version() -> str:
+    """EARRING_PROMPT_VERSION from settings; anything unknown/unreadable -> v1."""
+    try:
+        from app.config import settings
+
+        version = str(getattr(settings, "EARRING_PROMPT_VERSION", "v1") or "v1").strip().lower()
+    except Exception:  # noqa: BLE001 — config problems must never change the live prompt
+        return "v1"
+    return version if version in PROMPT_VERSIONS else "v1"
+
+
+def build_earring_ecommerce_prompt(
+    earring_type: Optional[str] = None,
+) -> str:
+    """Build the earring e-commerce main-image prompt used by every caller.
+
+    Returns v1 (unchanged live prompt) unless EARRING_PROMPT_VERSION=v2.
+    """
+    return PROMPT_VERSIONS[_active_prompt_version()](earring_type=earring_type)

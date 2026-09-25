@@ -191,6 +191,11 @@ class Settings(BaseSettings):
     WHATSAPP_PAY_IMPORTER_ZONE_CODE: str = ""  # state code, e.g. "MH", "GJ"
     WHATSAPP_PAY_IMPORTER_POSTAL_CODE: str = ""
 
+    # --- Earring e-commerce prompt version ---
+    # "v1" (default) = the original live prompt, byte-for-byte unchanged.
+    # "v2" = de-duplicated prompt with the same rules (opt-in, A/B first).
+    EARRING_PROMPT_VERSION: str = "v1"
+
     # --- ERPNext billing (Frappe Cloud) ---
     # Read by app/services/erpnext_service.py (with os.getenv fallback).
     # While ERPNEXT_INVOICE_ENABLED is False the local ReportLab receipt is

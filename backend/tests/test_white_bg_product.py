@@ -504,7 +504,10 @@ class Prompt1UnchangedTests(unittest.TestCase):
     def test_prompt_1_source_matches_head(self):
         path = Path(__file__).resolve().parents[1] / "app/services/earring_ecommerce_prompt.py"
         digest = hashlib.md5(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
-        self.assertEqual(digest, "da7c0737327102ce6a0868bfa1f6bf4b")
+        # Re-baselined 2026-09-25: opt-in v2 builder + EARRING_PROMPT_VERSION
+        # toggle added to this file (approved). The live v1 prompt OUTPUT is
+        # pinned byte-for-byte by tests/test_earring_prompt_v2.py::V1_SNAPSHOT.
+        self.assertEqual(digest, "989f0015142b944d91bc541f0bef3693")
 
 
 if __name__ == "__main__":
