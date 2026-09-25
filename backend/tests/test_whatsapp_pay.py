@@ -239,3 +239,32 @@ class WhatsAppPayTests(FundedSlotGateTestCase):
             result = asyncio.run(pay.reconcile_pending_orders(self.session))
         self.assertEqual(result, {"credited": 1})
         self.assertEqual(self._balance(), 600)
+
+    # ── unified billing ─────────────────────────────────────────────────
+    def test_receipt_sends_local_pdf_inline_when_erpnext_disabled(self):
+        o = self._sent_order()
+        with patch.object(pay, "lookup_payment", new=AsyncMock(return_value=_lookup(o.reference_id))):
+            self._post(_payment_webhook(o.reference_id))
+        self.assertEqual(self.doc.await_count, 1)
+        self.assertEqual(self.doc.await_args.kwargs["filename"], "Invoice_MoraaStudio_T123.pdf")
+
+    def test_receipt_uses_billing_service_in_background_when_erpnext_enabled(self):
+        import asyncio
+        from app.services import billing_service
+        o = self._sent_order()
+        o.pg_payment_id, o.status, o.credited = "pay_NATIVE1", "captured", True
+        self.session.commit()
+        dispatch = AsyncMock(return_value="erpnext")
+
+        async def run():
+            await pay._send_receipt(self.session, o)
+            await asyncio.gather(*list(pay._BACKGROUND_TASKS))
+
+        with patch.object(settings, "ERPNEXT_INVOICE_ENABLED", True), \
+             patch.object(billing_service, "dispatch_payment_invoice", new=dispatch):
+            asyncio.run(run())
+        kwargs = dispatch.await_args.kwargs
+        self.assertEqual((kwargs["recipient_id"], kwargs["payment_id"], kwargs["amount"]), (SENDER, "pay_NATIVE1", 500))
+        self.assertEqual(kwargs["customer_snapshot"]["gst_number"], "24AAAPS1234C1Z5")
+        self.assertEqual(self.pay_text.await_count, 1)  # receipt text still sent inline
+

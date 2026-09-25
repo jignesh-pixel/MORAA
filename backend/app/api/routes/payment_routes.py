@@ -8,7 +8,7 @@ import hmac
 import json
 from typing import Any, Dict, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -16,6 +16,7 @@ from app.config import settings
 from app.database import get_db
 from app.models.audit_log import AuditLog
 from app.models.customer import Customer
+from app.services.billing_service import dispatch_payment_invoice
 from app.services.invoice_service import generate_invoice_pdf
 from app.services.meta_whatsapp_service import (
     send_document_to_whatsapp,
@@ -236,6 +237,7 @@ def _payment_audit_row(
 )
 async def razorpay_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ) -> Dict[str, str]:
     raw_body = await request.body()
@@ -360,23 +362,26 @@ async def razorpay_webhook(
             ),
         )
 
-        # 2. PDF Invoice Dispatch
-        inv_suffix = payment_reference[-4:] if len(payment_reference) >= 4 else "1042"
-        inv_number = f"Invoice_MoraaStudio_{inv_suffix}"
-        pdf_bytes = generate_invoice_pdf(
-            customer_name=customer_name,
-            invoice_number=inv_number,
-            amount=amount_paid,
-        )
-
-        await send_document_to_whatsapp(
+        # 2. PDF Invoice Dispatch -- in the background after the response:
+        # ERPNext Sales Invoice PDF when ERPNEXT_INVOICE_ENABLED, otherwise
+        # (or on any ERPNext failure) the same local ReportLab receipt.
+        background_tasks.add_task(
+            dispatch_payment_invoice,
             recipient_id=clean_sender,
-            document_bytes=pdf_bytes,
-            filename=f"{inv_number}.pdf",
-            caption="",
+            payment_id=payment_reference,
+            amount=amount_paid,
+            customer_name=customer_name,
+            customer_snapshot={
+                "full_name": getattr(customer, "full_name", None),
+                "business_name": getattr(customer, "business_name", None),
+                "gst_number": getattr(customer, "gst_number", None),
+                "address": getattr(customer, "address", None),
+            },
+            local_pdf_fn=generate_invoice_pdf,
+            send_document_fn=send_document_to_whatsapp,
         )
 
-        logger.info(f"Successfully sent confirmation, invoice and tips to {clean_sender}")
+        logger.info(f"Sent confirmation and tips to {clean_sender}; invoice queued")
     except Exception as e:
         logger.error(f"Post-payment WhatsApp dispatch failed: {e}")
 

@@ -191,6 +191,26 @@ class Settings(BaseSettings):
     WHATSAPP_PAY_IMPORTER_ZONE_CODE: str = ""  # state code, e.g. "MH", "GJ"
     WHATSAPP_PAY_IMPORTER_POSTAL_CODE: str = ""
 
+    # --- ERPNext billing (Frappe Cloud) ---
+    # Read by app/services/erpnext_service.py (with os.getenv fallback).
+    # While ERPNEXT_INVOICE_ENABLED is False the local ReportLab receipt is
+    # sent exactly as before; any ERPNext error/timeout also falls back to it.
+    ERPNEXT_BASE_URL: str = ""
+    ERPNEXT_API_KEY: str = ""
+    ERPNEXT_API_SECRET: str = ""
+    ERPNEXT_COMPANY: str = ""
+    ERPNEXT_DEFAULT_DEBTORS_ACCOUNT: str = ""
+    ERPNEXT_PAYMENT_ACCOUNT: str = ""
+    ERPNEXT_INVOICE_ENABLED: bool = False
+    ERPNEXT_RECHARGE_ITEM_CODE: str = ""
+    ERPNEXT_TAX_TEMPLATE: str = ""
+    ERPNEXT_MODE_OF_PAYMENT: str = ""
+    ERPNEXT_PRINT_FORMAT: str = "Standard"
+    ERPNEXT_PRICES_INCLUDE_TAX: bool = True
+    ERPNEXT_TIMEOUT_SECONDS: float = 8.0
+    # Upper bound for the whole background invoice job (all ERPNext calls).
+    ERPNEXT_JOB_TIMEOUT_SECONDS: float = 60.0
+
     # --- Razorpay Payments (wallet recharge) ---
     # API credentials used to create dynamic recharge payment links.
     RAZORPAY_KEY_ID: str = ""

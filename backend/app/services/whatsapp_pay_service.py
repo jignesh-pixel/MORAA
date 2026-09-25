@@ -25,6 +25,7 @@ order_details / review_and_pay, payment statuses webhook, payment lookup
 ``GET /<PHONE_NUMBER_ID>/payments/<PAYMENT_CONFIGURATION>/<REFERENCE_ID>``.
 """
 
+import asyncio
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -439,10 +440,20 @@ async def reconcile_pending_orders(db: Session, older_than_seconds: int = 120, l
 # ─── Customer messages ───────────────────────────────────────────────────
 
 
+# Background invoice jobs started by _send_receipt (strong refs until done).
+_BACKGROUND_TASKS: "set[asyncio.Task]" = set()
+
+
 async def _send_receipt(db: Session, order: WhatsAppPaymentOrder) -> None:
-    """Same receipt + PDF invoice the Razorpay webhook sends. Never raises."""
+    """Same receipt text + invoice PDF as the Razorpay webhook. Never raises.
+
+    The PDF goes through billing_service.dispatch_payment_invoice (ERPNext
+    Sales Invoice, local ReportLab fallback). With ERPNext enabled it runs as
+    a detached task so the Meta webhook is not held up by ERPNext calls.
+    """
     try:
         from app.api.routes.payment_routes import PAYMENT_TIPS_MESSAGE
+        from app.services.billing_service import dispatch_payment_invoice
         from app.services.invoice_service import generate_invoice_pdf
         from app.services.meta_whatsapp_service import send_document_to_whatsapp
 
@@ -455,15 +466,26 @@ async def _send_receipt(db: Session, order: WhatsAppPaymentOrder) -> None:
             ),
         )
         customer = find_customer_by_phone(db, order.whatsapp_id)
-        inv_number = f"Invoice_MoraaStudio_{(order.pg_payment_id or order.reference_id)[-4:]}"
-        pdf_bytes = generate_invoice_pdf(
-            customer_name=getattr(customer, "full_name", None) or "Valued Customer",
-            invoice_number=inv_number,
+        job = dispatch_payment_invoice(
+            recipient_id=order.whatsapp_id,
+            payment_id=order.pg_payment_id or order.reference_id,
             amount=order.amount_rupees,
+            customer_name=getattr(customer, "full_name", None) or "Valued Customer",
+            customer_snapshot={
+                "full_name": getattr(customer, "full_name", None),
+                "business_name": getattr(customer, "business_name", None),
+                "gst_number": getattr(customer, "gst_number", None),
+                "address": getattr(customer, "address", None),
+            },
+            local_pdf_fn=generate_invoice_pdf,
+            send_document_fn=send_document_to_whatsapp,
         )
-        await send_document_to_whatsapp(
-            recipient_id=order.whatsapp_id, document_bytes=pdf_bytes, filename=f"{inv_number}.pdf", caption=""
-        )
+        if settings.ERPNEXT_INVOICE_ENABLED:
+            task = asyncio.get_running_loop().create_task(job)
+            _BACKGROUND_TASKS.add(task)
+            task.add_done_callback(_BACKGROUND_TASKS.discard)
+        else:
+            await job  # local PDF only: same inline behaviour as before
     except Exception as e:
         logger.error(f"WhatsApp Pay receipt dispatch failed for {order.reference_id}: {e}")
 
