@@ -191,6 +191,15 @@ class Settings(BaseSettings):
     WHATSAPP_PAY_IMPORTER_ZONE_CODE: str = ""  # state code, e.g. "MH", "GJ"
     WHATSAPP_PAY_IMPORTER_POSTAL_CODE: str = ""
 
+    # --- Live GSTIN verification during onboarding ---
+    # False (default) = onboarding behaves exactly as before (format check
+    # only, no lookup, no GST buttons). GST_PROVIDER: "none" (default, every
+    # lookup reports unavailable) or "mock" (local testing, DEBUG only);
+    # real vendors are added in app/services/gst_service.py.
+    GST_VERIFICATION_ENABLED: bool = False
+    GST_PROVIDER: str = "none"
+    GST_API_TIMEOUT_SECONDS: float = 8.0
+
     # --- Earring e-commerce prompt version ---
     # "v1" (default) = the original live prompt, byte-for-byte unchanged.
     # "v2" = de-duplicated prompt with the same rules (opt-in, A/B first).

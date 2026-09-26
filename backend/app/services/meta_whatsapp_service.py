@@ -575,6 +575,36 @@ async def send_whatsapp_cta_url_button(
     return await _post_message_payload(payload, "interactive CTA URL button", reply_to_message_id=reply_to_message_id)
 
 
+async def send_reply_buttons(
+    recipient_id: str,
+    body_text: str,
+    buttons: List[Tuple[str, str]],
+    reply_to_message_id: Optional[str] = None,
+) -> bool:
+    """Send an interactive message with up to 3 reply buttons [(id, title)].
+
+    Meta limits a reply-button title to 20 characters.
+    """
+    if not recipient_id or not body_text or not buttons:
+        return False
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": recipient_id,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": body_text},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": bid, "title": title[:20]}}
+                    for bid, title in buttons[:3]
+                ],
+            },
+        },
+    }
+    return await _post_message_payload(payload, "reply buttons", reply_to_message_id=reply_to_message_id)
+
+
 async def send_interactive_cta_button(
     recipient_id: str,
     body_text: str,

@@ -14,4 +14,7 @@ def _erpnext_billing_off_by_default(monkeypatch):
     from app.config import settings
 
     monkeypatch.setattr(settings, "ERPNEXT_INVOICE_ENABLED", False)
+    # Same for live GST verification: .env may switch it on (mock or real
+    # vendor); tests that exercise it turn it on explicitly.
+    monkeypatch.setattr(settings, "GST_VERIFICATION_ENABLED", False)
     yield

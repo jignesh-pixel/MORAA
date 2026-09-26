@@ -19,7 +19,7 @@ arithmetic.
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text, text, true
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, false, text, true
 from sqlalchemy.orm import Mapped, mapped_column, synonym
 
 from app.database import Base
@@ -81,6 +81,13 @@ class Customer(Base):
         default=True,
         server_default=true(),
         comment="True once onboarding has captured the full profile",
+    )
+    is_gst_verified: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=false(),
+        comment="True only after a live GSTIN lookup returned Active",
     )
 
     # ── Backward-compatible aliases ────────────────────────────────────

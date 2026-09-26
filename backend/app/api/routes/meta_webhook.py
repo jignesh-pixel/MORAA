@@ -64,6 +64,12 @@ from app.services.meta_whatsapp_service import (
     verify_webhook_signature,
 )
 from app.services.razorpay_service import create_recharge_payment_link
+from app.services.gst_service import (
+    handle_gst_button,
+    handle_gstin_reply,
+    is_awaiting_gstin,
+    verify_after_registration,
+)
 from app.services.upload_service import UploadService
 from app.services.whatsapp_pay_service import (
     handle_payment_status_event,
@@ -415,6 +421,8 @@ async def _handle_registration_flow(db: Session, event: Dict[str, Any]) -> bool:
         return False
 
     await _send_registration_confirmation(db, sender, cust, full_name)
+    # Live GSTIN check (no-op unless GST_VERIFICATION_ENABLED).
+    await verify_after_registration(db, sender, data.get("gst_number"))
     return True
 
 
@@ -661,10 +669,17 @@ async def _handle_product_choice(
 
 @router.get("/webhook", summary="Meta webhook verification")
 async def verify_webhook(
+    request: Request,
     hub_mode: Optional[str] = None,
     hub_verify_token: Optional[str] = None,
     hub_challenge: Optional[str] = None,
 ) -> PlainTextResponse:
+    # Meta sends dotted names (hub.mode, hub.verify_token, hub.challenge);
+    # FastAPI only binds the underscore names, so read the dotted ones too.
+    query = request.query_params
+    hub_mode = query.get("hub.mode") or hub_mode
+    hub_verify_token = query.get("hub.verify_token") or hub_verify_token
+    hub_challenge = query.get("hub.challenge") or hub_challenge
     if hub_mode != "subscribe" or not hub_verify_token or hub_verify_token != settings.META_VERIFY_TOKEN:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -743,10 +758,17 @@ async def receive_webhook(
                 lower_text = raw_text.lower()
                 logger.info("Text message received: sender={} text='{}'", sender, raw_text)
 
+                # After "Re-enter GSTIN" the next text is the GSTIN itself
+                # (always False unless GST_VERIFICATION_ENABLED).
+                if is_awaiting_gstin(db, sender):
+                    await handle_gstin_reply(db, sender, raw_text)
+                    continue
+
                 if "name:" in lower_text and any(k in lower_text for k in ("business", "brand", "gst", "city")):
                     user_name = "there"
                     biz_name = "Jewelry Business"
                     gst_val = "N/A"
+                    raw_gst = ""
                     addr_val = "N/A"
 
                     for line in raw_text.splitlines():
@@ -764,6 +786,7 @@ async def receive_webhook(
                         elif "gst" in l_low and ":" in line_clean:
                             extracted_gst = line_clean.split(":", 1)[1].strip()
                             if extracted_gst:
+                                raw_gst = extracted_gst
                                 # t9: only a real 15-char GSTIN is stored;
                                 # "NA"/"none"/malformed text becomes N/A.
                                 gst_val = _normalize_gst(extracted_gst)
@@ -779,6 +802,7 @@ async def receive_webhook(
                         continue
 
                     await _send_registration_confirmation(db, sender, cust, user_name)
+                    await verify_after_registration(db, sender, raw_gst)
                     continue
 
                 if re.search(r"\b(hi|hii|hello|hey|start)\b", lower_text):
@@ -843,6 +867,9 @@ async def receive_webhook(
                 button_reply = event.get("button_reply", {})
                 b_id = button_reply.get("id", "")
                 sender = event.get("sender", "")
+
+                if await handle_gst_button(db, sender, b_id):
+                    continue
 
                 product_choice = parse_product_button_id(b_id)
                 if product_choice:
