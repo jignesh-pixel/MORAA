@@ -131,7 +131,8 @@ class OpenAIImageProvider(BaseImageGenerationProvider):
             )
 
         try:
-            client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+            # max_retries=0: one HTTP attempt per call (the SDK default is 2 retries).
+            client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY, max_retries=0)
 
             # Map aspect ratio to a size the ACTIVE model accepts.
             # gpt-image-1 (ChatGPT image, PRIMARY) supports only:

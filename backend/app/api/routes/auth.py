@@ -3,6 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.database import get_db
 from app.schemas.auth import (
     LoginRequest,
@@ -27,6 +28,11 @@ router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 )
 async def signup(request: SignupRequest, db: Session = Depends(get_db)):
     """Register a new user account."""
+    if not settings.ALLOW_SIGNUP:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Signup is disabled",
+        )
     service = AuthService(db)
     try:
         result = service.signup(request)

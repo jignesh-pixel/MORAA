@@ -336,7 +336,8 @@ class ProductChoiceWebhookTests(FundedSlotGateTestCase):
     def _retry(self, row):
         self.app.dependency_overrides[require_auth] = lambda: object()
         with patch.object(self.webhook_module, "_trigger_generation", new=AsyncMock()) as pack_retry:
-            r = self.client.post(f"/api/meta/webhook/retry/{row.id}")
+            # The retry endpoint is local-only (public host guard); call it as localhost.
+            r = self.client.post(f"/api/meta/webhook/retry/{row.id}", headers={"host": "localhost"})
         self.assertEqual(r.status_code, 200)
         return pack_retry, r.json()
 

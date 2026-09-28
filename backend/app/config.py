@@ -60,6 +60,18 @@ class Settings(BaseSettings):
     RATE_LIMIT_REQUESTS: int = 100
     RATE_LIMIT_WINDOW_SECONDS: int = 60
 
+    # --- Public host guard ---
+    # Requests arriving through a public tunnel/host (e.g. ngrok) may only
+    # reach the two provider webhooks; everything else is local-only.
+    PUBLIC_HOST_GUARD_ENABLED: bool = True
+    # Hosts treated as local (comma-separated). Add a LAN IP here if the
+    # dashboard is opened from another machine on the network.
+    LOCAL_API_HOSTS: str = "localhost,127.0.0.1,::1,0.0.0.0"
+
+    # --- Auth ---
+    # Public self-signup is off by default; set ALLOW_SIGNUP=true to enable.
+    ALLOW_SIGNUP: bool = False
+
     # --- AI Engine ---
     # Options: "mock" (random), "vision" (PIL-based real analysis).
     # Add new engines in app/ai/engine_factory.py
@@ -291,8 +303,9 @@ class Settings(BaseSettings):
     MAX_GENERATIONS_PER_DAY: int = 100000
 
     # Styles generated per WhatsApp Earring Catalog Pack (6 styles exist).
-    # 1 = current throttled behaviour; empty/None = all styles.
-    MAX_STYLES_PER_PACK: Optional[int] = 1
+    # None = all styles (production: the full 6-shot E-Com Pack 1).
+    # Set a number (e.g. 1) only as a temporary testing throttle.
+    MAX_STYLES_PER_PACK: Optional[int] = None
 
     # --- AI image pre-validation (Scenario 4) ---
     # Fast Gemini quality inspection of a funded image before generation.

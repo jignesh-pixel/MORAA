@@ -111,8 +111,9 @@ class FeedbackPersistenceTests(unittest.TestCase):
 
 
 class ConfigAndAlertTests(unittest.TestCase):
-    def test_style_limit_comes_from_settings_and_stays_1(self):
-        self.assertEqual(settings.MAX_STYLES_PER_PACK, 1)
+    def test_style_limit_comes_from_settings_full_pack_by_default(self):
+        # Development throttle lifted: all 6 E-Com Pack 1 styles by default.
+        self.assertIsNone(settings.MAX_STYLES_PER_PACK)
         self.assertEqual(meta_whatsapp_service.MAX_STYLES_PER_PACK, settings.MAX_STYLES_PER_PACK)
 
     def test_old_send_names_still_work(self):

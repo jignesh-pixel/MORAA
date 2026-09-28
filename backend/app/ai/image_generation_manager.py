@@ -115,6 +115,9 @@ _NON_RECOVERABLE_PATTERNS = [
     "content_filtered",
     "prompt blocked",
     "prompt was blocked",
+    # Gemini answered but returned no image (e.g. a safety finish without an
+    # exception). The call was already made; do not pay a second provider.
+    "no image data",
 ]
 
 
@@ -135,7 +138,12 @@ _spend_day: Optional[str] = None
 _spend_count: int = 0
 
 
-def _spend_blocked() -> Optional[str]:
+def _spend_blocked(count: int = 1) -> Optional[str]:
+    """Consume ``count`` generation slots, or return why that is not allowed.
+
+    All-or-nothing: when fewer than ``count`` slots remain, nothing is
+    consumed. ``count=1`` is the original per-call behaviour.
+    """
     global _spend_day, _spend_count
     if getattr(settings, "GENERATION_ENABLED", True) is False:
         return "Image generation is disabled (GENERATION_ENABLED=false)"
@@ -145,10 +153,21 @@ def _spend_blocked() -> Optional[str]:
     today = time.strftime("%Y-%m-%d", time.gmtime())
     if _spend_day != today:
         _spend_day, _spend_count = today, 0
-    if _spend_count >= max(cap, 1):
+    if _spend_count + max(count, 1) > max(cap, 1):
         return "Daily image-generation cap reached (MAX_GENERATIONS_PER_DAY)"
-    _spend_count += 1
+    _spend_count += max(count, 1)
     return None
+
+
+def reserve_generation_slots(count: int) -> Optional[str]:
+    """Reserve ``count`` slots up front for a multi-image order (Catalog Pack).
+
+    The whole order either fits under MAX_GENERATIONS_PER_DAY or is refused
+    before any provider is called, so the cap can never cut a paid pack off
+    half-way. Returns None when reserved, else the reason it was refused.
+    The calls made for the order then pass ``spend_reserved=True``.
+    """
+    return _spend_blocked(count)
 
 
 class ImageGenerationManager:
@@ -206,11 +225,21 @@ class ImageGenerationManager:
         reference_image: Optional[bytes] = None,
         reference_mime_type: str = "image/jpeg",
         marketplace: Optional[str] = None,
+        spend_reserved: bool = False,
     ) -> ImageGenerationResult:
         context = dict(context) if context else {}
         request_id = context.get("request_id", "unknown")
 
-        blocked = _spend_blocked()
+        # spend_reserved: the slot was already taken by reserve_generation_slots()
+        # for this order; the kill switch still applies to every call.
+        if spend_reserved:
+            blocked = (
+                "Image generation is disabled (GENERATION_ENABLED=false)"
+                if getattr(settings, "GENERATION_ENABLED", True) is False
+                else None
+            )
+        else:
+            blocked = _spend_blocked()
         if blocked:
             logger.error(f"ImageGenerationManager: {blocked} -- no provider called request_id={request_id}")
             return ImageGenerationResult(

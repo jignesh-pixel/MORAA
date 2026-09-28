@@ -48,6 +48,9 @@ class RefundOnFailedGenerationTests(unittest.TestCase):
             patch.object(self.db, "close"),
             patch.object(mws, "DRY_RUN_IMAGE_MODE", False),
             patch.object(mws, "send_whatsapp_text", new=AsyncMock(return_value=True)),
+            # Not a spend-cap test: the pack now reserves its slots up front,
+            # so keep the local .env test cap out of the way.
+            patch.object(settings, "MAX_GENERATIONS_PER_DAY", 100000),
         ]
         for p in self.patches:
             p.start()

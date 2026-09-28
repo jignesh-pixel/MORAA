@@ -284,8 +284,17 @@ async def check_image_quality(
 
     model_name = settings.IMAGE_PREVALIDATION_MODEL or "gemini-3.6-flash"
 
+    # Bound the call: a hung request must not stall the webhook, and the
+    # small JSON verdict never needs a long answer. A timeout raises and is
+    # handled below by the existing fail-open/fail-closed policy (no retry).
+    timeout_ms = 30_000
+    max_output_tokens = 2048
+
     try:
-        client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        client = genai.Client(
+            api_key=settings.GEMINI_API_KEY,
+            http_options=types.HttpOptions(timeout=timeout_ms),
+        )
         image_part = types.Part.from_bytes(
             data=image_bytes,
             mime_type=mime_type or "image/jpeg",
@@ -293,6 +302,7 @@ async def check_image_quality(
         config = types.GenerateContentConfig(
             temperature=0.0,
             response_mime_type="application/json",
+            max_output_tokens=max_output_tokens,
         )
 
         # Mirror GeminiImageProvider: run the sync SDK call in a thread.

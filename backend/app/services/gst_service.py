@@ -22,7 +22,7 @@ use the GST-portal field names, override ``parse``.
 import asyncio
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from app.config import settings
 from app.utils.logger import logger
@@ -252,8 +252,30 @@ async def _send_choice(sender: str, body: str) -> None:
     await send_reply_buttons(sender, body + _CHOICE_SUFFIX, GST_BUTTONS)
 
 
-async def process_gstin(db, sender: str, raw_gstin: Any) -> Optional[GstVerificationResult]:
+# Called once the GST step is resolved (verified, accepted or skipped) so the
+# caller can finish onboarding ("You're all set" + recharge). Not called
+# while the GSTIN is still awaiting a retry / skip.
+OnComplete = Optional[Callable[[], Awaitable[Any]]]
+
+
+async def _complete(on_complete: OnComplete) -> None:
+    if on_complete is None:
+        return
+    try:
+        await on_complete()
+    except Exception as e:  # noqa: BLE001 -- never break the webhook
+        logger.error(f"Onboarding completion step failed: {e}")
+
+
+async def process_gstin(
+    db, sender: str, raw_gstin: Any, on_complete: OnComplete = None
+) -> Optional[GstVerificationResult]:
     """Verify one GSTIN for the sender's customer row and message the outcome.
+
+    Resolved (verified, or well-formed with no lookup vendor configured):
+    onboarding is completed and ``on_complete`` runs. Anything else leaves the
+    customer AWAITING_GSTIN (not registered yet) with Re-enter / Skip buttons,
+    and ``on_complete`` does NOT run.
 
     Never raises. Wallet, balance and images are not touched.
     """
@@ -263,7 +285,8 @@ async def process_gstin(db, sender: str, raw_gstin: Any) -> Optional[GstVerifica
         customer = find_customer_by_phone(db, sender)
         if customer is None:
             return None
-        result = await verify_gstin(raw_gstin)
+        provider = get_gst_provider()
+        result = await verify_gstin(raw_gstin, provider)
 
         if result.verified:
             customer.gst_number = result.gstin
@@ -272,16 +295,32 @@ async def process_gstin(db, sender: str, raw_gstin: Any) -> Optional[GstVerifica
             if result.address:
                 customer.address = result.address
             customer.is_gst_verified = True
+            customer.is_registered = True
             _set_state(db, customer.whatsapp_id, STATE_REGISTERED)
             db.commit()
             await _send_text(sender, SUCCESS_TEMPLATE.format(
                 trade_name=result.display_name or customer.business_name))
+            await _complete(on_complete)
+            return result
+
+        if result.status == UNAVAILABLE and provider.name == NoGstProvider.name:
+            # No lookup vendor configured: a well-formed GSTIN is kept as
+            # entered (unverified) and onboarding continues.
+            customer.gst_number = result.gstin
+            customer.is_gst_verified = False
+            customer.is_registered = True
+            _set_state(db, customer.whatsapp_id, STATE_REGISTERED)
+            db.commit()
+            await _complete(on_complete)
             return result
 
         customer.is_gst_verified = False
         if result.status in (INACTIVE, NOT_FOUND):
             customer.gst_number = "N/A"  # never invoice with a rejected GSTIN
-        _set_state(db, customer.whatsapp_id, STATE_REGISTERED)
+        # GST unresolved: onboarding is NOT complete. The next text is read as
+        # the GSTIN (or "skip"); the buttons do the same.
+        customer.is_registered = False
+        _set_state(db, customer.whatsapp_id, STATE_AWAITING_GSTIN)
         db.commit()
 
         if result.status == INVALID_FORMAT:
@@ -299,12 +338,22 @@ async def process_gstin(db, sender: str, raw_gstin: Any) -> Optional[GstVerifica
     except Exception as e:  # noqa: BLE001
         db.rollback()
         logger.error(f"GST verification step failed for {sender}: {e}")
+        # Never strand a customer mid-onboarding because of our own error.
+        await _complete(on_complete)
         return None
 
 
-async def verify_after_registration(db, sender: str, raw_gstin: Any) -> None:
-    """Called right after a profile is saved (text form or WhatsApp Flow)."""
+async def verify_after_registration(
+    db, sender: str, raw_gstin: Any, on_complete: OnComplete = None
+) -> None:
+    """Called right after a profile is saved (text form or WhatsApp Flow).
+
+    ``on_complete`` (the "You're all set" confirmation) runs only once the GST
+    step is resolved -- immediately when verification is off or no GSTIN was
+    given, and never while an invalid GSTIN is awaiting a retry / skip.
+    """
     if not verification_enabled():
+        await _complete(on_complete)
         return
     if str(raw_gstin or "").strip().lower() in _NO_GST_ANSWERS:
         from app.services.wallet_service import find_customer_by_phone
@@ -313,11 +362,12 @@ async def verify_after_registration(db, sender: str, raw_gstin: Any) -> None:
         if customer is not None and customer.is_gst_verified:
             customer.is_gst_verified = False
             db.commit()
+        await _complete(on_complete)
         return  # no GSTIN given: unchanged flow, nothing to verify
-    await process_gstin(db, sender, raw_gstin)
+    await process_gstin(db, sender, raw_gstin, on_complete)
 
 
-async def handle_gst_button(db, sender: str, button_id: str) -> bool:
+async def handle_gst_button(db, sender: str, button_id: str, on_complete: OnComplete = None) -> bool:
     """Re-enter / Skip buttons. Returns True when the button was ours."""
     if button_id not in (BTN_GST_REENTER, BTN_GST_SKIP) or not verification_enabled():
         return False
@@ -327,19 +377,26 @@ async def handle_gst_button(db, sender: str, button_id: str) -> bool:
         customer = find_customer_by_phone(db, sender)
         if customer is None:
             return True
+        row = _session(db, customer.whatsapp_id)
+        if (button_id == BTN_GST_SKIP and row is not None and row.state == STATE_REGISTERED
+                and customer.is_registered):
+            # Stale / double-tapped Skip after onboarding already finished:
+            # nothing to resolve, and never a second "You're all set".
+            logger.info(f"GST skip ignored, onboarding already complete: {sender}")
+            return True
         if button_id == BTN_GST_REENTER:
             _set_state(db, customer.whatsapp_id, STATE_AWAITING_GSTIN)
             db.commit()
             await _send_text(sender, REENTER_PROMPT)
         else:
-            await skip_gst(db, sender)
+            await skip_gst(db, sender, on_complete)
     except Exception as e:  # noqa: BLE001
         db.rollback()
         logger.error(f"GST button handling failed for {sender}: {e}")
     return True
 
 
-async def skip_gst(db, sender: str) -> None:
+async def skip_gst(db, sender: str, on_complete: OnComplete = None) -> None:
     from app.services.wallet_service import find_customer_by_phone
 
     customer = find_customer_by_phone(db, sender)
@@ -347,14 +404,16 @@ async def skip_gst(db, sender: str) -> None:
         return
     customer.is_gst_verified = False
     customer.gst_number = "N/A"  # gst_number is NOT NULL; "N/A" is the no-GST convention
+    customer.is_registered = True
     _set_state(db, customer.whatsapp_id, STATE_REGISTERED)
     db.commit()
     await _send_text(sender, SKIP_MESSAGE)
+    await _complete(on_complete)
 
 
-async def handle_gstin_reply(db, sender: str, text: str) -> None:
+async def handle_gstin_reply(db, sender: str, text: str, on_complete: OnComplete = None) -> None:
     """Text received while AWAITING_GSTIN: a GSTIN attempt, or 'skip'."""
     if text.strip().lower() in ("skip", "skip for now"):
-        await skip_gst(db, sender)
+        await skip_gst(db, sender, on_complete)
         return
-    await process_gstin(db, sender, text)
+    await process_gstin(db, sender, text, on_complete)

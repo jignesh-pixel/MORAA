@@ -315,11 +315,11 @@ class TestWebhookSignatureVerification(unittest.TestCase):
             result = verify_webhook_signature(b"body", None)
             self.assertFalse(result)
 
-    def test_no_secret_skips_verification(self):
-        """When META_APP_SECRET is empty, verification is skipped."""
+    def test_no_secret_fails_closed(self):
+        """When META_APP_SECRET is empty, nothing can be verified: reject."""
         with patch.object(settings, "META_APP_SECRET", ""):
             result = verify_webhook_signature(b"body", None)
-            self.assertTrue(result)
+            self.assertFalse(result)
 
     def test_invalid_prefix_rejected(self):
         """Signature with wrong prefix is rejected."""

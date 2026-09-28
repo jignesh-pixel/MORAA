@@ -320,8 +320,9 @@ def verify_webhook_signature(
 ) -> bool:
     """Verify Meta's X-Hub-Signature-256 HMAC-SHA256 signature."""
     if not settings.META_APP_SECRET:
-        logger.info("META_APP_SECRET not configured — skipping webhook signature verification")
-        return True
+        # Fail closed: without the app secret no signature can be verified.
+        logger.warning("META_APP_SECRET not configured — webhook signature cannot be verified")
+        return False
 
     if not signature_header:
         logger.warning("Webhook request missing X-Hub-Signature-256 header")
@@ -1102,6 +1103,115 @@ def _fail_delivery(db, ingestion, error_message: str) -> None:
     _check_failure_rate(db)
 
 
+def _refunded_amount(db, ingestion) -> int:
+    """Rupees refunded for this ingestion (0 when no refund row exists)."""
+    try:
+        from app.models.audit_log import AuditLog
+
+        row = (
+            db.query(AuditLog.details)
+            .filter(
+                AuditLog.action == REFUND_AUDIT_ACTION,
+                AuditLog.resource_id == ingestion.id,
+            )
+            .first()
+        )
+        if row is None:
+            return 0
+        return int((json.loads(row[0] or "{}") or {}).get("amount") or 0)
+    except Exception as e:
+        logger.error(f"Refund lookup failed: ingestion_id={ingestion.id} error={e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return 0
+
+
+async def _notify_failed_order(db, ingestion, product_label: str) -> None:
+    """Tell the customer a paid order failed, using the Clean Studio Shot
+    failure wording. States a refund only when a refund row exists. Never raises."""
+    refunded = _refunded_amount(db, ingestion)
+    text = f"Sorry, we couldn't create your {product_label} this time. "
+    if refunded:
+        text += f"₹{refunded} has been refunded to your wallet."
+    elif not ingestion.amount_charged:
+        text += "You were not charged."
+    try:
+        await send_whatsapp_text(
+            ingestion.external_user_id,
+            text.strip(),
+            reply_to_message_id=ingestion.external_message_id,
+        )
+    except Exception as notify_error:
+        logger.error(f"Failed-order notice not sent: ingestion_id={ingestion.id} error={notify_error}")
+
+
+# Paid orders whose worker can no longer be running once they are this old
+# (queued/processing rows left behind by a process restart).
+STUCK_PAID_STATUSES = ("white_queued", "pack_queued", "processing", "generated")
+
+
+async def recover_stuck_paid_orders(older_than) -> int:
+    """Startup recovery: fail + refund (exactly once) paid orders stuck in a
+    queued/processing state for longer than ``older_than``.
+
+    Only rows with a recorded charge (``amount_charged > 0``) are touched;
+    recent rows, completed rows and unpaid rows are left alone. Each row is
+    claimed with a guarded UPDATE so two sweepers can never both refund it.
+    Returns the number of orders recovered. Never raises.
+    """
+    from datetime import datetime, timezone
+
+    from app.database import SessionLocal
+    from app.models.whatsapp_ingestion import PRODUCT_WHITE_BG, WhatsAppIngestion
+
+    recovered = 0
+    db = SessionLocal()
+    try:
+        cutoff = datetime.now(timezone.utc) - older_than
+        rows = (
+            db.query(WhatsAppIngestion)
+            .filter(
+                WhatsAppIngestion.status.in_(STUCK_PAID_STATUSES),
+                WhatsAppIngestion.amount_charged > 0,
+                WhatsAppIngestion.updated_at < cutoff,
+            )
+            .all()
+        )
+        for row in rows:
+            message = f"Recovered at startup: order stuck in '{row.status}'"
+            claimed = (
+                db.query(WhatsAppIngestion)
+                .filter(
+                    WhatsAppIngestion.id == row.id,
+                    WhatsAppIngestion.status == row.status,
+                )
+                .update(
+                    {WhatsAppIngestion.status: "failed", WhatsAppIngestion.error_message: message},
+                    synchronize_session=False,
+                )
+            )
+            db.commit()
+            if claimed != 1:
+                continue
+            db.refresh(row)
+            logger.error(f"Stuck paid order recovered: ingestion_id={row.id} {message}")
+            _refund_failed_ingestion(db, row)
+            label = "Clean Studio Shot" if row.product_code == PRODUCT_WHITE_BG else "Full Catalog Pack"
+            await _notify_failed_order(db, row, label)
+            recovered += 1
+    except Exception as e:
+        logger.error(f"Stuck paid order recovery failed: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        db.close()
+    return recovered
+
+
 def _data_url_to_bytes(data_url: str) -> Optional[bytes]:
     import base64
     try:
@@ -1133,6 +1243,7 @@ async def _generate_single_pack_style(
     reference_image_bytes: bytes,
     reference_mime_type: str,
     request_id: str,
+    spend_reserved: bool = False,
 ) -> Optional[str]:
     """Generate one style of the catalog pack and return its image data URL."""
     if DRY_RUN_IMAGE_MODE:
@@ -1153,6 +1264,7 @@ async def _generate_single_pack_style(
             context={"request_id": request_id, "aspect_ratio": "4:5"},
             reference_image=reference_image_bytes,
             reference_mime_type=reference_mime_type,
+            spend_reserved=spend_reserved,
         )
 
         if not result.success or not result.image_url:
@@ -1199,6 +1311,18 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
     }
 
     db = SessionLocal()
+    ingestion = None
+
+    async def _fail(message: str, delivery: bool = False) -> bool:
+        # Same path as before (status + refund exactly once via the audit
+        # row), then tell the customer -- mirrors the Clean Studio Shot flow.
+        if delivery:
+            _fail_delivery(db, ingestion, message)
+        else:
+            _fail_ingestion(db, ingestion, message)
+        await _notify_failed_order(db, ingestion, "Full Catalog Pack")
+        return False
+
     try:
         ingestion = db.query(WhatsAppIngestion).filter(
             WhatsAppIngestion.id == ingestion_id
@@ -1220,19 +1344,16 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
 
         image_record = db.query(Image).filter(Image.id == ingestion.image_id).first()
         if not image_record:
-            _fail_ingestion(db, ingestion, "Image record not found")
-            return False
+            return await _fail("Image record not found")
 
         from pathlib import Path
         image_path = Path(image_record.file_path)
         if not image_path.exists():
-            _fail_ingestion(db, ingestion, f"Image file not found: {image_path}")
-            return False
+            return await _fail(f"Image file not found: {image_path}")
 
         reference_image_bytes = image_path.read_bytes()
         if len(reference_image_bytes) == 0:
-            _fail_ingestion(db, ingestion, "Image file is empty")
-            return False
+            return await _fail("Image file is empty")
 
         style_jobs: List[Tuple[str, str]] = []
         for style_title, prompt_type in CATALOG_PACK_STYLES:
@@ -1247,8 +1368,19 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
             style_jobs = style_jobs[: max(MAX_STYLES_PER_PACK, 1)]
 
         if not style_jobs:
-            _fail_ingestion(db, ingestion, "No valid style prompt builders available")
-            return False
+            return await _fail("No valid style prompt builders available")
+
+        # Daily spend cap: reserve every style of this paid pack up front. The
+        # pack either fits under MAX_GENERATIONS_PER_DAY as a whole or fails
+        # (and is refunded) before any provider call -- never a 1/6 pack.
+        spend_reserved = False
+        if not DRY_RUN_IMAGE_MODE:
+            from app.ai.image_generation_manager import reserve_generation_slots
+
+            blocked = reserve_generation_slots(len(style_jobs))
+            if blocked:
+                return await _fail(f"Generation blocked: {blocked}")
+            spend_reserved = True
 
         logger.info(
             f"Catalog pack generation started: ingestion_id={ingestion_id} "
@@ -1265,6 +1397,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
                     reference_image_bytes=reference_image_bytes,
                     reference_mime_type=ingestion.mime_type or "image/jpeg",
                     request_id=ingestion.request_id,
+                    spend_reserved=spend_reserved,
                 )
                 for style_title, prompt in style_jobs
             ]
@@ -1275,8 +1408,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         ]
 
         if not generated_data_urls:
-            _fail_ingestion(db, ingestion, "All catalog style generations failed")
-            return False
+            return await _fail("All catalog style generations failed")
 
         ingestion.status = "generated"
         db.commit()
@@ -1294,8 +1426,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
             media_ids.append(media_id)
 
         if not media_ids:
-            _fail_delivery(db, ingestion, "All Meta media uploads failed")
-            return False
+            return await _fail("All Meta media uploads failed", delivery=True)
 
         from app.services.wallet_service import find_customer_by_phone, get_balance
 
@@ -1309,11 +1440,12 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
             balance_text=balance_text,
             reply_to_message_id=ingestion.external_message_id,
         )
-        total_images = len(media_ids)
+        # Completion is measured against the styles this pack was meant to
+        # produce, not just the images that happened to be generated.
+        total_images = len(style_jobs)
 
         if sent_count == 0:
-            _fail_delivery(db, ingestion, "Catalog pack Meta message delivery failed")
-            return False
+            return await _fail("Catalog pack Meta message delivery failed", delivery=True)
 
         if sent_count < total_images:
             # Partial delivery: the customer already received real value, so
@@ -1325,6 +1457,15 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
                 f"Catalog pack partially delivered: ingestion_id={ingestion_id} "
                 f"sent={sent_count}/{total_images} recipient={ingestion.external_user_id}"
             )
+            try:
+                await send_whatsapp_text(
+                    ingestion.external_user_id,
+                    f"Note: {sent_count} of {total_images} images in your Full Catalog Pack "
+                    "could be created this time.",
+                    reply_to_message_id=ingestion.external_message_id,
+                )
+            except Exception as notify_error:
+                logger.error(f"Partial-pack notice not sent: ingestion_id={ingestion_id} error={notify_error}")
             return True
 
         ingestion.status = "delivered"
@@ -1339,6 +1480,19 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
 
     except Exception as e:
         logger.error(f"Catalog pack generation exception: ingestion_id={ingestion_id} error={e}")
+        # A paid order must never be left in processing/generated with no
+        # output and no refund: record the failure through the same path.
+        try:
+            db.rollback()
+            if ingestion is not None:
+                db.refresh(ingestion)
+                if ingestion.status not in ("failed", "delivery_failed", "delivered", "delivered_partial"):
+                    return await _fail(f"Unexpected error: {e}"[:1000])
+        except Exception as fail_error:
+            logger.error(
+                f"Catalog pack could not record failure: ingestion_id={ingestion_id} "
+                f"error={fail_error}"
+            )
         return False
     finally:
         db.close()

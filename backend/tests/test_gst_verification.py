@@ -218,6 +218,88 @@ class OnboardingFlowTests(FundedSlotGateTestCase):
         self.assertEqual((self.provider.calls, self.button_msgs), ([], []))
         self.assertIsNone(self._state())
 
+    # ── Onboarding completion waits for GST resolution ──
+    USER_FORM = "Name: MOCK VERIFIED USER\nbusiness: Test Jeweller\nGST: {gst}\nBusiness Address: JOGESHWARI-E TEST"
+
+    def _confirmations(self):
+        # "You're all set" + Recharge CTA (the only CTA-URL sender used here).
+        return self.webhook_module.send_whatsapp_cta_url_button.await_count
+
+    def test_invalid_gst_prompts_and_does_not_complete_onboarding(self):
+        self._text(self.USER_FORM.format(gst="INVALID1263"), "wamid.i1")
+        self.assertEqual(self._confirmations(), 0)  # no "You're all set"
+        self.assertTrue(self.button_msgs[-1][0].startswith("Invalid GST format."))
+        self.assertEqual([b for b, _ in self.button_msgs[-1][1]], ["btn_gst_reenter", "btn_gst_skip"])
+        c = self._cust()
+        self.assertEqual((c.gst_number, c.is_gst_verified, c.is_registered), ("N/A", False, False))
+        self.assertEqual(self._state(), gst.STATE_AWAITING_GSTIN)
+        self.assertEqual(self.provider.calls, [])
+
+    def test_invalid_then_skip_completes_once(self):
+        self._text(self.USER_FORM.format(gst="INVALID1263"), "wamid.i2")
+        self._button("btn_gst_skip", "wamid.i2b")
+        c = self._cust()
+        self.assertEqual((c.gst_number, c.is_gst_verified, c.is_registered), ("N/A", False, True))
+        self.assertEqual(self._state(), gst.STATE_REGISTERED)
+        self.assertEqual(self.texts[-1], gst.SKIP_MESSAGE)
+        self.assertEqual(self._confirmations(), 1)
+        body = self.webhook_module.send_whatsapp_cta_url_button.await_args.kwargs["body_text"]
+        self.assertTrue(body.startswith("You're all set, MOCK!"))
+        # A second (stale) Skip tap never sends a second confirmation.
+        self._button("btn_gst_skip", "wamid.i2c")
+        self.assertEqual(self._confirmations(), 1)
+
+    def test_invalid_then_reenter_then_valid_completes_once(self):
+        self._text(self.USER_FORM.format(gst="INVALID1263"), "wamid.i3")
+        self._button("btn_gst_reenter", "wamid.i3b")
+        self.assertEqual(self.texts[-1], "Please enter your 15-digit GSTIN number:")
+        self._text("BAD2", "wamid.i3c")  # still invalid: prompt again, no completion
+        self.assertEqual(self._confirmations(), 0)
+        self.assertEqual(self._state(), gst.STATE_AWAITING_GSTIN)
+        self._text(GOOD, "wamid.i3d")
+        c = self._cust()
+        self.assertEqual((c.gst_number, c.is_gst_verified, c.is_registered), (GOOD, True, True))
+        self.assertEqual(self._state(), gst.STATE_REGISTERED)
+        self.assertIn("✅ GSTIN Verified Successfully! Trade Name: SHAH GEMS LLP. Profile complete.", self.texts)
+        self.assertEqual(self._confirmations(), 1)
+
+    def test_invalid_then_typed_valid_without_button(self):
+        self._text(self.USER_FORM.format(gst="INVALID1263"), "wamid.i4")
+        self._text(GOOD, "wamid.i4b")
+        self.assertEqual((self._cust().is_gst_verified, self._confirmations()), (True, 1))
+
+    def test_invalid_then_typed_skip(self):
+        self._text(self.USER_FORM.format(gst="INVALID1263"), "wamid.i5")
+        self._text("skip", "wamid.i5b")
+        self.assertEqual((self._cust().gst_number, self._state(), self._confirmations()),
+                         ("N/A", gst.STATE_REGISTERED, 1))
+
+    def test_valid_gst_confirms_after_verification(self):
+        self._text(self.USER_FORM.format(gst=GOOD), "wamid.i6")
+        self.assertEqual((self._cust().is_gst_verified, self._confirmations(), self.button_msgs), (True, 1, []))
+
+    def test_no_gst_confirms_immediately(self):
+        self._text(self.USER_FORM.format(gst="NA"), "wamid.i7")
+        self.assertEqual((self._confirmations(), self.button_msgs, self.provider.calls), (1, [], []))
+
+    def test_flag_off_confirms_immediately(self):
+        with patch.object(settings, "GST_VERIFICATION_ENABLED", False):
+            self._text(self.USER_FORM.format(gst="INVALID1263"), "wamid.i8")
+        self.assertEqual((self._confirmations(), self.button_msgs), (1, []))
+
+    def test_invalid_gst_in_flow_waits_for_skip(self):
+        self._flow({"full_name": "Anurag Mehta", "business_name": "Moraa", "address": "Surat", "gst_number": "27ABC123"})
+        self.assertEqual(self._confirmations(), 0)
+        self._button("btn_gst_skip", "wamid.f1")
+        self.assertEqual(self._confirmations(), 1)
+
+    def test_no_vendor_accepts_well_formed_gstin_unverified(self):
+        self.provider = gst.NoGstProvider()
+        self._text(self.USER_FORM.format(gst=GOOD), "wamid.i9")
+        c = self._cust()
+        self.assertEqual((c.gst_number, c.is_gst_verified, c.is_registered), (GOOD, False, True))
+        self.assertEqual((self._confirmations(), self.button_msgs), (1, []))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -31,6 +31,7 @@ from app.middleware.cors import setup_cors
 from app.middleware.error_handler import setup_error_handlers
 from app.middleware.logging_middleware import setup_logging_middleware
 from app.middleware.rate_limit import setup_rate_limit
+from app.middleware.public_host_guard import setup_public_host_guard
 from app.utils.logger import logger, setup_logging
 
 
@@ -80,6 +81,24 @@ async def lifespan(app: FastAPI):
             f"Storage sweep skipped: {e}", extra={"category": "system"}
         )
 
+    # Paid-order recovery (best-effort, non-fatal): background jobs do not
+    # survive a restart, so a paid order left queued/processing longer than
+    # the existing stuck threshold is failed and refunded exactly once.
+    try:
+        from app.api.routes.meta_webhook import STUCK_WHITE_AFTER
+        from app.services.meta_whatsapp_service import recover_stuck_paid_orders
+
+        recovered = await recover_stuck_paid_orders(STUCK_WHITE_AFTER)
+        if recovered:
+            logger.warning(
+                f"Recovered {recovered} stuck paid order(s) at startup",
+                extra={"category": "system"},
+            )
+    except Exception as e:
+        logger.warning(
+            f"Stuck paid order recovery skipped: {e}", extra={"category": "system"}
+        )
+
     # Image provider startup diagnosis (best-effort, non-fatal). Probes the
     # configured Gemini image model once at boot and logs an actionable cause
     # when access is broken (invalid model name, disabled API, quota
@@ -121,6 +140,7 @@ setup_cors(app)
 setup_logging_middleware(app)
 setup_rate_limit(app)
 setup_error_handlers(app)
+setup_public_host_guard(app)
 
 # Include routers
 app.include_router(health_router)

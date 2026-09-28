@@ -228,6 +228,62 @@ def _normalize_gst(value: Any) -> str:
     return gst_norm if _GSTIN_RE.match(gst_norm) else "N/A"
 
 
+_REG_NAME_KEYS = {"name", "full name", "your name"}
+_REG_BUSINESS_KEYS = {
+    "business", "business name", "brand", "brand name",
+    "shop name", "company", "company name",
+}
+_REG_GST_KEYS = {"gst", "gstin", "gst number", "gstin number", "gst no", "gst no."}
+_REG_ADDRESS_KEYS = {"address", "business address", "shop address"}
+
+
+def _parse_registration_text(raw_text: str) -> Dict[str, str]:
+    """Parse a free-text "Key: value" registration message.
+
+    Keys are matched exactly (case-insensitive, parenthesised parts such as
+    "(Optional)" removed). "City" only fills the address when no address key
+    was given.
+    """
+    result = {
+        "name": "there",
+        "business": "Jewelry Business",
+        "gst": "N/A",
+        "raw_gst": "",
+        "address": "N/A",
+    }
+    address_val = ""
+    city_val = ""
+    for line in (raw_text or "").splitlines():
+        # Customers often paste the "• Name:" bullets back.
+        line_clean = line.strip().lstrip("•*-–· ").strip()
+        if ":" not in line_clean:
+            continue
+        key, value = line_clean.split(":", 1)
+        value = value.strip()
+        if not value:
+            continue
+        key = re.sub(r"\([^)]*\)", " ", key.lower())
+        key = " ".join(key.split())
+        if key in _REG_NAME_KEYS:
+            result["name"] = value.split()[0]
+        elif key in _REG_BUSINESS_KEYS:
+            result["business"] = value
+        elif key in _REG_GST_KEYS:
+            result["raw_gst"] = value
+            # t9: only a real 15-char GSTIN is stored; "NA"/"none"/malformed
+            # text becomes N/A.
+            result["gst"] = _normalize_gst(value)
+        elif key in _REG_ADDRESS_KEYS:
+            address_val = value
+        elif key == "city":
+            city_val = value
+    if address_val:
+        result["address"] = address_val
+    elif city_val:
+        result["address"] = city_val
+    return result
+
+
 def _upsert_registered_customer(
     db: Session,
     sender: str,
@@ -295,6 +351,17 @@ async def _send_registration_confirmation(
         button_label="Recharge Wallet",
         url=pay_url or DEFAULT_PAYMENT_URL,
     )
+
+
+def _confirmation_for(db: Session, sender: str):
+    """Deferred "You're all set" for a GSTIN resolved after registration
+    (Skip button, or a valid re-entered GSTIN)."""
+    async def _send() -> None:
+        cust = _find_customer_safe(db, sender)
+        if cust is not None:
+            name = (cust.full_name or "there").split()[0] if (cust.full_name or "").strip() else "there"
+            await _send_registration_confirmation(db, sender, cust, name)
+    return _send
 
 
 # ─── WhatsApp Flow registration ──────────────────────────────────────────
@@ -420,9 +487,12 @@ async def _handle_registration_flow(db: Session, event: Dict[str, Any]) -> bool:
         logger.error(f"Registration Flow could not be saved for {sender}")
         return False
 
-    await _send_registration_confirmation(db, sender, cust, full_name)
-    # Live GSTIN check (no-op unless GST_VERIFICATION_ENABLED).
-    await verify_after_registration(db, sender, data.get("gst_number"))
+    # GST first: "You're all set" is sent only once the GSTIN is resolved
+    # (verified, accepted, skipped, or none given / check disabled).
+    await verify_after_registration(
+        db, sender, data.get("gst_number"),
+        on_complete=lambda: _send_registration_confirmation(db, sender, cust, full_name),
+    )
     return True
 
 
@@ -761,39 +831,16 @@ async def receive_webhook(
                 # After "Re-enter GSTIN" the next text is the GSTIN itself
                 # (always False unless GST_VERIFICATION_ENABLED).
                 if is_awaiting_gstin(db, sender):
-                    await handle_gstin_reply(db, sender, raw_text)
+                    await handle_gstin_reply(db, sender, raw_text, on_complete=_confirmation_for(db, sender))
                     continue
 
-                if "name:" in lower_text and any(k in lower_text for k in ("business", "brand", "gst", "city")):
-                    user_name = "there"
-                    biz_name = "Jewelry Business"
-                    gst_val = "N/A"
-                    raw_gst = ""
-                    addr_val = "N/A"
-
-                    for line in raw_text.splitlines():
-                        # Customers often paste the "• Name:" bullets back.
-                        line_clean = line.strip().lstrip("•*-–· ").strip()
-                        l_low = line_clean.lower()
-                        if l_low.startswith("name:"):
-                            extracted = line_clean.split(":", 1)[1].strip()
-                            if extracted:
-                                user_name = extracted.split()[0]
-                        elif ("business name" in l_low or "brand name" in l_low) and ":" in line_clean:
-                            extracted_biz = line_clean.split(":", 1)[1].strip()
-                            if extracted_biz:
-                                biz_name = extracted_biz
-                        elif "gst" in l_low and ":" in line_clean:
-                            extracted_gst = line_clean.split(":", 1)[1].strip()
-                            if extracted_gst:
-                                raw_gst = extracted_gst
-                                # t9: only a real 15-char GSTIN is stored;
-                                # "NA"/"none"/malformed text becomes N/A.
-                                gst_val = _normalize_gst(extracted_gst)
-                        elif ("address" in l_low or l_low.startswith("city")) and ":" in line_clean:
-                            extracted_addr = line_clean.split(":", 1)[1].strip()
-                            if extracted_addr:
-                                addr_val = extracted_addr
+                if "name:" in lower_text and any(k in lower_text for k in ("business", "brand", "gst", "city", "address")):
+                    parsed = _parse_registration_text(raw_text)
+                    user_name = parsed["name"]
+                    biz_name = parsed["business"]
+                    gst_val = parsed["gst"]
+                    raw_gst = parsed["raw_gst"]
+                    addr_val = parsed["address"]
 
                     cust = _upsert_registered_customer(
                         db, sender, user_name, biz_name, gst_val, addr_val
@@ -801,8 +848,11 @@ async def receive_webhook(
                     if cust is None:
                         continue
 
-                    await _send_registration_confirmation(db, sender, cust, user_name)
-                    await verify_after_registration(db, sender, raw_gst)
+                    # GST first; the confirmation waits for GST resolution.
+                    await verify_after_registration(
+                        db, sender, raw_gst,
+                        on_complete=lambda: _send_registration_confirmation(db, sender, cust, user_name),
+                    )
                     continue
 
                 if re.search(r"\b(hi|hii|hello|hey|start)\b", lower_text):
@@ -868,7 +918,7 @@ async def receive_webhook(
                 b_id = button_reply.get("id", "")
                 sender = event.get("sender", "")
 
-                if await handle_gst_button(db, sender, b_id):
+                if await handle_gst_button(db, sender, b_id, on_complete=_confirmation_for(db, sender)):
                     continue
 
                 product_choice = parse_product_button_id(b_id)
