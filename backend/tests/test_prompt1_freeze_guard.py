@@ -23,9 +23,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # NOTE: Re-baselined 2026-09-09 — Prompt 1 builder gained the mandatory
 # 1:1 visual-preservation lock + input-extraction directives (approved
 # change). Content is otherwise identical to the original baseline.
+# Re-baselined 2026-09-28 — approved changes: 100% pure white background
+# (ff2754f, 2026-09-19) and the v2 prompt behind EARRING_PROMPT_VERSION
+# (46b0dd0, 2026-09-25; v1 stays the default). Hashes are computed with
+# CRLF normalised to LF so a Windows checkout does not trip the guard.
 
 PROMPT1_FILE_HASHES = {
-    "backend/app/services/earring_ecommerce_prompt.py": "79402c00f7bf89b21f08a00fddc43c55",
+    "backend/app/services/earring_ecommerce_prompt.py": "989f0015142b944d91bc541f0bef3693",
     "backend/app/api/routes/earring_ecommerce.py": "04b95e0d8f93229d1ccd1bf71b0f0782",
     "frontend/src/services/earring-ecommerce.service.ts": "aed13afa09d236994a89be632df7480d",
 }
@@ -50,11 +54,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 def _md5(filepath: Path) -> str:
     """Compute MD5 hash of a file."""
-    h = hashlib.md5()
     with open(filepath, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
+        return hashlib.md5(f.read().replace(b"\r\n", b"\n")).hexdigest()
 
 
 class TestPrompt1FileIntegrity(unittest.TestCase):
@@ -143,7 +144,7 @@ class TestPrompt1OutputContract(unittest.TestCase):
         from app.services.earring_ecommerce_prompt import build_earring_ecommerce_prompt
         result = build_earring_ecommerce_prompt()
         self.assertIn("OUTPUT RULE", result)
-        self.assertIn("WITHOUT any jewellery card", result)
+        self.assertIn("no jewellery card", result)
 
     def test_builder_accepts_earring_type_hoop(self):
         """Prompt 1 builder accepts Hoop earring type."""

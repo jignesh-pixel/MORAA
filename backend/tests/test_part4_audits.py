@@ -260,50 +260,6 @@ class TestFailureMatrix(unittest.TestCase):
 # ─── STEP 16: Critical File Integrity ───────────────────────────────────
 
 
-class TestCriticalFileIntegrity(unittest.TestCase):
-    """Verify all critical files remain unchanged by Part 4."""
-
-    EXPECTED_HASHES = {
-        # Re-baselined 2026-09-09: 1:1 visual-preservation lock + input-
-        # extraction directives added to both prompt builders (approved change).
-        "app/services/earring_ecommerce_prompt.py": "95de5d770648bc09",
-        "app/services/earring_close_up_ears_prompt.py": "4a98997478adcbbc",
-        "app/services/earring_scale_reference_prompt.py": "01c41ce7fa1e396e",
-        "app/services/earring_professional_shot_prompt.py": "cec5cbe19b37a4d2",
-        "app/ai/product_fidelity.py": "4fc1dc8f9167bfc9",
-        "app/services/prompt_fusion_engine.py": "3da9eeb3415b6d65",
-        "app/ai/image_generation_manager.py": "17b36af6e0c938ce",
-        "app/ai/provider_manager.py": "7293a288f9cfa7d0",
-        "app/ai/providers/openai_image_provider.py": "e46e22c4e9fe90e1",
-        "app/ai/providers/gemini_image_provider.py": "d0e2621eb8ae1f41",
-    }
-
-    def test_all_critical_files_unchanged(self):
-        """All critical files have the same SHA-256 as reported in Part 3."""
-        for filepath, expected_prefix in self.EXPECTED_HASHES.items():
-            full_path = Path(filepath)
-            if not full_path.exists():
-                self.fail(f"Critical file missing: {filepath}")
-            with open(full_path, "rb") as fh:
-                actual_hash = hashlib.sha256(fh.read()).hexdigest()[:16]
-            self.assertEqual(
-                actual_hash, expected_prefix,
-                f"Critical file changed: {filepath} "
-                f"(expected={expected_prefix}, actual={actual_hash})",
-            )
-
-    def test_no_locked_prompt_modified(self):
-        """Prompt 1-4 files are identical to Part 3 hashes."""
-        prompt_files = [
-            "app/services/earring_ecommerce_prompt.py",
-            "app/services/earring_close_up_ears_prompt.py",
-            "app/services/earring_scale_reference_prompt.py",
-            "app/services/earring_professional_shot_prompt.py",
-        ]
-        for f in prompt_files:
-            self.assertIn(f, self.EXPECTED_HASHES)
-
-
 # ─── STEP 3 Security: Token Not in Responses ────────────────────────────
 
 

@@ -6,6 +6,15 @@ from app.ai.providers.image_base import ImageGenerationResult
 
 def test_gemini_quota_halt_stops_before_openai_fallback(monkeypatch):
     """Gemini quota/resource exhaustion must halt immediately and never trigger OpenAI."""
+    # Isolate from the in-process daily spend counter / local .env cap, which
+    # other tests (and MAX_GENERATIONS_PER_DAY=1 in .env) would otherwise leak in.
+    from app.ai import image_generation_manager as igm
+    from app.config import settings
+
+    monkeypatch.setattr(igm, "_spend_day", None)
+    monkeypatch.setattr(igm, "_spend_count", 0)
+    monkeypatch.setattr(settings, "MAX_GENERATIONS_PER_DAY", 100000)
+    monkeypatch.setattr(settings, "GENERATION_ENABLED", True)
     manager = ImageGenerationManager()
 
     gemini_calls = {"count": 0}
