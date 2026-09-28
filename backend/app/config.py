@@ -284,6 +284,11 @@ class Settings(BaseSettings):
     # from WALLET_IMAGE_PRICE_RUPEES, which stays the E-Com Pack 1 price.
     WHITE_BG_PRICE_RUPEES: int = 50
 
+    # Trial credits consumed per order (tier = TRIAL). A credit is one
+    # complimentary order; the owner sets trial_credits_total per customer.
+    TRIAL_CREDITS_PER_WHITE_BG: int = 1   # ₹50 Clean Studio Shot
+    TRIAL_CREDITS_PER_PACK_1: int = 1     # ₹500 E-Com Pack 1 (6 images)
+
     # Razorpay (or any PSP) payment-page URL used by the "Pay ₹<price>" CTA
     # URL button. Leave empty to fall back to the interactive reply button
     # ('recharge_500' / "💳 Recharge to use") that the onboarding flow already

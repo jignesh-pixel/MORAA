@@ -75,6 +75,7 @@ from app.services.whatsapp_pay_service import (
     handle_payment_status_event,
     try_send_native_recharge,
 )
+from app.services import entitlement_service as ent
 from app.services.wallet_service import (
     charge_customer_balance,
     find_customer_by_phone,
@@ -328,7 +329,24 @@ def _upsert_registered_customer(
 async def _send_registration_confirmation(
     db: Session, sender: str, cust: Customer, display_name: str
 ) -> None:
-    """"You're all set" + Recharge Wallet CTA (fresh ₹500 Razorpay link)."""
+    """"You're all set" + Recharge Wallet CTA (fresh ₹500 Razorpay link).
+
+    Team members (ADMIN) and trial customers with credits get the same
+    confirmation as plain text, without any recharge prompt.
+    """
+    if ent.payment_exempt(cust):
+        if ent.is_admin(cust):
+            extra = "Team access is active - no recharge needed."
+        else:
+            remaining = ent.trial_remaining(cust)
+            extra = (f"You have {remaining} complimentary trial credit"
+                     f"{'' if remaining == 1 else 's'} - no recharge needed.")
+        await send_whatsapp_text(
+            sender,
+            f"You're all set, {display_name}! 🎉\n\nYour account is ready.\n{extra}\n\n"
+            "Send your jewelry photo whenever you're ready to start!",
+        )
+        return
     confirm_msg = REGISTRATION_CONFIRMATION_TEMPLATE.format(
         name=display_name,
         balance=f"{get_balance(db, cust.whatsapp_id):,}",
@@ -566,7 +584,8 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
     min_price = min(white_price, pack_price)
     customer = find_customer_by_phone(db, sender)
     balance = get_balance(db, customer.whatsapp_id) if customer else 0
-    if customer is None or balance < min_price:
+    # Team members and trial customers with credits are never held for funds.
+    if customer is None or (balance < min_price and not ent.payment_exempt(customer)):
         ingestion.status = "unfunded"
         ingestion.error_message = f"Balance {balance} below minimum {min_price} at upload"
         db.commit()
@@ -689,7 +708,39 @@ async def _handle_product_choice(
     price = _product_price(product)
     dry_run = product == PRODUCT_WHITE_BG and bool(_mws.DRY_RUN_IMAGE_MODE)
     customer = find_customer_by_phone(db, sender)
-    if customer is None:
+
+    # Tiered access (entitlement_service): ADMIN is free; a TRIAL customer
+    # with credits for this product is free (a credit is used only when the
+    # order is delivered). Everything else is the normal wallet path.
+    free_access = None
+    if customer is not None and ent.is_admin(customer):
+        free_access = "admin"
+    elif customer is not None and ent.has_trial_credits(customer):
+        if not ent.trial_shot_allowed(customer, product):
+            if get_balance(db, customer.whatsapp_id) < price:
+                db.query(WhatsAppIngestion).filter(
+                    WhatsAppIngestion.id == ingestion_id,
+                    WhatsAppIngestion.status == "choice_claimed",
+                ).update(
+                    {WhatsAppIngestion.status: "awaiting_choice", WhatsAppIngestion.product_code: None},
+                    synchronize_session=False,
+                )
+                db.commit()
+                permitted = " / ".join(ent.allowed_product_labels(customer)) or "no products"
+                await send_whatsapp_text(
+                    sender,
+                    f"Your complimentary trial covers: {permitted}. Tap that option on your photo "
+                    f"to use a trial credit, or recharge your wallet to order the {label}.",
+                    reply_to_message_id=quote_id,
+                )
+                return None
+            # Wallet can pay for the product outside the trial: normal charge below.
+        elif ent.trial_credits_available(db, customer, product, exclude_ingestion_id=ingestion_id):
+            free_access = "trial"
+
+    if free_access:
+        charged = True
+    elif customer is None:
         charged = False
     elif dry_run:
         # Same balance rule, but no money moves in dry-run.
@@ -719,15 +770,23 @@ async def _handle_product_choice(
         return None
 
     db.refresh(ingestion)
-    ingestion.amount_charged = 0 if dry_run else price
+    ingestion.amount_charged = 0 if (dry_run or free_access) else price
     ingestion.status = "white_queued" if product == PRODUCT_WHITE_BG else "pack_queued"
     db.commit()
 
     if product == PRODUCT_WHITE_BG:
+        if free_access == "trial":
+            cost_note = ", complimentary trial credit"
+        elif free_access == "admin":
+            cost_note = ", team access - no charge"
+        elif dry_run:
+            cost_note = ", test mode - no charge"
+        else:
+            cost_note = f", ₹{price}"
         await send_whatsapp_text(
             sender,
             "✨ Processing your Clean Studio Shot (1 image"
-            + (", test mode - no charge" if dry_run else f", ₹{price}")
+            + cost_note
             + ")... Please allow 20-30 seconds.",
             reply_to_message_id=quote_id,
         )

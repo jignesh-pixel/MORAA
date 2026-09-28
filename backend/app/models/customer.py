@@ -19,7 +19,19 @@ arithmetic.
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text, false, text, true
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Integer,
+    String,
+    Text,
+    false,
+    text,
+    true,
+)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, synonym
 
 from app.database import Base
@@ -33,6 +45,16 @@ class Customer(Base):
     """
 
     __tablename__ = "customers"
+    __table_args__ = (
+        CheckConstraint(
+            "tier IN ('ADMIN','TRIAL','STANDARD')",
+            name="ck_customers_tier",
+        ),
+        CheckConstraint(
+            "trial_credits_total >= 0 AND trial_credits_used >= 0",
+            name="ck_customers_trial_credits_nonneg",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(
         String(36),
@@ -88,6 +110,43 @@ class Customer(Base):
         default=False,
         server_default=false(),
         comment="True only after a live GSTIN lookup returned Active",
+    )
+
+    # ── Access tier (migration 0008) ───────────────────────────────────
+    tier: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="STANDARD",
+        server_default=text("'STANDARD'"),
+        comment="Access tier: ADMIN, TRIAL or STANDARD",
+    )
+    trial_credits_total: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+        comment="Complimentary orders granted by the owner (TRIAL tier)",
+    )
+    trial_credits_used: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+        comment="Complimentary orders already consumed (TRIAL tier)",
+    )
+    allowed_shots: Mapped[list] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=False,
+        default=lambda: ["all"],
+        server_default=text("'[\"all\"]'"),
+        comment='Shot/product types this customer may order (["all"] = every type)',
+    )
+    bypass_payment: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=false(),
+        comment="True to skip wallet/payment checks (owner-granted)",
     )
 
     # ── Backward-compatible aliases ────────────────────────────────────

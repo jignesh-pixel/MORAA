@@ -1373,8 +1373,15 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         # Daily spend cap: reserve every style of this paid pack up front. The
         # pack either fits under MAX_GENERATIONS_PER_DAY as a whole or fails
         # (and is refunded) before any provider call -- never a 1/6 pack.
+        from app.services import entitlement_service as ent
+        from app.services.wallet_service import find_customer_by_phone as _find_cust
+
         spend_reserved = False
-        if not DRY_RUN_IMAGE_MODE:
+        if not DRY_RUN_IMAGE_MODE and ent.is_admin(_find_cust(db, ingestion.external_user_id)):
+            # Team (ADMIN) order: not counted against the daily spend cap
+            # (the GENERATION_ENABLED kill switch still applies per call).
+            spend_reserved = True
+        elif not DRY_RUN_IMAGE_MODE:
             from app.ai.image_generation_manager import reserve_generation_slots
 
             blocked = reserve_generation_slots(len(style_jobs))
@@ -1466,6 +1473,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
                 )
             except Exception as notify_error:
                 logger.error(f"Partial-pack notice not sent: ingestion_id={ingestion_id} error={notify_error}")
+            await ent.record_trial_success(db, ingestion)  # images were delivered
             return True
 
         ingestion.status = "delivered"
@@ -1476,6 +1484,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
             f"Catalog pack delivered: ingestion_id={ingestion_id} images={len(media_ids)} "
             f"recipient={ingestion.external_user_id}"
         )
+        await ent.record_trial_success(db, ingestion)  # trial orders only; never raises
         return True
 
     except Exception as e:
@@ -1671,11 +1680,18 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
 
             # The customer's stored photo goes to the model as the reference
             # image; the prompt tells it to re-photograph THAT earring on white.
+            # Team (ADMIN) orders are not counted against the daily spend
+            # cap; the GENERATION_ENABLED kill switch still applies.
+            from app.services import entitlement_service as ent
+            from app.services.wallet_service import find_customer_by_phone as _find_cust
+
+            admin_order = ent.is_admin(_find_cust(db, ingestion.external_user_id))
             result = await ImageGenerationManager().generate_image(
                 prompt=build_ecommerce_shot_prompt(),
                 context={"request_id": ingestion.request_id, "aspect_ratio": "1:1"},
                 reference_image=reference_image_bytes,
                 reference_mime_type=reference_mime_type,
+                **({"spend_reserved": True} if admin_order else {}),
             )
             if not result.success or not result.image_url:
                 return await _fail(f"Generation failed: {result.error}")
@@ -1746,6 +1762,9 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
         logger.info(
             f"White BG delivered: ingestion_id={ingestion_id} provider={provider_name} model={model_used}"
         )
+        from app.services import entitlement_service as ent
+
+        await ent.record_trial_success(db, ingestion)  # trial orders only; never raises
         return True
 
     except Exception as e:
