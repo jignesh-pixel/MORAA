@@ -80,3 +80,6 @@ Thumbs.db
 nul
 
 .claude/settings.local.json
+
+# Local tooling / experiment artifacts (kept on disk, not tracked)
+graphify-out/

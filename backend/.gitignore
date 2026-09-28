@@ -45,3 +45,6 @@ task3_outputs/
 task4_outputs/
 task5_outputs/
 prompt_experiment_outputs/
+# Prompt experiment scripts (local only)
+prompt_experiment*.py
+task[2-5]_*.py

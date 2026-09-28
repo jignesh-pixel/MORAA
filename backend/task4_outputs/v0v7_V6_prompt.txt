@@ -1,7 +1,0 @@
-Create an e-commerce main image of the reference product.
-Preserve the exact product shown in the reference image.
-Preserve the exact shape, geometry, proportions, thickness, curvature, and component arrangement visible in the reference.
-Preserve every visible jewellery detail, including stones, links, hooks, posts, clasps, connectors, patterns, textures, and decorative elements.
-Preserve the exact material and original colour of the reference product. Do not recolour, reinterpret, warm, cool, tint, or transform the product.
-Do not redesign, beautify, simplify, complete, reconstruct, or invent any part of the jewellery. Preserve only what is supported by the visible reference.
-Remove the hand, card, packaging, surface, and unrelated background elements without removing or modifying any part of the jewellery.

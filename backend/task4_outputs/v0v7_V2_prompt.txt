@@ -1,3 +1,0 @@
-Create an e-commerce main image of the reference product.
-Preserve the exact product shown in the reference image.
-Preserve the exact shape, geometry, proportions, thickness, curvature, and component arrangement visible in the reference.
