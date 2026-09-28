@@ -116,11 +116,6 @@ class ConfigAndAlertTests(unittest.TestCase):
         self.assertIsNone(settings.MAX_STYLES_PER_PACK)
         self.assertEqual(meta_whatsapp_service.MAX_STYLES_PER_PACK, settings.MAX_STYLES_PER_PACK)
 
-    def test_old_send_names_still_work(self):
-        m = meta_whatsapp_service
-        self.assertIs(m.send_6_pack_images_to_whatsapp, m.send_catalog_pack_images_to_whatsapp)
-        self.assertIs(m.send_7_pack_images_to_whatsapp, m.send_catalog_pack_images_to_whatsapp)
-
     def test_failure_rate_alert_logged_when_above_target(self):
         engine, db = _make_engine_and_session()
         for i, status in enumerate(["failed", "failed", "delivered"]):

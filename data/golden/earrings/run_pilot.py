@@ -49,8 +49,8 @@ BACKEND_DIR = os.path.join(PROJECT_ROOT, "backend")
 RESULTS_DIR = os.path.join(PROJECT_ROOT, "data", "golden", "earrings", "results")
 
 REFERENCES = {
-    "R1": os.path.join(PROJECT_ROOT, "Earring Examples", "Ex1.jpeg"),
-    "R2": os.path.join(PROJECT_ROOT, "Earring Examples", "example 1.jpeg"),
+    "R1": os.path.join(PROJECT_ROOT, "docs", "samples", "Earring Examples", "Ex1.jpeg"),
+    "R2": os.path.join(PROJECT_ROOT, "docs", "samples", "Earring Examples", "example 1.jpeg"),
 }
 
 API_BASE = "http://localhost:8000"

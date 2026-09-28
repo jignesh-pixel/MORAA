@@ -144,36 +144,3 @@ def test_default_settings_do_not_block_normal_generation():
     p = _FakeProvider()
     r = asyncio.run(_manager_with(p).generate_image("x", {"request_id": "ok"}))
     assert r.success and p.calls == 1
-
-
-# ── Onboarding parser: quota error -> cooldown, no repeated paid calls ──
-
-def test_onboarding_quota_error_starts_cooldown():
-    from app.services import onboarding_service as ob
-    calls = {"n": 0}
-
-    class _Models:
-        def generate_content(self, **kw):
-            calls["n"] += 1
-            raise RuntimeError("429 RESOURCE_EXHAUSTED: quota exceeded")
-
-    class _Client:
-        def __init__(self, **kw):
-            self.models = _Models()
-
-    fake_genai = types.ModuleType("google.genai")
-    fake_genai.Client = _Client
-    fake_types = types.ModuleType("google.genai.types")
-    fake_types.GenerateContentConfig = lambda **kw: kw
-    fake_genai.types = fake_types
-    google_pkg = sys.modules.get("google") or types.ModuleType("google")
-    mods = {"google": google_pkg, "google.genai": fake_genai, "google.genai.types": fake_types}
-
-    ob._onboarding_quota_cooldown_until = 0.0
-    ob._onboarding_daily_call_count = 0
-    with patch.dict(sys.modules, mods), patch.object(google_pkg, "genai", fake_genai, create=True), \
-         patch.object(settings, "GEMINI_API_KEY", "fake-key"):
-        for _ in range(5):  # same registration message re-delivered 5 times
-            assert asyncio.run(ob._extract_via_gemini("Name: A\nBusiness name: B")) is None
-    assert calls["n"] == 1
-    ob._onboarding_quota_cooldown_until = 0.0

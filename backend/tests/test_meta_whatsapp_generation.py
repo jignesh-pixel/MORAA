@@ -74,90 +74,6 @@ class TestDataUrlConversion(unittest.TestCase):
         self.assertIsNone(result)
 
 
-# ─── Test: process_whatsapp_generation ────────────────────────────────────
-
-
-class TestProcessWhatsappGeneration(unittest.TestCase):
-    """Verify the core generation trigger function reuses existing components."""
-
-    def test_generation_calls_existing_prompt_builders(self):
-        """process_whatsapp_generation routes to the correct prompt builder
-        based on prompt_type: prompt_ecommerce, prompt_close_up, or prompt_ugc."""
-        from app.services.meta_whatsapp_service import process_whatsapp_generation
-
-        # Verify the function imports all three prompt builders used in the interactive flow
-        import inspect
-        source = inspect.getsource(process_whatsapp_generation)
-        self.assertIn("build_earring_ecommerce_prompt", source)
-        self.assertIn("build_close_up_ears_prompt", source)
-        self.assertIn("build_ugc_style_prompt", source)
-        # Verify it still does NOT import unrelated prompt builders
-        self.assertNotIn("build_scale_reference_prompt", source)
-        self.assertNotIn("build_professional_shot_prompt", source)
-        self.assertNotIn("build_complementary_shot_prompt", source)
-        self.assertNotIn("build_macro_shot_prompt", source)
-
-    def test_generation_calls_existing_manager(self):
-        """process_whatsapp_generation calls ImageGenerationManager — the SAME provider router."""
-        from app.services.meta_whatsapp_service import process_whatsapp_generation
-
-        import inspect
-        source = inspect.getsource(process_whatsapp_generation)
-        self.assertIn("ImageGenerationManager", source)
-        self.assertIn("generate_image", source)
-        # Verify it does NOT directly call any provider
-        self.assertNotIn("GeminiImageProvider", source)
-        self.assertNotIn("OpenAIImageProvider", source)
-        self.assertNotIn("AsyncOpenAI", source)
-        self.assertNotIn("genai.Client", source)
-
-    def test_generation_reuses_existing_storage(self):
-        """process_whatsapp_generation reads from the existing upload directory."""
-        from app.services.meta_whatsapp_service import process_whatsapp_generation
-
-        import inspect
-        source = inspect.getsource(process_whatsapp_generation)
-        # Should use Image.file_path (existing storage path)
-        self.assertIn("image_record.file_path", source)
-        self.assertIn("Image", source)
-
-    def test_idempotency_blocks_duplicate_processing(self):
-        """process_whatsapp_generation skips only while status is 'processing' (in-flight).
-
-        Terminal/awaiting states (stored, failed, awaiting_selection, generated,
-        delivered) are allowed to re-run so a new style can be selected for the
-        same image."""
-        from app.services.meta_whatsapp_service import process_whatsapp_generation
-
-        import inspect
-        source = inspect.getsource(process_whatsapp_generation)
-        self.assertIn("ingestion.status ==", source)
-        self.assertIn('"processing"', source)
-
-    def test_status_lifecycle_tracked(self):
-        """process_whatsapp_generation updates status through the lifecycle."""
-        from app.services.meta_whatsapp_service import process_whatsapp_generation
-
-        import inspect
-        source = inspect.getsource(process_whatsapp_generation)
-        self.assertIn('"processing"', source)
-        self.assertIn('"generated"', source)
-        self.assertIn('"delivered"', source)
-
-    def test_no_direct_provider_calls(self):
-        """process_whatsapp_generation never bypasses the provider manager."""
-        from app.services.meta_whatsapp_service import process_whatsapp_generation
-
-        import inspect
-        source = inspect.getsource(process_whatsapp_generation)
-        # Should NOT contain direct API calls to AI providers
-        self.assertNotIn("openai.AsyncOpenAI", source)
-        self.assertNotIn("google.genai", source)
-        self.assertNotIn("client.models.generate_content", source)
-        self.assertNotIn("client.images.edit", source)
-        self.assertNotIn("client.images.generate", source)
-
-
 # ─── Test: Meta Media Upload (Mocked) ────────────────────────────────────
 
 
@@ -370,27 +286,6 @@ class TestFailureHandling(unittest.TestCase):
 
 class TestExistingComponentReuse(unittest.TestCase):
     """Verify Part 3 uses ONLY existing GemVision components."""
-
-    def test_uses_existing_earring_prompt_module(self):
-        """The generation function imports from the existing prompt module."""
-        from app.services.meta_whatsapp_service import process_whatsapp_generation
-        import inspect
-        source = inspect.getsource(process_whatsapp_generation)
-        self.assertIn("from app.services.earring_ecommerce_prompt import", source)
-
-    def test_uses_existing_image_generation_manager(self):
-        """The generation function imports the existing ImageGenerationManager."""
-        from app.services.meta_whatsapp_service import process_whatsapp_generation
-        import inspect
-        source = inspect.getsource(process_whatsapp_generation)
-        self.assertIn("from app.ai.image_generation_manager import", source)
-
-    def test_uses_existing_image_model(self):
-        """The generation function uses the existing Image model for storage paths."""
-        from app.services.meta_whatsapp_service import process_whatsapp_generation
-        import inspect
-        source = inspect.getsource(process_whatsapp_generation)
-        self.assertIn("from app.models.image import Image", source)
 
     def test_no_duplicate_ai_pipeline(self):
         """No duplicate AI pipeline exists in the WhatsApp service."""

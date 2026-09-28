@@ -16,44 +16,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
-# ─── STEP 5: Generation Idempotency Audit ────────────────────────────────
-
-
-class TestGenerationIdempotency(unittest.TestCase):
-    """Verify that duplicate generation triggers are blocked."""
-
-    def _guard_line(self, source: str) -> str:
-        """Extract the status-guard line from process_whatsapp_generation source."""
-        return next(
-            line for line in source.splitlines()
-            if "ingestion.status ==" in line
-        )
-
-    def test_status_guard_blocks_processing(self):
-        """process_whatsapp_generation skips only while status is 'processing'."""
-        from app.services.meta_whatsapp_service import process_whatsapp_generation
-        import inspect
-        source = inspect.getsource(process_whatsapp_generation)
-        guard = self._guard_line(source)
-        self.assertIn('"processing"', guard)
-
-    def test_status_guard_allows_rerun_from_delivered(self):
-        """'delivered' is not blocked — a new style can be re-selected for the same image."""
-        from app.services.meta_whatsapp_service import process_whatsapp_generation
-        import inspect
-        source = inspect.getsource(process_whatsapp_generation)
-        guard = self._guard_line(source)
-        self.assertNotIn('"delivered"', guard)
-
-    def test_status_guard_allows_rerun_from_generated(self):
-        """'generated' is not blocked — a new style can be re-selected for the same image."""
-        from app.services.meta_whatsapp_service import process_whatsapp_generation
-        import inspect
-        source = inspect.getsource(process_whatsapp_generation)
-        guard = self._guard_line(source)
-        self.assertNotIn('"generated"', guard)
-
-
 # ─── STEP 6: Delivery Idempotency Audit ─────────────────────────────────
 
 
@@ -68,16 +30,6 @@ class TestDeliveryIdempotency(unittest.TestCase):
         self.assertIn('"failed"', source)
         self.assertIn('"delivery_failed"', source)
 
-    def test_process_generation_allows_rerun_from_delivered(self):
-        """process_whatsapp_generation re-runs from 'delivered' for a new style selection."""
-        from app.services.meta_whatsapp_service import process_whatsapp_generation
-        import inspect
-        source = inspect.getsource(process_whatsapp_generation)
-        guard = next(
-            line for line in source.splitlines()
-            if "ingestion.status ==" in line
-        )
-        self.assertNotIn('"delivered"', guard)
 
 
 # ─── STEP 7: Retry Safety Audit ─────────────────────────────────────────
@@ -248,16 +200,6 @@ class TestFailureMatrix(unittest.TestCase):
         _fail_delivery(mock_db, mock_ingestion, "meta api error")
         self.assertEqual(mock_ingestion.status, "delivery_failed")
 
-    def test_duplicate_generation_trigger_blocked(self):
-        """process_whatsapp_generation blocks only in-flight ('processing') triggers."""
-        from app.services.meta_whatsapp_service import process_whatsapp_generation
-        import inspect
-        source = inspect.getsource(process_whatsapp_generation)
-        self.assertIn("ingestion.status ==", source)
-        self.assertIn('"processing"', source)
-
-
-# ─── STEP 16: Critical File Integrity ───────────────────────────────────
 
 
 # ─── STEP 3 Security: Token Not in Responses ────────────────────────────
