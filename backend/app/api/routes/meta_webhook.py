@@ -71,6 +71,7 @@ from app.services.gst_service import (
     verify_after_registration,
 )
 from app.services.upload_service import UploadService
+from app.services.ops_forward import divert_ops_messages
 from app.services.whatsapp_pay_service import (
     handle_payment_status_event,
     try_send_native_recharge,
@@ -869,6 +870,8 @@ async def receive_webhook(
     image_events: List[Dict[str, Any]] = []
 
     for entry in entries:
+        # Studioo Ops: team ops messages -> Next.js in background; no-op for customers.
+        entry = divert_ops_messages(entry, background_tasks)
         events = parse_webhook_entry(entry)
 
         for event in events:

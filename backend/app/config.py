@@ -176,6 +176,16 @@ class Settings(BaseSettings):
     META_REGISTRATION_FLOW_SCREEN: str = "REGISTRATION"
     META_REGISTRATION_FLOW_MODE: str = "draft"
 
+    # --- Studioo Ops (internal team channel) ---
+    # OFF by default. When True, messages from OPS_TEAM numbers that look like
+    # ops commands are forwarded to OPS_INBOUND_URL (Next.js /api/ops/inbound)
+    # in the background and skip the customer pipeline. Everyone else is
+    # unaffected. See app/services/ops_forward.py.
+    OPS_ENABLED: bool = False
+    OPS_TEAM: str = ""  # JSON: {"name": "91XXXXXXXXXX", ...}
+    OPS_SECRET: str = ""  # shared with the Next.js app (x-ops-secret header)
+    OPS_INBOUND_URL: str = ""
+
     # --- WhatsApp Pay (native in-chat order_details, India) ---
     # OFF by default: while False nothing below is used and every recharge
     # prompt behaves exactly as before (Razorpay payment link CTA / text).
