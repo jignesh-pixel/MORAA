@@ -417,6 +417,16 @@ def _flow_text(value: Any, max_len: Optional[int] = None) -> str:
     return cleaned[:max_len] if max_len else cleaned
 
 
+def _flow_field(data: Dict[str, Any], *aliases: str) -> Any:
+    """Pick a Flow value by key alias. Tolerates Flow Builder keys such as
+    ``screen_0_Full_Name_0`` as well as hand-written ones (``full_name``)."""
+    for key, value in data.items():
+        norm = re.sub(r"^screen_\d+_|_\d+$", "", str(key).strip().lower())
+        if norm in aliases:
+            return value
+    return None
+
+
 async def _handle_registration_flow(db: Session, event: Dict[str, Any]) -> bool:
     """Create/update the sender's customer from a registration Flow submission.
 
@@ -429,18 +439,23 @@ async def _handle_registration_flow(db: Session, event: Dict[str, Any]) -> bool:
     if not sender:
         return False
 
-    full_name = _flow_text(data.get("full_name"), 255)
-    business_name = _flow_text(data.get("business_name"), 255)
-    address = _flow_text(data.get("address")) or "N/A"
-    gst_number = _normalize_gst(data.get("gst_number"))
+    full_name = _flow_text(_flow_field(data, "full_name", "name", "your_name"), 255)
+    # Only the name is required; business_name is NOT NULL, so fall back to it.
+    business_name = _flow_text(
+        _flow_field(data, "business_name", "brand_name", "business", "brand"), 255
+    ) or full_name
+    address = _flow_text(_flow_field(data, "address", "city")) or "N/A"
+    gst_number = _normalize_gst(_flow_field(data, "gst_number", "gstin", "gst"))
 
     dedupe_key = _flow_dedupe_key(message_id) if message_id else None
     if dedupe_key and _flow_already_processed(db, dedupe_key):
         logger.info(f"Duplicate registration Flow ignored: message_id={message_id[:40]}")
         return False
 
-    if not full_name or not business_name:
-        logger.warning(f"Registration Flow missing name/business: sender={sender}")
+    if not full_name:
+        logger.warning(
+            f"Registration Flow missing name: sender={sender} keys={sorted(data)}"
+        )
         await send_whatsapp_text(sender, REGISTRATION_REQUEST_MESSAGE)
         return False
 

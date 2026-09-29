@@ -181,6 +181,12 @@ class FlowWebhookTests(FundedSlotGateTestCase):
         self.cta.assert_not_awaited()
         self.assertTrue(self.sent_texts and self.sent_texts[-1].startswith("Quick Setup"))
 
+    def test_name_only_registers(self):
+        self._post(_flow_message({"flow_token": "x", "full_name": "Anurag"}))
+        c = self._cust()
+        self.assertEqual((c.full_name, c.business_name, c.address, c.gst_number, c.is_registered),
+                         ("Anurag", "Anurag", "N/A", "N/A", True))
+
     def test_h_text_registration_still_works(self):
         self._post(_text("• Name: Anurag Mehta\n• Brand Name: Moraa Jewels\n• City: Surat\n• GSTIN (Optional): " + GSTIN,
                          message_id="wamid.txtreg"))
@@ -217,3 +223,13 @@ class FlowWebhookTests(FundedSlotGateTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_flow_field_accepts_gstin_and_flow_builder_keys():
+    from app.api.routes.meta_webhook import _flow_field
+
+    d = {"full_name": "A", "business_name": "B", "gstin": "27AAAPL1234C1Z5"}
+    assert _flow_field(d, "gst_number", "gstin", "gst") == "27AAAPL1234C1Z5"
+    b = {"screen_0_Full_Name_0": "A", "screen_0_Business_Name_1": "B", "flow_token": "x"}
+    assert _flow_field(b, "full_name") == "A"
+    assert _flow_field(b, "business_name") == "B"
