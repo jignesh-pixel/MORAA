@@ -42,6 +42,8 @@ from app.services.meta_whatsapp_service import _post_message_payload, send_whats
 from app.services.wallet_service import credit_wallet, find_customer_by_phone, get_balance
 from app.utils.logger import logger
 
+_plog = logger.bind(category="payments")
+
 GRAPH_BASE = "https://graph.facebook.com/v21.0"
 INR_OFFSET = 100
 MIN_RECHARGE_RUPEES = 500
@@ -52,6 +54,12 @@ MONEY_ONCE_ACTION = "razorpay_payment_captured"
 MONEY_ONCE_RESOURCE_TYPE = "razorpay_payment"
 
 ORDER_FAILED_MESSAGE = "Your in-chat payment didn't go through. You can pay with the link below instead."
+# Strict mode (WHATSAPP_PAY_STRICT): in-chat texts that never carry a URL.
+PAYMENT_UNAVAILABLE_MESSAGE = "Payment system is temporarily unavailable. Please try again shortly."
+ORDER_FAILED_STRICT_MESSAGE = (
+    "Your in-chat payment didn't go through. "
+    "Reply *recharge {amount}* to try again."
+)
 
 
 # ─── Activation ──────────────────────────────────────────────────────────
@@ -85,17 +93,33 @@ def _importer_address() -> Optional[Dict[str, str]]:
     return address
 
 
+def native_pay_block_reason(phone: str) -> Optional[str]:
+    """None when native pay may be attempted for phone, else the gate that blocks it."""
+    if not settings.WHATSAPP_PAY_ENABLED:
+        return "gate1_disabled: WHATSAPP_PAY_ENABLED is false"
+    if not (settings.WHATSAPP_PAY_CONFIGURATION_NAME or "").strip():
+        return "gate2_no_config_name: WHATSAPP_PAY_CONFIGURATION_NAME is empty"
+    if _importer_address() is None:
+        return ("gate3_importer_incomplete: WHATSAPP_PAY_IMPORTER_ADDRESS_LINE1/CITY/"
+                "ZONE_CODE/POSTAL_CODE or COUNTRY_OF_ORIGIN is empty")
+    if not _allowlisted(phone):
+        return "gate4_not_allowlisted: number not in WHATSAPP_PAY_ALLOWLIST"
+    return None
+
+
 def is_native_pay_active(phone: str) -> bool:
     """True only when the feature is on, fully configured and allowed for phone."""
-    if not settings.WHATSAPP_PAY_ENABLED:
-        return False
-    if not (settings.WHATSAPP_PAY_CONFIGURATION_NAME or "").strip():
-        logger.warning("WhatsApp Pay enabled but WHATSAPP_PAY_CONFIGURATION_NAME is empty")
-        return False
-    if _importer_address() is None:
-        logger.warning("WhatsApp Pay enabled but WHATSAPP_PAY_IMPORTER_* address is incomplete")
-        return False
-    return _allowlisted(phone)
+    return native_pay_block_reason(phone) is None
+
+
+def _log_native_skip(recipient_id: str, site: str, reason: str) -> None:
+    msg = f"WhatsApp Pay native skipped: site={site} recipient={recipient_id} reason={reason}"
+    # Gate 1 is the normal "feature off" state: INFO. Everything else means
+    # the feature is on but this prompt will not be native: WARNING.
+    if reason.startswith("gate1_"):
+        _plog.info(msg)
+    else:
+        _plog.warning(msg)
 
 
 # ─── Outbound: order_details ─────────────────────────────────────────────
@@ -188,19 +212,25 @@ async def try_send_native_recharge(
     amount_rupees: int,
     body_text: str,
     reply_to_message_id: Optional[str] = None,
+    site: str = "unknown",
 ) -> bool:
     """Send a native WhatsApp Pay recharge order. Never raises.
 
     Returns True only when Meta accepted the order_details message. False
-    means "not active / no customer / rejected" and the caller must run its
-    existing Razorpay-link code unchanged (silent fallback).
+    means "not active / no customer / rejected"; the caller then calls
+    send_payment_unavailable (strict mode) or its Razorpay-link code.
+    Every exit is logged with the gate / Meta error that caused it.
     """
     try:
-        if not is_native_pay_active(recipient_id):
+        reason = native_pay_block_reason(recipient_id)
+        if reason:
+            _log_native_skip(recipient_id, site, reason)
             return False
         customer = find_customer_by_phone(db, recipient_id)
         if customer is None:
-            return False  # wallet row required for crediting; link path handles placeholders
+            # wallet row required for crediting; link path handles placeholders
+            _log_native_skip(recipient_id, site, "gate5_no_customer: no wallet row for this number")
+            return False
         amount = max(int(amount_rupees), MIN_RECHARGE_RUPEES)
         expiry = max(int(settings.WHATSAPP_PAY_ORDER_EXPIRY_SECONDS), 300)
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=expiry)
@@ -219,18 +249,62 @@ async def try_send_native_recharge(
         payload = build_order_details_payload(
             recipient_id, customer.whatsapp_id, order.reference_id, amount, body_text, expires_at
         )
-        sent = await _post_message_payload(payload, "whatsapp pay order", reply_to_message_id=reply_to_message_id)
+        _plog.info(
+            f"WhatsApp Pay native attempt: site={site} recipient={recipient_id} "
+            f"ref={order.reference_id} amount_rupees={amount} config={order.configuration_name}")
+        meta_error: Dict[str, Any] = {}
+        sent = await _post_message_payload(
+            payload, "whatsapp pay order", reply_to_message_id=reply_to_message_id, error_out=meta_error,
+        )
         order.status = "sent" if sent else "dispatch_failed"
         if not sent:
-            order.last_error = "order_details rejected by Meta (see log)"
+            if meta_error.get("timeout"):
+                order.last_error = "timeout: Meta may still have delivered the order"
+            else:
+                order.last_error = (
+                    f"meta status={meta_error.get('status')} code={meta_error.get('code')} "
+                    f"subcode={meta_error.get('subcode')}: {meta_error.get('message') or ''} "
+                    f"{meta_error.get('details') or ''}"
+                ).strip()[:500]
         db.commit()
-        if not sent:
-            logger.warning(f"WhatsApp Pay dispatch failed for {recipient_id}; using Razorpay link fallback")
+        if sent:
+            logger.info(f"WhatsApp Pay native sent: site={site} ref={order.reference_id}")
+        else:
+            _plog.warning(
+                f"WhatsApp Pay native dispatch failed: site={site} recipient={recipient_id} "
+                f"ref={order.reference_id} code={meta_error.get('code')} subcode={meta_error.get('subcode')} "
+                f"message={meta_error.get('message')!r} details={meta_error.get('details')!r} "
+                f"timeout={bool(meta_error.get('timeout'))}")
         return bool(sent)
     except Exception as e:
         db.rollback()
-        logger.error(f"WhatsApp Pay dispatch error for {recipient_id}: {e}; using Razorpay link fallback")
+        logger.error(f"WhatsApp Pay dispatch error: site={site} recipient={recipient_id}: {e}")
         return False
+
+
+async def send_payment_unavailable(
+    recipient_id: str,
+    site: str,
+    body_text: Optional[str] = None,
+    reply_to_message_id: Optional[str] = None,
+) -> bool:
+    """Strict-mode replacement for every Razorpay-link fallback. Never raises.
+
+    Returns False when WHATSAPP_PAY_STRICT is off (caller keeps its link
+    code). Returns True when strict mode handled the prompt: an in-chat
+    notice was sent (no URL) and an ALERT logged; the caller must stop.
+    """
+    if not settings.WHATSAPP_PAY_STRICT:
+        return False
+    _plog.error(
+        f"ALERT WhatsApp Pay strict: native recharge not sent, no link emitted: "
+        f"site={site} recipient={recipient_id}")
+    text = f"{body_text}\n\n{PAYMENT_UNAVAILABLE_MESSAGE}" if body_text else PAYMENT_UNAVAILABLE_MESSAGE
+    try:
+        await send_whatsapp_text(recipient_id, text, reply_to_message_id=reply_to_message_id)
+    except Exception as e:
+        logger.error(f"WhatsApp Pay strict notice failed for {recipient_id}: {e}")
+    return True
 
 
 async def send_order_status(recipient_id: str, reference_id: str, status: str, description: str = "") -> bool:
@@ -437,6 +511,34 @@ async def reconcile_pending_orders(db: Session, older_than_seconds: int = 120, l
     return results
 
 
+async def run_reconcile_sweep_forever() -> None:
+    """Background loop started from app lifespan: reconcile missed webhooks.
+
+    Safe to run in every worker: crediting is guarded by the money-once
+    audit claim (uq_audit_logs_money_once). Never raises except on cancel.
+    """
+    interval = int(settings.WHATSAPP_PAY_RECONCILE_INTERVAL_SECONDS or 0)
+    if interval <= 0:
+        logger.info("WhatsApp Pay reconcile sweep disabled (interval <= 0)")
+        return
+    interval = max(interval, 60)
+    from app.database import SessionLocal
+
+    while True:
+        await asyncio.sleep(interval)
+        if not settings.WHATSAPP_PAY_ENABLED:
+            continue
+        try:
+            with SessionLocal() as db:
+                results = await reconcile_pending_orders(db)
+            if results:
+                logger.info(f"WhatsApp Pay reconcile sweep: {results}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"WhatsApp Pay reconcile sweep failed: {e}")
+
+
 # ─── Customer messages ───────────────────────────────────────────────────
 
 
@@ -491,8 +593,22 @@ async def _send_receipt(db: Session, order: WhatsAppPaymentOrder) -> None:
 
 
 async def _send_fallback_link_once(db: Session, order: WhatsAppPaymentOrder) -> None:
-    """After a failed in-chat payment, offer the Razorpay link once."""
+    """After a failed in-chat payment, offer the Razorpay link once.
+
+    Strict mode: no link; an in-chat "reply recharge N to retry" text instead.
+    """
     if order.fallback_sent:
+        return
+    if settings.WHATSAPP_PAY_STRICT:
+        try:
+            if await send_whatsapp_text(
+                order.whatsapp_id, ORDER_FAILED_STRICT_MESSAGE.format(amount=order.amount_rupees)
+            ):
+                order.fallback_sent = True
+                db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.error(f"WhatsApp Pay strict retry notice failed for {order.reference_id}: {e}")
         return
     try:
         from app.services.meta_whatsapp_service import send_whatsapp_cta_url_button

@@ -268,3 +268,105 @@ class WhatsAppPayTests(FundedSlotGateTestCase):
         self.assertEqual(kwargs["customer_snapshot"]["gst_number"], "24AAAPS1234C1Z5")
         self.assertEqual(self.pay_text.await_count, 1)  # receipt text still sent inline
 
+
+
+class WhatsAppPayStrictModeTests(WhatsAppPayTests):
+    """WHATSAPP_PAY_STRICT: no Razorpay link / URL button ever; gate logging."""
+
+    def _strict(self, **overrides):
+        self._enable(**overrides)
+        p = patch.object(settings, "WHATSAPP_PAY_STRICT", True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _assert_unavailable_no_link(self):
+        self.cta.assert_not_awaited()
+        self.link.assert_not_awaited()
+        texts = [c.args[1] for c in self.pay_text.await_args_list]
+        self.assertTrue(any(pay.PAYMENT_UNAVAILABLE_MESSAGE in t for t in texts), texts)
+        self.assertFalse(any("http" in t for t in texts), texts)
+
+    def test_strict_meta_rejection_sends_in_chat_notice_not_link(self):
+        self._strict()
+        _make_customer(self.session, balance=0)
+        self.post.return_value = False
+        self._post(self._recharge_text())
+        self.assertEqual(self._order().status, "dispatch_failed")
+        self._assert_unavailable_no_link()
+
+    def test_strict_with_feature_disabled_never_sends_link(self):
+        self._strict(WHATSAPP_PAY_ENABLED=False)
+        _make_customer(self.session, balance=0)
+        self._post(self._recharge_text())
+        self.post.assert_not_awaited()
+        self._assert_unavailable_no_link()
+
+    def test_strict_unfunded_photo_never_sends_static_link(self):
+        from tests.test_wallet_funded_slot_gate import _image_payload
+        self._strict()
+        _make_customer(self.session, balance=0)
+        self.post.return_value = False
+        self._post(_image_payload(1))
+        self.assertEqual(self.sent_texts, [])
+        self._assert_unavailable_no_link()
+
+    def test_strict_failed_payment_offers_in_chat_retry_not_link(self):
+        self._strict()
+        o = self._sent_order()
+        self.cta.reset_mock()
+        self.pay_text.reset_mock()
+        for _ in range(2):
+            self._post(_payment_webhook(o.reference_id, status="pending", tx_status="failed"))
+        self.assertTrue(self._order().fallback_sent)
+        self.cta.assert_not_awaited()
+        self.assertEqual(self.pay_text.await_count, 1)
+        self.assertIn("recharge 500", self.pay_text.await_args.args[1])
+
+    def test_unfunded_photo_from_unknown_sender_gets_wallet_row_and_native_order(self):
+        from app.models.customer import Customer
+        from tests.test_wallet_funded_slot_gate import _image_payload
+        self._enable()
+        self._post(_image_payload(1))
+        self.assertEqual(self.post.await_count, 1)
+        cust = self.session.query(Customer).one()
+        self.assertEqual((cust.is_registered, cust.wallet_balance), (False, 0))
+        self.assertEqual(self._order().status, "sent")
+
+    def test_unknown_sender_gets_no_wallet_row_when_native_inactive(self):
+        from app.models.customer import Customer
+        from tests.test_wallet_funded_slot_gate import _image_payload
+        self._post(_image_payload(1))
+        self.post.assert_not_awaited()
+        self.assertEqual(self.session.query(Customer).count(), 0)
+
+    def test_gate_reasons(self):
+        self.assertTrue(pay.native_pay_block_reason(SENDER).startswith("gate1_"))
+        self._enable(WHATSAPP_PAY_CONFIGURATION_NAME="")
+        self.assertTrue(pay.native_pay_block_reason(SENDER).startswith("gate2_"))
+        with patch.object(settings, "WHATSAPP_PAY_CONFIGURATION_NAME", "cfg"), \
+             patch.object(settings, "WHATSAPP_PAY_IMPORTER_CITY", ""):
+            self.assertTrue(pay.native_pay_block_reason(SENDER).startswith("gate3_"))
+        with patch.object(settings, "WHATSAPP_PAY_CONFIGURATION_NAME", "cfg"), \
+             patch.object(settings, "WHATSAPP_PAY_ALLOWLIST", "919999999999"):
+            self.assertTrue(pay.native_pay_block_reason(SENDER).startswith("gate4_"))
+        with patch.object(settings, "WHATSAPP_PAY_CONFIGURATION_NAME", "cfg"):
+            self.assertIsNone(pay.native_pay_block_reason(SENDER))
+
+    def test_meta_error_details_parsed(self):
+        class _Resp:
+            status_code = 400
+            text = "{}"
+            def json(self):
+                return {"error": {"message": "(#131009) Parameter value is not valid", "type": "OAuthException",
+                                  "code": 131009, "error_subcode": 2494010,
+                                  "error_data": {"details": "payment configuration not found"},
+                                  "fbtrace_id": "Axyz"}}
+        err = mws._meta_error_details(_Resp())
+        self.assertEqual((err["status"], err["code"], err["subcode"]), (400, 131009, 2494010))
+        self.assertEqual(err["details"], "payment configuration not found")
+
+
+# Do not re-run every inherited WhatsAppPayTests test under the strict class.
+for _name in [n for n in dir(WhatsAppPayTests) if n.startswith("test_")]:
+    if _name not in WhatsAppPayStrictModeTests.__dict__:
+        setattr(WhatsAppPayStrictModeTests, _name, None)

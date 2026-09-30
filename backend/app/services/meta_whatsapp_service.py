@@ -361,12 +361,34 @@ async def send_feedback_buttons(recipient_id: str, ingestion_id: str) -> bool:
 # ─── Plain text + CTA button messages ─────────────────────────────────────
 
 
+def _meta_error_details(response: Any) -> Dict[str, Any]:
+    """Pull code / error_subcode / message / details out of a Graph API error body."""
+    try:
+        err = (response.json() or {}).get("error") or {}
+    except Exception:
+        return {"status": getattr(response, "status_code", None), "message": (getattr(response, "text", "") or "")[:300]}
+    return {
+        "status": getattr(response, "status_code", None),
+        "code": err.get("code"),
+        "subcode": err.get("error_subcode"),
+        "type": err.get("type"),
+        "message": err.get("message"),
+        "details": (err.get("error_data") or {}).get("details"),
+        "fbtrace_id": err.get("fbtrace_id"),
+    }
+
+
 async def _post_message_payload(
     payload: Dict[str, Any],
     label: str,
     reply_to_message_id: Optional[str] = None,
+    error_out: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    """POST a message payload to the Meta Send API with optional context quote."""
+    """POST a message payload to the Meta Send API with optional context quote.
+
+    When ``error_out`` is a dict it is filled with the parsed Meta error
+    (code, subcode, message, details) or {"timeout": True} on failure.
+    """
     if not settings.META_WHATSAPP_TOKEN:
         logger.error(f"META_WHATSAPP_TOKEN not configured — cannot send {label}")
         return False
@@ -392,7 +414,14 @@ async def _post_message_payload(
             )
 
             if response.status_code not in (200, 201):
-                logger.error(f"Meta send {label} failed: status={response.status_code} body={response.text}")
+                err = _meta_error_details(response)
+                if error_out is not None:
+                    error_out.update(err)
+                logger.error(
+                    f"Meta send {label} failed: status={err.get('status')} code={err.get('code')} "
+                    f"subcode={err.get('subcode')} message={err.get('message')!r} "
+                    f"details={err.get('details')!r} fbtrace_id={err.get('fbtrace_id')}"
+                )
                 return False
 
             data = response.json()
@@ -408,9 +437,13 @@ async def _post_message_payload(
             return True
 
     except httpx.TimeoutException:
+        if error_out is not None:
+            error_out["timeout"] = True
         logger.error(f"Meta send {label} timed out")
         return False
     except Exception as e:
+        if error_out is not None:
+            error_out["message"] = str(e)
         logger.error(f"Meta send {label} failed: {e}")
         return False
 

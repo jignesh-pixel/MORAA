@@ -115,9 +115,25 @@ async def lifespan(app: FastAPI):
             extra={"category": "system"},
         )
 
+    # WhatsApp Pay reconcile sweep (best-effort): credits in-chat payments
+    # whose webhook was missed. Loop is idle while WHATSAPP_PAY_ENABLED=false.
+    import asyncio
+
+    reconcile_task = None
+    try:
+        from app.services.whatsapp_pay_service import run_reconcile_sweep_forever
+
+        reconcile_task = asyncio.create_task(run_reconcile_sweep_forever())
+    except Exception as e:
+        logger.warning(
+            f"WhatsApp Pay reconcile sweep not started: {e}", extra={"category": "system"}
+        )
+
     yield
 
     # Shutdown
+    if reconcile_task is not None:
+        reconcile_task.cancel()
     logger.info(
         f"Shutting down {settings.APP_NAME}",
         extra={"category": "system"},

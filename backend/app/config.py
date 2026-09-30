@@ -192,7 +192,8 @@ class Settings(BaseSettings):
     # When True, recharge prompts send a native order_details message using
     # the Razorpay payment configuration named WHATSAPP_PAY_CONFIGURATION_NAME
     # (must match the name created in WhatsApp Manager exactly, max 60 chars);
-    # any dispatch failure silently falls back to the Razorpay link CTA.
+    # any dispatch failure falls back to the Razorpay link CTA unless
+    # WHATSAPP_PAY_STRICT is on.
     WHATSAPP_PAY_ENABLED: bool = False
     WHATSAPP_PAY_CONFIGURATION_NAME: str = ""
     # Comma-separated WhatsApp numbers for a pilot; empty = everyone.
@@ -212,6 +213,15 @@ class Settings(BaseSettings):
     WHATSAPP_PAY_IMPORTER_CITY: str = ""
     WHATSAPP_PAY_IMPORTER_ZONE_CODE: str = ""  # state code, e.g. "MH", "GJ"
     WHATSAPP_PAY_IMPORTER_POSTAL_CODE: str = ""
+    # Strict native mode: never send a Razorpay link / URL button for a wallet
+    # recharge. If native order_details cannot be sent, the customer gets an
+    # in-chat "temporarily unavailable" text and an ALERT is logged.
+    # Turn on ONLY after native pay is live and tested; before that it means
+    # nobody can recharge.
+    WHATSAPP_PAY_STRICT: bool = False
+    # Background sweep for orders whose payment webhook was missed (seconds;
+    # 0 disables). Runs only while WHATSAPP_PAY_ENABLED is true.
+    WHATSAPP_PAY_RECONCILE_INTERVAL_SECONDS: int = 300
 
     # --- Live GSTIN verification during onboarding ---
     # False (default) = onboarding behaves exactly as before (format check

@@ -74,6 +74,8 @@ from app.services.upload_service import UploadService
 from app.services.ops_forward import divert_ops_messages
 from app.services.whatsapp_pay_service import (
     handle_payment_status_event,
+    is_native_pay_active,
+    send_payment_unavailable,
     try_send_native_recharge,
 )
 from app.services import entitlement_service as ent
@@ -116,6 +118,39 @@ def _hold_message(price: int, balance: Optional[int] = None, product: str = "thi
 def _find_customer_safe(db: Session, sender: str) -> Optional[Customer]:
     """Helper to find customer regardless of leading + or 91 country code differences."""
     return find_customer_by_phone(db, sender)
+
+
+def _ensure_wallet_row(db: Session, sender: str) -> Optional[Customer]:
+    """Find the sender's wallet row, creating an UNREGISTERED placeholder if none.
+
+    Same placeholder shape the Razorpay webhook uses for unregistered payers;
+    registration later adopts the row by phone. Only called when native pay
+    is active, so an in-chat order can be credited to this row.
+    """
+    cust = find_customer_by_phone(db, sender)
+    if cust is not None:
+        return cust
+    try:
+        cust = Customer(
+            whatsapp_id=sender,
+            full_name="Valued Customer",
+            business_name="Jewelry Business",
+            gst_number="N/A",
+            address="N/A",
+            wallet_balance=0,
+            is_registered=False,
+        )
+        db.add(cust)
+        db.commit()
+        logger.info(f"Created unregistered wallet row for native pay: sender={sender}")
+        return cust
+    except IntegrityError:
+        db.rollback()  # concurrent create won; read it back
+        return find_customer_by_phone(db, sender)
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Wallet row creation failed for {sender}: {e}")
+        return None
 
 
 FEEDBACK_AUDIT_ACTION = "whatsapp_feedback"
@@ -352,7 +387,9 @@ async def _send_registration_confirmation(
         name=display_name,
         balance=f"{get_balance(db, cust.whatsapp_id):,}",
     )
-    if await try_send_native_recharge(db, sender, 500, confirm_msg):
+    if await try_send_native_recharge(db, sender, 500, confirm_msg, site="registration"):
+        return
+    if await send_payment_unavailable(sender, "registration", body_text=confirm_msg):
         return
     try:
         pay_url = await create_recharge_payment_link(
@@ -605,10 +642,17 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
         ingestion.status = "unfunded"
         ingestion.error_message = f"Balance {balance} below minimum {min_price} at upload"
         db.commit()
+        if customer is None and is_native_pay_active(sender):
+            customer = _ensure_wallet_row(db, sender)
         hold_balance = get_balance(db, customer.whatsapp_id) if customer else 0
         if customer is not None and await try_send_native_recharge(
             db, sender, max(min_price, 500), _hold_body(min_price, hold_balance, "an order"),
-            reply_to_message_id=message_id,
+            reply_to_message_id=message_id, site="photo_low_balance",
+        ):
+            return None
+        if await send_payment_unavailable(
+            sender, "photo_low_balance",
+            body_text=_hold_body(min_price, hold_balance, "an order"), reply_to_message_id=message_id,
         ):
             return None
         await send_whatsapp_text(
@@ -776,6 +820,11 @@ async def _handle_product_choice(
         balance = get_balance(db, customer.whatsapp_id) if customer else 0
         if await try_send_native_recharge(
             db, sender, max(price, 500), _hold_body(price, balance, label), reply_to_message_id=quote_id,
+            site="product_choice",
+        ):
+            return None
+        if await send_payment_unavailable(
+            sender, "product_choice", body_text=_hold_body(price, balance, label), reply_to_message_id=quote_id,
         ):
             return None
         await send_whatsapp_text(
@@ -962,7 +1011,10 @@ async def receive_webhook(
                     if await try_send_native_recharge(
                         db, sender, requested_amount,
                         f"Recharge your Moraa Studio wallet with ₹{requested_amount} 💳",
+                        site="recharge_command",
                     ):
+                        continue
+                    if await send_payment_unavailable(sender, "recharge_command"):
                         continue
                     cust = _find_customer_safe(db, sender)
                     cust_name = getattr(cust, "full_name", "Customer") if cust else "Customer"

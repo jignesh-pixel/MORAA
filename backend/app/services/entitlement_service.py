@@ -181,17 +181,21 @@ async def send_trial_exhausted_card(db, customer: Any, reply_to_message_id: Opti
     enabled, else the Razorpay link CTA)."""
     from app.services import meta_whatsapp_service as mws
     from app.services import razorpay_service
-    from app.services.whatsapp_pay_service import try_send_native_recharge
+    from app.services.whatsapp_pay_service import send_payment_unavailable, try_send_native_recharge
 
     total = int(customer.trial_credits_total or 0)
     body = EXHAUSTED_TEMPLATE.format(used=total, total=total)
     amount = 500
     try:
         if await try_send_native_recharge(db, customer.whatsapp_id, amount, body,
-                                          reply_to_message_id=reply_to_message_id):
+                                          reply_to_message_id=reply_to_message_id,
+                                          site="trial_exhausted"):
             return
     except Exception as e:  # noqa: BLE001
         logger.error(f"Native recharge for trial exhaustion failed: {e}")
+    if await send_payment_unavailable(customer.whatsapp_id, "trial_exhausted", body_text=body,
+                                      reply_to_message_id=reply_to_message_id):
+        return
     try:
         url = await razorpay_service.create_recharge_payment_link(
             customer_phone=customer.whatsapp_id,
