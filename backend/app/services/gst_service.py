@@ -211,6 +211,13 @@ def verification_enabled() -> bool:
     return bool(getattr(settings, "GST_VERIFICATION_ENABLED", False))
 
 
+def gst_check_pending(raw_gstin: Any) -> bool:
+    """True when a submitted GSTIN still has to go through process_gstin
+    (verification on and a non-empty answer), i.e. registration must NOT be
+    marked complete yet. Empty / "NA" / "skip" answers return False."""
+    return verification_enabled() and str(raw_gstin or "").strip().lower() not in _NO_GST_ANSWERS
+
+
 def _session(db, whatsapp_id: str, create: bool = False):
     from app.models.onboarding_session import OnboardingSession
 

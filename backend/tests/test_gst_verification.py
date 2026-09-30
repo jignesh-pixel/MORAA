@@ -293,6 +293,59 @@ class OnboardingFlowTests(FundedSlotGateTestCase):
         self._button("btn_gst_skip", "wamid.f1")
         self.assertEqual(self._confirmations(), 1)
 
+    # ── Flow submissions under Flow Builder keys (INVALID213 regression) ──
+    FLOW_BASE = {"screen_0_Full_Name_0": "Anurag Mehta", "screen_0_Business_Name_1": "Moraa Jewels",
+                 "screen_0_Address_2": "12 Diamond Plaza, Surat"}
+
+    def test_flow_invalid_gstin_under_builder_key_keeps_draft_and_offers_choice(self):
+        for key in ("screen_0_GSTIN_3", "gstin", "screen_0_GSTIN_Optional_3"):
+            with self.subTest(key=key):
+                self.session.query(Customer).delete()
+                self.session.query(OnboardingSession).delete()
+                self.session.commit()
+                self.webhook_module.send_whatsapp_cta_url_button.reset_mock()
+                self.button_msgs.clear()
+                self._flow(dict(self.FLOW_BASE, **{key: "INVALID213"}), mid=f"wamid.fk.{key}")
+                self.assertEqual(self._confirmations(), 0)  # registration NOT completed
+                body, buttons = self.button_msgs[-1]
+                self.assertEqual(body, gst.INVALID_FORMAT_MESSAGE + "\n\nWould you like to re-enter it or skip for now?")
+                self.assertEqual(buttons, gst.GST_BUTTONS)
+                c = self._cust()  # draft kept
+                self.assertEqual((c.full_name, c.business_name, c.address, c.gst_number, c.is_registered),
+                                 ("Anurag Mehta", "Moraa Jewels", "12 Diamond Plaza, Surat", "N/A", False))
+                self.assertEqual(self._state(), gst.STATE_AWAITING_GSTIN)
+
+    def test_flow_invalid_gstin_then_skip_finalizes_with_skip_notice_and_card(self):
+        self._flow(dict(self.FLOW_BASE, screen_0_GSTIN_3="INVALID213"), mid="wamid.fs1")
+        self._button("btn_gst_skip", "wamid.fs2")
+        c = self._cust()
+        self.assertEqual((c.gst_number, c.is_registered, c.full_name), ("N/A", True, "Anurag Mehta"))
+        self.assertIn(gst.SKIP_MESSAGE, self.texts)
+        self.assertEqual(self._confirmations(), 1)  # "You're all set" + payment card
+
+    def test_flow_invalid_gstin_then_reenter_waits_for_typed_gstin(self):
+        self._flow(dict(self.FLOW_BASE, screen_0_GSTIN_3="INVALID213"), mid="wamid.fr1")
+        self._button("btn_gst_reenter", "wamid.fr2")
+        self.assertEqual(self.texts[-1], gst.REENTER_PROMPT)
+        self.assertEqual(self._state(), gst.STATE_AWAITING_GSTIN)
+        self._text(GOOD, "wamid.fr3")
+        c = self._cust()
+        self.assertEqual((c.gst_number, c.is_registered), (GOOD, True))
+        self.assertEqual(self._confirmations(), 1)
+
+    def test_flow_valid_gstin_under_builder_key_completes_directly(self):
+        self._flow(dict(self.FLOW_BASE, screen_0_GSTIN_3=GOOD.lower()), mid="wamid.fv1")
+        c = self._cust()
+        self.assertEqual((c.gst_number, c.is_registered), (GOOD, True))
+        self.assertEqual((self._confirmations(), self.button_msgs), (1, []))
+
+    def test_flow_empty_or_omitted_gstin_completes_directly(self):
+        self._flow(dict(self.FLOW_BASE, screen_0_GSTIN_3=""), mid="wamid.fe1")
+        self.assertEqual((self._cust().is_registered, self._confirmations(), self.button_msgs), (True, 1, []))
+        self._flow(dict(self.FLOW_BASE), mid="wamid.fe2")
+        self.assertEqual(self.button_msgs, [])
+        self.assertEqual(self.provider.calls, [])
+
     def test_no_vendor_accepts_well_formed_gstin_unverified(self):
         self.provider = gst.NoGstProvider()
         self._text(self.USER_FORM.format(gst=GOOD), "wamid.i9")
