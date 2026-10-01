@@ -18,6 +18,9 @@ from app.utils.security import (
 )
 from app.utils.logger import logger
 
+# Hash of a throw-away password, verified when the username is unknown (see login).
+_DUMMY_PASSWORD_HASH = hash_password("not-a-real-password")
+
 
 class AuthService:
     """Authentication and user management service."""
@@ -55,6 +58,9 @@ class AuthService:
         """Authenticate user and return tokens."""
         user = self.repo.find_first(username=username)
         if not user:
+            # Spend the same bcrypt time as a real check so response time does
+            # not reveal whether the username exists.
+            verify_password(password, _DUMMY_PASSWORD_HASH)
             raise ValueError("Invalid username or password")
 
         if not verify_password(password, user.hashed_password):

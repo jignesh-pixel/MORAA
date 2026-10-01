@@ -343,7 +343,9 @@ def verify_webhook_signature(
         hashlib.sha256,
     ).hexdigest()
 
-    if not hmac.compare_digest(computed, signature_hash):
+    # Bytes, not str: compare_digest raises TypeError on non-ASCII text, which
+    # turned a malformed header into a 500.
+    if not hmac.compare_digest(computed.encode("ascii"), signature_hash.encode("utf-8")):
         logger.warning("Webhook signature mismatch — possible tampering")
         return False
 

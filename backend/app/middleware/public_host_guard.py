@@ -15,13 +15,14 @@ client, so tunnelled traffic stays public.
 
 import ipaddress
 import re
+import time
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.config import settings
-from app.utils.logger import logger
+from app.utils.logger import logger, safe_log
 
 PUBLIC_ALLOWED_PATHS = frozenset({
     "/api/meta/webhook",
@@ -36,6 +37,34 @@ _PROXY_HEADERS = frozenset({b"x-forwarded-for", b"x-forwarded-host", b"forwarded
 # used to make request.url.path look like a webhook while the router served
 # a different route. Anything else is rejected outright.
 _VALID_HOST = re.compile(r"^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(:\d{1,5})?$")
+
+
+# Internet scanners hit the public URL constantly. Each blocked request must
+# not write several log lines (disk-fill amplification): at most this many
+# detailed lines per minute, then a single summary when the window rolls over.
+_BLOCKED_LOG_PER_MINUTE = 20
+_blocked_window_start = 0.0
+_blocked_logged = 0
+_blocked_suppressed = 0
+
+
+def _log_blocked(method: str, path: object, host: str) -> None:
+    global _blocked_window_start, _blocked_logged, _blocked_suppressed
+    now = time.monotonic()
+    if now - _blocked_window_start >= 60:
+        if _blocked_suppressed:
+            logger.bind(category="api").warning(
+                "Public host guard: {} more blocked requests in the last minute not logged",
+                _blocked_suppressed,
+            )
+        _blocked_window_start, _blocked_logged, _blocked_suppressed = now, 0, 0
+    if _blocked_logged >= _BLOCKED_LOG_PER_MINUTE:
+        _blocked_suppressed += 1
+        return
+    _blocked_logged += 1
+    logger.bind(category="api").warning(
+        "Public host guard: blocked {} {} host={!r}", method, safe_log(path), safe_log(host, 100)
+    )
 
 
 def routed_path(request: Request) -> str:
@@ -101,18 +130,13 @@ class PublicHostGuardMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         host = request.headers.get("host", "")
         if host and not _VALID_HOST.match(host):
-            logger.bind(category="api").warning(
-                "Public host guard: rejected malformed Host header {!r}", host[:100]
-            )
+            _log_blocked(request.method, request.scope.get("path"), host)
             return JSONResponse(status_code=400, content={"detail": "Invalid Host header"})
 
         if settings.PUBLIC_HOST_GUARD_ENABLED and is_public_request(request):
             path = routed_path(request)
             if path not in PUBLIC_ALLOWED_PATHS:
-                logger.bind(category="api").warning(
-                    "Public host guard: blocked {} {} host={!r}",
-                    request.method, request.scope.get("path"), host[:100],
-                )
+                _log_blocked(request.method, request.scope.get("path"), host)
                 return JSONResponse(status_code=404, content={"detail": "Not Found"})
             # Webhook payloads are small JSON; refuse oversized or malformed
             # bodies before the route reads them into memory.

@@ -6,6 +6,7 @@ Handles both standard payment links and Razorpay Payment Pages.
 import hashlib
 import hmac
 import json
+import re
 from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
@@ -64,7 +65,7 @@ def verify_razorpay_signature(raw_body: bytes, signature_header: Optional[str]) 
         hashlib.sha256,
     ).hexdigest()
 
-    return hmac.compare_digest(computed, signature_header.strip())
+    return hmac.compare_digest(computed.encode("ascii"), signature_header.strip().encode("utf-8"))
 
 
 def _nested_get(payload: Dict[str, Any], *path: str) -> Any:
@@ -410,8 +411,10 @@ async def razorpay_webhook(
         logger.info(f"Payment {payment_reference} already processed, skipping duplicate (event={event}, no credit).")
         return {"status": "already_processed"}
 
-    clean_sender = sender_id.lstrip("+").strip()
-    customer = _resolve_customer(db, sender_id)
+    # Digits only: spaces/hyphens/brackets in the payer's number must not
+    # create a second wallet row for the same phone.
+    clean_sender = re.sub(r"[\s\-().]", "", sender_id).lstrip("+")
+    customer = _resolve_customer(db, clean_sender)
     customer_name = "Valued Customer"
 
     customer_was_created = customer is None

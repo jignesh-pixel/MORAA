@@ -52,6 +52,7 @@ ENV_FILE: Optional[str] = _resolve_env_file()
 
 # Production JWT signing keys shorter than this are refused at boot.
 _MIN_SECRET_KEY_LENGTH = 32
+_MIN_SECRET_KEY_DISTINCT_CHARS = 10
 
 
 class Settings(BaseSettings):
@@ -455,6 +456,8 @@ class Settings(BaseSettings):
                 problems.append(
                     f"SECRET_KEY is shorter than {_MIN_SECRET_KEY_LENGTH} characters"
                 )
+            elif len(set(secret_key)) < _MIN_SECRET_KEY_DISTINCT_CHARS:
+                problems.append("SECRET_KEY has too few distinct characters to be random")
             if not self.META_APP_SECRET.strip():
                 problems.append("META_APP_SECRET is not set")
             if not self.RAZORPAY_WEBHOOK_SECRET.strip():

@@ -13,7 +13,7 @@ from app.config import BASE_DIR, Settings
 
 _SAFE_PRODUCTION = {
     "ENVIRONMENT": "production",
-    "SECRET_KEY": "k" * 48,
+    "SECRET_KEY": "aB3dE5fG7hJ9kL1mN2pQ4rS6tU8vW0xY2zA4bC6d",
     "META_APP_SECRET": "meta-secret",
     "RAZORPAY_WEBHOOK_SECRET": "rzp-secret",
     "DATABASE_URL": "postgresql://user:pass@db.example:5432/app",
@@ -76,7 +76,7 @@ class EnvFileResolutionTests(unittest.TestCase):
 
     def test_environment_loaded_from_env_file(self):
         with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as fh:
-            fh.write("ENVIRONMENT=production\nSECRET_KEY=" + "s" * 40 + "\n"
+            fh.write("ENVIRONMENT=production\nSECRET_KEY=aB3dE5fG7hJ9kL1mN2pQ4rS6tU8vW0xY2zA4bC6d\n"
                      "META_APP_SECRET=m\nRAZORPAY_WEBHOOK_SECRET=r\n"
                      "DATABASE_URL=postgresql://u:p@h:5432/d\nDEBUG=true\nDEBUG=false\n")
         try:
@@ -94,7 +94,7 @@ class ProductionGuardTests(unittest.TestCase):
     def test_safe_production_config_boots(self):
         s = _settings()
         self.assertTrue(s.IS_PRODUCTION)
-        self.assertEqual(s.SECRET_KEY, "k" * 48)
+        self.assertEqual(s.SECRET_KEY, "aB3dE5fG7hJ9kL1mN2pQ4rS6tU8vW0xY2zA4bC6d")
 
     def test_each_unsafe_setting_refuses_boot(self):
         cases = {
@@ -115,6 +115,11 @@ class ProductionGuardTests(unittest.TestCase):
         with self.assertRaises(ValidationError) as ctx:
             _settings(SECRET_KEY="short")
         self.assertIn("shorter than 32", str(ctx.exception))
+
+    def test_low_variety_production_secret_key_refused(self):
+        with self.assertRaises(ValidationError) as ctx:
+            _settings(SECRET_KEY="a" * 48)
+        self.assertIn("too few distinct characters", str(ctx.exception))
 
     def test_refusal_never_echoes_secret_values(self):
         with self.assertRaises(ValidationError) as ctx:

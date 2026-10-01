@@ -20,6 +20,7 @@ the balance negative).
 
 from typing import Any, Dict, List, Optional, Tuple
 import asyncio
+import hmac
 import json
 from datetime import datetime, timedelta, timezone
 import re
@@ -87,7 +88,6 @@ from app.services.wallet_service import (
     get_balance,
     get_customer,
     price_per_image,
-    refund_generation_charge,
 )
 from app.utils.logger import logger, mask_phone
 
@@ -191,15 +191,6 @@ def _save_feedback(db: Session, sender: str, button_id: str) -> None:
     except Exception as e:
         db.rollback()
         logger.error(f"Feedback persistence failed: {e}")
-
-
-def _refund_pack_charge(db: Session, customer: Optional[Customer]) -> None:
-    """Refund a single pack charge after a post-deduction failure."""
-    if customer is None:
-        return
-    price = price_per_image()
-    refund_generation_charge(db, customer.whatsapp_id, price)
-    db.refresh(customer)
 
 
 # ─── Background generation trigger ──────────────────────────────────────
@@ -887,7 +878,13 @@ async def verify_webhook(
     hub_mode = query.get("hub.mode") or hub_mode
     hub_verify_token = query.get("hub.verify_token") or hub_verify_token
     hub_challenge = query.get("hub.challenge") or hub_challenge
-    if hub_mode != "subscribe" or not hub_verify_token or hub_verify_token != settings.META_VERIFY_TOKEN:
+    if (
+        hub_mode != "subscribe"
+        or not hub_verify_token
+        or not hmac.compare_digest(
+            hub_verify_token.encode("utf-8"), (settings.META_VERIFY_TOKEN or "").encode("utf-8")
+        )
+    ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid verification token or mode",
@@ -910,13 +907,14 @@ async def receive_webhook(
 ) -> Dict[str, Any]:
     try:
         raw_body = await request.body()
-        if not raw_body:
-            return {"status": "ignored", "message": "Empty body"}
-        payload = json.loads(raw_body.decode("utf-8"))
     except Exception as e:
-        logger.error("Failed to parse webhook JSON payload: {}", e)
+        logger.error("Failed to read webhook body: {}", e)
         return {"status": "error", "message": "Invalid JSON payload"}
+    if not raw_body:
+        return {"status": "ignored", "message": "Empty body"}
 
+    # Verify the signature on the raw bytes BEFORE parsing: an unsigned sender
+    # must not be able to make the server parse arbitrary JSON.
     if (settings.META_APP_SECRET or "").strip():
         signature = request.headers.get("X-Hub-Signature-256")
         if not verify_webhook_signature(raw_body, signature):
@@ -930,6 +928,15 @@ async def receive_webhook(
             "ALLOW_UNSIGNED_WEBHOOKS is off -- refusing an unsigned payload."
         )
         return {"status": "error", "message": "Webhook not configured"}
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception as e:
+        logger.error("Failed to parse webhook JSON payload: {}", e)
+        return {"status": "error", "message": "Invalid JSON payload"}
+    if not isinstance(payload, dict):
+        logger.warning("Webhook JSON body is not an object: {}", type(payload).__name__)
+        return {"status": "ignored", "message": "Unexpected payload shape"}
 
     if payload.get("object") == "whatsapp_business_account" and "entry" not in payload:
         return {"status": "ok"}

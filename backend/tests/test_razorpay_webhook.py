@@ -417,6 +417,20 @@ class RazorpayWebhookRouteTests(unittest.TestCase):
         self.assertEqual(response.json(), {"status": "missing_phone"})
         self.assertEqual(self.session.query(Customer).count(), 0)
 
+    def test_formatted_payer_phone_credits_the_existing_wallet(self):
+        """Spaces/hyphens in the payer's number must not create a second wallet."""
+        self.session.add(Customer(
+            whatsapp_id="919000000004", full_name="Test", business_name="Test Gems",
+            gst_number="N/A", address="Surat", wallet_balance=100, is_registered=True,
+        ))
+        self.session.commit()
+        response = self._post(_payment_captured_payload(notes={"sender_id": "+91 90000-00004"}))
+
+        self.assertEqual(response.json(), {"status": "ok"})
+        self.session.expire_all()
+        self.assertEqual(wallet_service.get_balance(self.session, "919000000004"), 600)
+        self.assertEqual(self.session.query(Customer).count(), 1)
+
     def _audits(self, action):
         return (
             self.session.query(AuditLog)

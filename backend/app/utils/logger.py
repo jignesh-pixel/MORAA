@@ -7,6 +7,18 @@ from loguru import logger
 from app.config import settings
 
 
+def safe_log(value: object, limit: int = 300) -> str:
+    """Make client-controlled text safe to write into a log line.
+
+    A request path or header can carry newlines or other control characters
+    ("/x%0a2026-10-01 ... | INFO | Payment credited"), which would forge extra
+    log lines. Control characters are escaped and the length is capped.
+    """
+    text = str(value)
+    cleaned = "".join(c if c.isprintable() else f"\\x{ord(c):02x}" for c in text)
+    return cleaned[:limit] + ("..." if len(cleaned) > limit else "")
+
+
 def mask_phone(value: object) -> str:
     """Mask a phone number / WhatsApp id for logs: '919812345678' -> '91******5678'.
 

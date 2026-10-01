@@ -6,7 +6,7 @@ import uuid
 from fastapi import FastAPI, Request
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from app.utils.logger import logger
+from app.utils.logger import logger, safe_log
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
@@ -25,7 +25,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         # scope["path"] is the routed path (request.url is rebuilt from the
         # Host header). Values are passed as arguments, never formatted into
         # the template, so a path containing "{x}" cannot break logging.
-        path = request.scope.get("path", "")
+        path = safe_log(request.scope.get("path", ""))
         api_log = logger.bind(category="api")
         api_log.info("→ [{}] {} {}", request_id, request.method, path)
 

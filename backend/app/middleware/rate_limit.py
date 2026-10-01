@@ -10,7 +10,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.config import settings
 from app.middleware.public_host_guard import PUBLIC_ALLOWED_PATHS, routed_path
-from app.utils.logger import logger
+from app.utils.logger import logger, safe_log
 
 # Never counted: the health probe, and static customer images under /uploads
 # (one page view is many hits; /uploads is local-only behind the host guard).
@@ -78,7 +78,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         if len(self._request_counts[key]) >= limit:
             logger.bind(category="api").warning(
-                "Rate limit exceeded for {} on {} ({})", client_ip, routed_path(request), bucket
+                "Rate limit exceeded for {} on {} ({})", client_ip, safe_log(routed_path(request)), bucket
             )
             return JSONResponse(
                 status_code=429,
