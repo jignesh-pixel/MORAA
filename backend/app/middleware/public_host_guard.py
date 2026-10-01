@@ -2,9 +2,18 @@
 
 When the API is reached through a public host (the ngrok tunnel the Meta and
 Razorpay webhooks need), only those two webhook endpoints are served. Every
-other route stays reachable from localhost only. Requests from localhost are
-untouched.
+other route stays reachable from this machine only. Requests from this
+machine are untouched.
+
+"Local" needs all three: the real socket peer is loopback (or listed in
+LOCAL_PEER_ADDRESSES), the Host header is a local name, and no proxy header
+is present. The Host header alone is attacker-controlled, so it never makes
+a request local by itself. Behind uvicorn's default proxy handling, a tunnel
+connecting from 127.0.0.1 has the peer rewritten to the X-Forwarded-For
+client, so tunnelled traffic stays public.
 """
+
+import ipaddress
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -31,7 +40,26 @@ def _hostname(host_header: str) -> str:
     return host
 
 
+def _is_local_peer(request: Request) -> bool:
+    """True when the TCP peer is this machine (loopback) or an allowed peer."""
+    peer = (request.client.host if request.client else "") or ""
+    peer = peer.strip().lower()
+    if not peer:
+        return False
+    allowed = {p.strip().lower() for p in settings.LOCAL_PEER_ADDRESSES.split(",") if p.strip()}
+    if peer in allowed:
+        return True
+    try:
+        address = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    mapped = getattr(address, "ipv4_mapped", None)
+    return address.is_loopback or bool(mapped and mapped.is_loopback)
+
+
 def is_public_request(request: Request) -> bool:
+    if not _is_local_peer(request):
+        return True
     local_hosts = {h.strip().lower() for h in settings.LOCAL_API_HOSTS.split(",") if h.strip()}
     if _hostname(request.headers.get("host", "")) not in local_hosts:
         return True

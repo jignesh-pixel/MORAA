@@ -108,6 +108,39 @@ class PublicHostGuardTests(unittest.TestCase):
             r = self.client.post("/api/payments/razorpay/webhook", json={"event": "ping"}, headers={"host": NGROK})
         self.assertEqual((r.status_code, r.json().get("status")), (200, "ignored"))
 
+    def test_remote_peer_spoofing_localhost_host_header_blocked(self):
+        # TestClient's peer "testclient" is not loopback once it is removed
+        # from the allowed peers: this is a remote client sending
+        # "Host: localhost" straight to the port (no proxy headers).
+        with patch.object(settings, "LOCAL_PEER_ADDRESSES", "127.0.0.1,::1"):
+            for host in ("localhost:8000", "127.0.0.1:8000", "[::1]:8000"):
+                r = self.client.post("/api/generate-image", json={}, headers={"host": host})
+                self.assertEqual(r.status_code, 404, host)
+            self.assertEqual(
+                self.client.get("/docs", headers={"host": "localhost"}).status_code, 404
+            )
+            with patch.object(settings, "ALLOW_UNSIGNED_WEBHOOKS", True), \
+                 patch.object(settings, "RAZORPAY_WEBHOOK_SECRET", ""):
+                r = self.client.post("/api/payments/razorpay/webhook", json={"event": "ping"},
+                                     headers={"host": "localhost"})
+            self.assertEqual(r.status_code, 200)
+
+    def test_peer_classification(self):
+        from types import SimpleNamespace
+
+        from app.middleware.public_host_guard import _is_local_peer
+
+        def req(host):
+            return SimpleNamespace(client=SimpleNamespace(host=host) if host is not None else None)
+
+        with patch.object(settings, "LOCAL_PEER_ADDRESSES", "127.0.0.1,::1"):
+            for peer in ("127.0.0.1", "127.0.0.5", "::1", "::ffff:127.0.0.1"):
+                self.assertTrue(_is_local_peer(req(peer)), peer)
+            for peer in ("203.0.113.5", "10.0.0.7", "::ffff:203.0.113.5", "testclient", "", None):
+                self.assertFalse(_is_local_peer(req(peer)), peer)
+        with patch.object(settings, "LOCAL_PEER_ADDRESSES", "192.168.1.20"):
+            self.assertTrue(_is_local_peer(req("192.168.1.20")))
+
     def test_guard_can_be_disabled(self):
         with patch.object(settings, "PUBLIC_HOST_GUARD_ENABLED", False):
             r = self.client.get("/api/generate-image/health", headers={"host": NGROK})

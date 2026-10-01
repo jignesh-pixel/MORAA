@@ -28,4 +28,7 @@ def _erpnext_billing_off_by_default(monkeypatch):
     # Most webhook tests post unsigned payloads with no secret configured
     # (local development). Signature tests set this False explicitly.
     monkeypatch.setattr(settings, "ALLOW_UNSIGNED_WEBHOOKS", True)
+    # Starlette's TestClient connects as peer "testclient"; treat it as this
+    # machine. Guard tests override this to prove remote peers are blocked.
+    monkeypatch.setattr(settings, "LOCAL_PEER_ADDRESSES", "127.0.0.1,::1,testclient")
     yield

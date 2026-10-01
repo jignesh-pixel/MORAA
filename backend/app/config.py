@@ -98,9 +98,11 @@ class Settings(BaseSettings):
     # Hosts treated as local (comma-separated). Add a LAN IP here if the
     # dashboard is opened from another machine on the network.
     LOCAL_API_HOSTS: str = "localhost,127.0.0.1,::1,0.0.0.0"
-    # Socket peer addresses treated as this machine. A request is local only
-    # when its real peer is one of these -- the Host header alone is never
-    # trusted (anyone can send "Host: localhost").
+    # Extra socket peer addresses treated as this machine (loopback is always
+    # local). A request is local only when its real peer qualifies -- the Host
+    # header alone is never trusted (anyone can send "Host: localhost"). Add
+    # a LAN IP here, alongside LOCAL_API_HOSTS, to open the dashboard from
+    # another machine.
     LOCAL_PEER_ADDRESSES: str = "127.0.0.1,::1"
 
     # --- Auth ---
