@@ -3,6 +3,8 @@
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Tests import each other as `tests.<module>`; makes plain `pytest` work, not only `python -m pytest`.
+pythonpath = ["."]
 # The load harness is a script (tests/load_scenarios/run_load_scenarios.py), not a pytest suite.
 norecursedirs = ["tests/load_scenarios", "venv", ".venv", "node_modules"]
 markers = [

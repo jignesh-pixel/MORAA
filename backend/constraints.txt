@@ -1,8 +1,9 @@
 # Exact versions of every package (runtime + dev tooling) the tests run against.
 # Used as a pip constraints file: it never installs anything by itself, it only pins
-# versions of packages that something else requires. Packages that exist only on other
-# platforms (e.g. uvloop on Linux) are not listed and resolve normally.
-# Regenerate after intentionally changing a dependency:  pip freeze | grep -vi "^passlib==" > constraints.txt
+# versions of packages that something else requires.
+# Generated on Windows with: pip freeze | grep -vi "^passlib==" > constraints.txt
+# Platform-specific packages are therefore added by hand (uvloop, below); everything
+# else that exists only on other platforms resolves normally.
 aiofiles==24.1.0
 alembic==1.14.0
 amqp==5.3.1
@@ -113,6 +114,7 @@ tzlocal==5.4.4
 uritemplate==4.2.0
 urllib3==2.7.0
 uvicorn==0.34.0
+uvloop==0.21.0; sys_platform != "win32"
 vine==5.1.0
 watchfiles==1.2.0
 wcwidth==0.8.2
