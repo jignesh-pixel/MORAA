@@ -15,6 +15,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+import httpx
 from celery import Task
 from sqlalchemy.orm import Session
 
@@ -47,10 +48,16 @@ def get_analysis_pipeline() -> AnalysisPipeline:
     return _pipeline
 
 
+# Failures worth retrying: the call may succeed a moment later. Anything else
+# (missing record, unreadable image, bad prompt, parse error) fails the same
+# way every time, and each retry would re-run a paid AI call for nothing.
+TRANSIENT_ERRORS = (ConnectionError, TimeoutError, httpx.TransportError)
+
+
 class AnalysisTask(Task):
     """Base task class for analysis tasks with automatic error handling."""
 
-    autoretry_for = (Exception,)
+    autoretry_for = TRANSIENT_ERRORS
     max_retries = 2
     default_retry_delay = 10  # seconds between retries
     acks_late = True  # Re-deliver if worker crashes
