@@ -831,17 +831,21 @@ REFUND_AUDIT_ACTION = "whatsapp_generation_refund"
 def _refund_failed_ingestion(db, ingestion) -> None:
     """Return the slot charge for an ingestion that delivered nothing.
 
-    Idempotent per ingestion (an audit_logs row marks it refunded), so a
-    manual retry that fails again never refunds twice. Never raises.
-    ponytail: check-then-refund-then-record; a DB error between the refund
-    commit and the audit commit could allow one extra refund on a later retry.
+    Money moves at most once per ingestion. The refund audit row is the
+    claim: it is flushed BEFORE the wallet credit, and the partial unique
+    index uq_audit_logs_money_once rejects a concurrent second claim, so a
+    racing duplicate (retry endpoint, failure path, startup recovery) rolls
+    back without crediting. Claim, credit and commit are one transaction, the
+    same pattern as the Razorpay and WhatsApp Pay credits. Callers commit
+    their own changes before calling. Never raises.
     """
     try:
         import json
 
+        from sqlalchemy.exc import IntegrityError
+
         from app.models.audit_log import AuditLog
-        from app.models.customer import Customer
-        from app.services.wallet_service import price_per_image, refund_generation_charge
+        from app.services.wallet_service import credit_wallet, price_per_image
 
         already = (
             db.query(AuditLog.id)
@@ -866,8 +870,11 @@ def _refund_failed_ingestion(db, ingestion) -> None:
         # Pack 1 price -- exactly the previous behaviour.
         charged = getattr(ingestion, "amount_charged", None)
         price = int(charged) if charged is not None else price_per_image()
-        if not refund_generation_charge(db, cust.whatsapp_id, price):
+        if price <= 0:
             return
+
+        # 1. Claim: a concurrent duplicate fails here (on PostgreSQL it waits
+        #    for the winner's commit, then fails) before any money moves.
         db.add(
             AuditLog(
                 action=REFUND_AUDIT_ACTION,
@@ -877,6 +884,20 @@ def _refund_failed_ingestion(db, ingestion) -> None:
                 details=json.dumps({"whatsapp_id": cust.whatsapp_id, "amount": price}),
             )
         )
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            logger.info(f"Refund already claimed concurrently: ingestion_id={ingestion.id}")
+            return
+
+        # 2. Credit inside the same transaction; 3. commit claim + credit together.
+        if credit_wallet(db, cust.whatsapp_id, price, commit=False) != 1:
+            db.rollback()
+            logger.error(
+                f"Refund rolled back, wallet row not updated: ingestion_id={ingestion.id}"
+            )
+            return
         db.commit()
         logger.info(f"Refunded ₹{price} for failed ingestion_id={ingestion.id}")
     except Exception as e:
