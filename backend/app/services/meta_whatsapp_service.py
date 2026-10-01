@@ -840,6 +840,9 @@ def _refund_failed_ingestion(db, ingestion) -> None:
     same pattern as the Razorpay and WhatsApp Pay credits. Callers commit
     their own changes before calling. Never raises.
     """
+    # Read once: after a rollback the ORM object is expired, and reloading it
+    # on a broken connection would raise from the error path.
+    ingestion_id = getattr(ingestion, "id", None)
     try:
         import json
 
@@ -852,7 +855,7 @@ def _refund_failed_ingestion(db, ingestion) -> None:
             db.query(AuditLog.id)
             .filter(
                 AuditLog.action == REFUND_AUDIT_ACTION,
-                AuditLog.resource_id == ingestion.id,
+                AuditLog.resource_id == ingestion_id,
             )
             .first()
         )
@@ -863,7 +866,7 @@ def _refund_failed_ingestion(db, ingestion) -> None:
 
         cust = find_customer_by_phone(db, ingestion.external_user_id)
         if cust is None:
-            logger.error(f"Refund skipped, customer not found: ingestion_id={ingestion.id}")
+            logger.error(f"Refund skipped, customer not found: ingestion_id={ingestion_id}")
             return
 
         # Refund what was actually debited for this order. Legacy rows
@@ -879,7 +882,7 @@ def _refund_failed_ingestion(db, ingestion) -> None:
         db.add(
             AuditLog(
                 action=REFUND_AUDIT_ACTION,
-                resource_id=ingestion.id,
+                resource_id=ingestion_id,
                 resource_type="whatsapp_ingestion",
                 status="success",
                 details=json.dumps({"whatsapp_id": cust.whatsapp_id, "amount": price}),
@@ -889,20 +892,20 @@ def _refund_failed_ingestion(db, ingestion) -> None:
             db.flush()
         except IntegrityError:
             db.rollback()
-            logger.info(f"Refund already claimed concurrently: ingestion_id={ingestion.id}")
+            logger.info(f"Refund already claimed concurrently: ingestion_id={ingestion_id}")
             return
 
         # 2. Credit inside the same transaction; 3. commit claim + credit together.
         if credit_wallet(db, cust.whatsapp_id, price, commit=False) != 1:
             db.rollback()
             logger.error(
-                f"Refund rolled back, wallet row not updated: ingestion_id={ingestion.id}"
+                f"Refund rolled back, wallet row not updated: ingestion_id={ingestion_id}"
             )
             return
         db.commit()
-        logger.info(f"Refunded ₹{price} for failed ingestion_id={ingestion.id}")
+        logger.info(f"Refunded ₹{price} for failed ingestion_id={ingestion_id}")
     except Exception as e:
-        logger.error(f"Refund for failed ingestion failed: ingestion_id={ingestion.id} error={e}")
+        logger.error(f"Refund for failed ingestion failed: ingestion_id={ingestion_id} error={e}")
         try:
             db.rollback()
         except Exception:
@@ -1454,18 +1457,9 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
             _fail_delivery(db, ingestion, message)
         else:
             _fail_ingestion(db, ingestion, message)
-        refunded = int(ingestion.amount_charged or 0)
-        try:
-            await send_whatsapp_text(
-                ingestion.external_user_id,
-                (
-                    "Sorry, we couldn't create your Clean Studio Shot this time. "
-                    + (f"₹{refunded} has been refunded to your wallet." if refunded else "You were not charged.")
-                ),
-                reply_to_message_id=ingestion.external_message_id,
-            )
-        except Exception as notify_error:
-            logger.error(f"White BG failure notice not sent: {notify_error}")
+        # States a refund only when the refund row exists (never a refund
+        # that was skipped), same wording as before.
+        await _notify_failed_order(db, ingestion, "Clean Studio Shot")
         return False
 
     try:

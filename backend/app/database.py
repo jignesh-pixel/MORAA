@@ -1,7 +1,9 @@
 """Database engine, session factory, and declarative base."""
 
 from pathlib import Path
-from sqlalchemy import create_engine, event
+from typing import Optional
+
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import settings
@@ -73,3 +75,22 @@ def init_db() -> None:
     )
 
     Base.metadata.create_all(bind=engine)
+
+
+# Partial unique index that makes every payment credit and refund happen at
+# most once (app/models/audit_log.py, migration 0003). create_all never adds
+# an index to a table that already exists, so it is checked explicitly.
+MONEY_ONCE_INDEX = "uq_audit_logs_money_once"
+
+
+def money_once_index_present() -> Optional[bool]:
+    """True/False when the index can be checked, None for other dialects."""
+    dialect = engine.dialect.name
+    if dialect == "postgresql":
+        query = text("SELECT 1 FROM pg_indexes WHERE indexname = :name")
+    elif dialect == "sqlite":
+        query = text("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = :name")
+    else:
+        return None
+    with engine.connect() as conn:
+        return conn.execute(query, {"name": MONEY_ONCE_INDEX}).first() is not None

@@ -129,7 +129,8 @@ def credit_wallet(db: Session, whatsapp_id: str, amount: int, commit: bool = Tru
     """Add funds (payment captured or refund). Returns the new balance."""
     amount = max(int(amount), 0)
     if amount == 0 or not whatsapp_id:
-        return get_balance(db, whatsapp_id)
+        # commit=False callers read the return value as "rows updated".
+        return 0 if not commit else get_balance(db, whatsapp_id)
 
     try:
         updated = (

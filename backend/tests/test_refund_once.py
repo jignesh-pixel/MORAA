@@ -136,5 +136,13 @@ class RefundOnceTests(unittest.TestCase):
         self.assertEqual(self._refund_rows(), 1)
 
 
+class MoneyOnceIndexCheckTests(unittest.TestCase):
+    def test_index_detected_on_the_test_database(self):
+        from app.database import Base as AppBase, engine, money_once_index_present
+
+        AppBase.metadata.create_all(bind=engine)
+        self.assertIs(money_once_index_present(), True)
+
+
 if __name__ == "__main__":
     unittest.main()

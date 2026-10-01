@@ -33,6 +33,12 @@ PAISE_PER_RUPEE = 100
 AUDIT_ACTION_PAYMENT_CAPTURED = "razorpay_payment_captured"
 # Captured payment the webhook could not match to any payer (no phone).
 AUDIT_ACTION_PAYMENT_UNMATCHED = "razorpay_payment_unmatched"
+# One row per transient credit failure (each answered 503 so Razorpay retries).
+AUDIT_ACTION_PAYMENT_CREDIT_FAILED = "razorpay_payment_credit_failed"
+# After this many failed credit attempts for one payment, stop asking Razorpay
+# to retry (it would eventually disable the webhook) and leave the pending rows
+# plus an ALERT for a manual credit.
+MAX_CREDIT_ATTEMPTS = 8
 AUDIT_RESOURCE_TYPE = "razorpay_payment"
 
 PAYMENT_TIPS_MESSAGE = (
@@ -222,7 +228,9 @@ def _record_unmatched_payment(
     """
     logger.error(
         f"ALERT Razorpay payment {payment_reference} (₹{amount_paid}, event={event}) "
-        "has no payer phone and was NOT credited. Identify the payer and credit manually."
+        "has no payer phone and was NOT credited. If another event for this payment "
+        "credits it, the audit row is marked resolved; otherwise identify the payer "
+        "and credit manually."
     )
     try:
         exists = (
@@ -251,6 +259,61 @@ def _record_unmatched_payment(
     except Exception as e:
         db.rollback()
         logger.error(f"Could not record unmatched payment {payment_reference}: {e}")
+
+
+def _record_credit_failure(
+    db: Session, payment_reference: str, amount_paid: int, reason: str
+) -> int:
+    """Record one failed credit attempt; return how many have been recorded.
+
+    Written in its own transaction after the failed one was rolled back, so
+    the money claim stays free for Razorpay's retry. Never raises (returns 0
+    when even the record cannot be written, so the caller keeps retrying).
+    """
+    try:
+        db.add(
+            AuditLog(
+                user_id=None,
+                action=AUDIT_ACTION_PAYMENT_CREDIT_FAILED,
+                resource_id=payment_reference,
+                resource_type=AUDIT_RESOURCE_TYPE,
+                status="pending",
+                details=json.dumps(
+                    {"amount_paid": amount_paid, "currency": "INR", "reason": reason[:300]}
+                ),
+            )
+        )
+        db.commit()
+        return (
+            db.query(AuditLog.id)
+            .filter(
+                AuditLog.action == AUDIT_ACTION_PAYMENT_CREDIT_FAILED,
+                AuditLog.resource_id == payment_reference,
+            )
+            .count()
+        )
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Could not record credit failure for {payment_reference}: {e}")
+        return 0
+
+
+def _retry_or_give_up(
+    db: Session, payment_reference: str, amount_paid: int, reason: str
+) -> Dict[str, str]:
+    """Answer 503 so Razorpay retries, until MAX_CREDIT_ATTEMPTS is reached."""
+    attempts = _record_credit_failure(db, payment_reference, amount_paid, reason)
+    if attempts >= MAX_CREDIT_ATTEMPTS:
+        logger.error(
+            f"ALERT Razorpay payment {payment_reference} (₹{amount_paid}) failed to credit "
+            f"{attempts} times ({reason}); NOT credited and no longer retried. "
+            "Credit manually after fixing the cause."
+        )
+        return {"status": "credit_failed"}
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Payment not credited yet, retry later",
+    )
 
 
 def _payment_audit_row(
@@ -386,6 +449,13 @@ async def razorpay_webhook(
                 raise RuntimeError("customer row not updated")
             if getattr(customer, "full_name", None):
                 customer_name = customer.full_name
+        # Close any earlier "not credited" alerts for this payment in the same
+        # transaction, so nobody credits it a second time by hand.
+        db.query(AuditLog).filter(
+            AuditLog.action.in_((AUDIT_ACTION_PAYMENT_UNMATCHED, AUDIT_ACTION_PAYMENT_CREDIT_FAILED)),
+            AuditLog.resource_id == payment_reference,
+            AuditLog.status == "pending",
+        ).update({AuditLog.status: "resolved"}, synchronize_session=False)
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -399,20 +469,14 @@ async def razorpay_webhook(
             f"Payment webhook: customer provisioning conflict for {clean_sender}; "
             f"payment {payment_reference} not credited yet, asking Razorpay to retry."
         )
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Customer provisioning conflict, retry later",
-        )
+        return _retry_or_give_up(db, payment_reference, amount_paid, "customer provisioning conflict")
     except Exception as e:
         db.rollback()
         logger.error(
             f"Payment webhook: wallet credit failed for {clean_sender}: {e}; "
             f"payment {payment_reference} not credited yet, asking Razorpay to retry."
         )
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Wallet credit failed, retry later",
-        )
+        return _retry_or_give_up(db, payment_reference, amount_paid, f"wallet credit failed: {e}")
 
     logger.info(
         f"Wallet credited ₹{amount_paid} for {clean_sender}: event={event} "

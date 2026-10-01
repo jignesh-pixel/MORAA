@@ -26,7 +26,7 @@ from app.api.routes.health import router as health_router
 # Import Celery task modules so they register with the Celery app
 import app.tasks.prompt_tasks  # noqa: F401, E402
 from app.config import ENV_FILE, settings
-from app.database import init_db
+from app.database import MONEY_ONCE_INDEX, init_db, money_once_index_present
 from app.middleware.cors import setup_cors
 from app.middleware.error_handler import setup_error_handlers
 from app.middleware.logging_middleware import setup_logging_middleware
@@ -53,6 +53,17 @@ async def lifespan(app: FastAPI):
     # Initialize database
     init_db()
     logger.info("Database initialized", extra={"category": "system"})
+
+    # Payment credits and refunds rely on this index to move money at most
+    # once. Without it every claim silently succeeds twice under a race.
+    if money_once_index_present() is False:
+        message = (
+            f"{MONEY_ONCE_INDEX} is missing: payment credits and refunds are NOT "
+            "protected against double processing. Run `alembic upgrade head`."
+        )
+        if settings.IS_PRODUCTION:
+            raise RuntimeError(message)
+        logger.error(message, extra={"category": "system"})
 
     # Ensure upload and report directories exist
     settings.UPLOAD_PATH.mkdir(parents=True, exist_ok=True)
