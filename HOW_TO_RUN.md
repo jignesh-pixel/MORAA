@@ -139,10 +139,16 @@ Paste the following into `backend/.env`:
 # ─── Application ───────────────────────────────────────────
 APP_NAME=MORAA GemVision
 APP_VERSION=1.0.0
+# development | production. Production refuses to start without SECRET_KEY (32+ chars),
+# META_APP_SECRET, RAZORPAY_WEBHOOK_SECRET and a non-SQLite DATABASE_URL.
+ENVIRONMENT=development
+# DEBUG only controls SQL echo and verbose output. It never relaxes a security check.
 DEBUG=true
+# Development only: accept webhooks with no signature while their secret is unset.
+# ALLOW_UNSIGNED_WEBHOOKS=true
 
 # ─── Server ────────────────────────────────────────────────
-HOST=0.0.0.0
+HOST=127.0.0.1
 PORT=8000
 
 # ─── Database (SQLite for development — no external DB needed)
@@ -257,7 +263,7 @@ The project does not include a seed script — the database starts empty. You ca
 Make sure your virtual environment is still activated, then run:
 
 ```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 **Expected output:**
@@ -265,7 +271,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 INFO:     Started server process [12345]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
-INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
 ```
 
 ### 5.2 Verify the Backend is Running
@@ -392,13 +398,13 @@ Open **two separate terminal windows**:
 | `cd backend` | `cd frontend` |
 | `venv\Scripts\activate` (Windows) | `npm run dev` |
 | or `source venv/bin/activate` (Linux/Mac) | |
-| `uvicorn app.main:app --reload --host 0.0.0.0 --port 8000` | |
+| `uvicorn app.main:app --reload --host 127.0.0.1 --port 8000` | |
 
 ### Windows PowerShell Example
 
 | Terminal 1 — Backend | Terminal 2 — Frontend |
 |---|---|
-| ```powershell<br>cd backend<br>.\venv\Scripts\Activate.ps1<br>uvicorn app.main:app --reload --host 0.0.0.0 --port 8000<br>``` | ```powershell<br>cd frontend<br>npm run dev<br>``` |
+| ```powershell<br>cd backend<br>.\venv\Scripts\Activate.ps1<br>uvicorn app.main:app --reload --host 127.0.0.1 --port 8000<br>``` | ```powershell<br>cd frontend<br>npm run dev<br>``` |
 
 ---
 
@@ -479,7 +485,7 @@ cd backend
 venv\Scripts\activate      # Windows
 # source venv/bin/activate  # Linux/Mac
 
-celery -A celery_worker worker -l info -Q analysis --autoreload
+celery -A celery_worker worker -l info -Q analysis
 ```
 
 Now you have three processes running:
@@ -602,13 +608,34 @@ python --version
 
 ---
 
+## 11b. Going live: security settings (Phase 0)
+
+- **Bind to localhost.** Start uvicorn with `--host 127.0.0.1`. ngrok connects to localhost, so it still
+  reaches the two webhooks. The dashboard routes answer only to a request that really comes from this
+  machine; a `Host: localhost` header sent from elsewhere gets 404.
+- **Do not use `--reload` for live traffic.** Every saved file restarts the server mid-order.
+- **Start the server from `backend/`.** Uploads and reports are stored under relative paths, and the
+  server logs a warning if it was started elsewhere. `.env` itself is found by absolute path.
+- **`ENVIRONMENT=production`** makes the server refuse to start when a secret is missing, when `DEBUG`
+  is on, when the database is SQLite, or when the `uq_audit_logs_money_once` index is missing
+  (run `alembic upgrade head`).
+- **`SECRET_KEY`** must be set (32+ characters). Generate one with
+  `python -c "import secrets; print(secrets.token_urlsafe(48))"`.
+- **`MAX_GENERATIONS_PER_DAY`** is the daily ceiling on image generations per server process
+  (about 6 per Pack). The server warns at start-up if it is below one Pack.
+- **Dashboard password (optional).** Set `DASHBOARD_PASSWORD` (and optionally `DASHBOARD_USER`,
+  default `admin`) in the frontend environment to make the browser ask for a login on every page and on
+  `/api/gemini/analyze`. Leave it unset for local development.
+- **Tests never read `backend/.env`.** They set `MORAA_ENV_FILE=""` and use temporary folders.
+  Set `MORAA_ENV_FILE` to a file path to run against a specific env file on purpose.
+
 ## 12. Useful Commands
 
 ### Backend
 
 ```bash
 # Start the API server (with auto-reload)
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 
 #To run the terminaal 
@@ -635,7 +662,7 @@ pytest -k "test_name"    # run specific test
 
 # Start Celery worker (if Redis is running)
 cd backend
-celery -A celery_worker worker -l info -Q analysis --autoreload
+celery -A celery_worker worker -l info -Q analysis
 ```
 
 ### Frontend
@@ -828,7 +855,7 @@ The frontend also supports **direct Gemini API analysis** via `/api/gemini/analy
 | Activate venv (PowerShell) | `.\venv\Scripts\Activate.ps1` |
 | Activate venv (Linux/Mac) | `source venv/bin/activate` |
 | Run migrations | `cd backend && alembic upgrade head` |
-| Start backend | `cd backend && uvicorn app.main:app --reload --host 0.0.0.0 --port 8000` |
+| Start backend | `cd backend && uvicorn app.main:app --reload --host 127.0.0.1 --port 8000` |
 | Frontend setup | `cd frontend && npm install` |
 | Start frontend | `cd frontend && npm run dev` |
 | Run backend tests | `cd backend && pytest` |
