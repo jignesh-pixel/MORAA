@@ -106,17 +106,22 @@ source venv/bin/activate
 ### 4.3 Install Backend Dependencies
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-dev.txt -c constraints.txt
 ```
 
-This installs all packages listed in `backend/requirements.txt`, including:
+This installs the runtime packages in `backend/requirements.txt` plus the development tools in
+`backend/requirements-dev.txt` (pytest, ruff, pip-audit, pgserver). `constraints.txt` pins every
+package to the exact version the tests run against. On a production server install only the
+runtime set: `pip install -r requirements.txt -c constraints.txt`.
+
+Runtime packages include:
 - FastAPI, Uvicorn (web server)
 - SQLAlchemy, Alembic (database ORM & migrations)
 - Celery, Redis (task queue)
-- python-jose, passlib (authentication)
+- python-jose, bcrypt (authentication)
 - Pillow, ReportLab (image processing & PDFs)
-- google-generativeai (optional Gemini integration)
-- httpx, pytest (testing)
+- google-generativeai, google-genai, openai (AI providers)
+- httpx (HTTP client)
 
 ### 4.4 Configure Environment Variables
 
@@ -534,7 +539,7 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 pip install --upgrade pip
 
 # Then retry
-pip install -r requirements.txt
+pip install -r requirements-dev.txt -c constraints.txt
 
 # If a specific package fails, install it individually
 pip install <package-name>
@@ -629,6 +634,14 @@ python --version
 - **Opening the dashboard from another machine** needs both `LOCAL_API_HOSTS` (the name or IP in the
   browser's address bar) and `LOCAL_PEER_ADDRESSES` (that machine's IP) in `backend/.env`; either one
   alone is not enough. Leave both at their defaults for localhost-only use.
+- **The database schema belongs to Alembic.** The server no longer creates tables on start. In production
+  it refuses to start unless the database is at the latest revision: run `alembic upgrade head` before
+  every deploy that includes a new migration. In development on SQLite it migrates itself on start.
+  Never run `alembic downgrade base` on a live database: migration 0002's downgrade drops `customers`
+  (wallet balances).
+- **CI** (`.github/workflows/ci.yml`) runs lint, the full test suite on SQLite and on PostgreSQL, the
+  dependency audit (`backend/pip-audit-ignore.txt` lists the advisories that are known and deferred) and
+  the frontend type check on every pull request.
 - **Tests never read `backend/.env`.** They set `MORAA_ENV_FILE=""` and use temporary folders.
   Set `MORAA_ENV_FILE` to a file path to run against a specific env file on purpose.
 
@@ -657,11 +670,20 @@ alembic downgrade -1
 # Check current migration status
 alembic current
 
-# Run tests
+# Run tests (SQLite, no setup needed)
 cd backend
-pytest
-pytest -v     # verbose
-pytest -k "test_name"    # run specific test
+python -m pytest -q
+python -m pytest -k "test_name"    # run specific test
+
+# Run the same suite on a real, throw-away PostgreSQL (starts one automatically via pgserver)
+set MORAA_TEST_DB=postgres            # PowerShell: $env:MORAA_TEST_DB = "postgres"
+python -m pytest -q
+# or against a PostgreSQL you run yourself (loopback only; never a hosted/production database)
+# set TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/moraa_test
+
+# Lint and dependency audit (the same checks CI runs)
+ruff check .
+pip-audit -r constraints.txt --no-deps --disable-pip --strict
 
 # Start Celery worker (if Redis is running)
 cd backend
@@ -779,7 +801,8 @@ moraa-gemvision/
 │  1. Clone the repository                                │
 │  2. cd frontend && npm install                          │
 │  3. cd ../backend && python -m venv venv                │
-│  4. Activate venv && pip install -r requirements.txt    │
+│  4. Activate venv && pip install -r requirements-dev.txt │
+│     -c constraints.txt                                  │
 │  5. Create backend/.env with your configuration         │
 │  6. alembic upgrade head                                │
 └─────────────────────────────────────────────────────────┘
@@ -805,7 +828,7 @@ moraa-gemvision/
 │  • Check backend health at http://localhost:8000/health   │
 │  • Explore API at http://localhost:8000/docs             │
 │  • Register a user, upload an image, run an analysis     │
-│  • Run tests: cd backend && pytest                       │
+│  • Run tests: cd backend && python -m pytest             │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -853,7 +876,7 @@ The frontend also supports **direct Gemini API analysis** via `/api/gemini/analy
 
 | Task | Command |
 |---|---|
-| Backend setup | `cd backend && python -m venv venv && pip install -r requirements.txt` |
+| Backend setup | `cd backend && python -m venv venv && pip install -r requirements-dev.txt -c constraints.txt` |
 | Activate venv (Windows CMD) | `venv\Scripts\activate` |
 | Activate venv (PowerShell) | `.\venv\Scripts\Activate.ps1` |
 | Activate venv (Linux/Mac) | `source venv/bin/activate` |
@@ -861,7 +884,7 @@ The frontend also supports **direct Gemini API analysis** via `/api/gemini/analy
 | Start backend | `cd backend && uvicorn app.main:app --reload --host 127.0.0.1 --port 8000` |
 | Frontend setup | `cd frontend && npm install` |
 | Start frontend | `cd frontend && npm run dev` |
-| Run backend tests | `cd backend && pytest` |
+| Run backend tests | `cd backend && python -m pytest -q` |
 | Run frontend lint | `cd frontend && npm run lint` |
 | API docs | `http://localhost:8000/docs` |
 | Health check | `http://localhost:8000/health` |
