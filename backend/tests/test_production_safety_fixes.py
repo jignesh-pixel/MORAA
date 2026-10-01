@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -227,9 +228,14 @@ class OpenAIRetryTests(unittest.TestCase):
         with patch("openai.AsyncOpenAI", side_effect=fake_client), \
              patch.object(settings, "OPENAI_API_KEY", "sk-test"):
             asyncio.run(OpenAIImageProvider().generate_image("p", {"request_id": "t"}))
-            with tempfile.NamedTemporaryFile(suffix=".jpg") as f:
-                f.write(b"\xff\xd8\xff" + b"\x00" * 32); f.flush()
-                asyncio.run(OpenAIProvider().analyze([f.name], {"request_id": "t"}))
+            # A file in a temp directory, closed before use: re-opening a still-open
+            # NamedTemporaryFile raises PermissionError on Windows, which made analyze()
+            # return before it ever built the client this test is about.
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                image_path = os.path.join(tmp_dir, "probe.jpg")
+                with open(image_path, "wb") as f:
+                    f.write(b"\xff\xd8\xff" + b"\x00" * 32)
+                asyncio.run(OpenAIProvider().analyze([image_path], {"request_id": "t"}))
         self.assertEqual(len(seen), 2)
         self.assertTrue(all(k.get("max_retries") == 0 for k in seen), seen)
 
