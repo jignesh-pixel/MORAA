@@ -25,8 +25,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from app.config import settings
-from app.utils.logger import logger
-
+from app.utils.logger import logger, mask_phone
 # Step A: 2-digit state code, 10-char PAN, entity code 1-9/A-Z, literal Z, check char.
 GSTIN_FORMAT_RE = re.compile(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$")
 
@@ -244,7 +243,7 @@ def is_awaiting_gstin(db, sender: str) -> bool:
         return bool(row and row.state == STATE_AWAITING_GSTIN)
     except Exception as e:  # noqa: BLE001 -- never break the text router
         db.rollback()
-        logger.error(f"GST state lookup failed for {sender}: {e}")
+        logger.error(f"GST state lookup failed for {mask_phone(sender)}: {e}")
         return False
 
 
@@ -345,7 +344,7 @@ async def process_gstin(
         return result
     except Exception as e:  # noqa: BLE001
         db.rollback()
-        logger.error(f"GST verification step failed for {sender}: {e}")
+        logger.error(f"GST verification step failed for {mask_phone(sender)}: {e}")
         # Never strand a customer mid-onboarding because of our own error.
         await _complete(on_complete)
         return None
@@ -390,7 +389,7 @@ async def handle_gst_button(db, sender: str, button_id: str, on_complete: OnComp
                 and customer.is_registered):
             # Stale / double-tapped Skip after onboarding already finished:
             # nothing to resolve, and never a second "You're all set".
-            logger.info(f"GST skip ignored, onboarding already complete: {sender}")
+            logger.info(f"GST skip ignored, onboarding already complete: {mask_phone(sender)}")
             return True
         if button_id == BTN_GST_REENTER:
             _set_state(db, customer.whatsapp_id, STATE_AWAITING_GSTIN)
@@ -400,7 +399,7 @@ async def handle_gst_button(db, sender: str, button_id: str, on_complete: OnComp
             await skip_gst(db, sender, on_complete)
     except Exception as e:  # noqa: BLE001
         db.rollback()
-        logger.error(f"GST button handling failed for {sender}: {e}")
+        logger.error(f"GST button handling failed for {mask_phone(sender)}: {e}")
     return True
 
 

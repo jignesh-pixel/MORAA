@@ -626,6 +626,9 @@ python --version
 - **Dashboard password (optional).** Set `DASHBOARD_PASSWORD` (and optionally `DASHBOARD_USER`,
   default `admin`) in the frontend environment to make the browser ask for a login on every page and on
   `/api/gemini/analyze`. Leave it unset for local development.
+- **Opening the dashboard from another machine** needs both `LOCAL_API_HOSTS` (the name or IP in the
+  browser's address bar) and `LOCAL_PEER_ADDRESSES` (that machine's IP) in `backend/.env`; either one
+  alone is not enough. Leave both at their defaults for localhost-only use.
 - **Tests never read `backend/.env`.** They set `MORAA_ENV_FILE=""` and use temporary folders.
   Set `MORAA_ENV_FILE` to a file path to run against a specific env file on purpose.
 

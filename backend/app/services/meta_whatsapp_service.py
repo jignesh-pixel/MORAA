@@ -20,11 +20,9 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-from sqlalchemy import or_
 
 from app.config import settings
-from app.utils.logger import logger
-
+from app.utils.logger import logger, mask_phone
 # ─── Constants ────────────────────────────────────────────────────────────
 
 META_MEDIA_URL_TEMPLATE = "https://graph.facebook.com/v21.0/{media_id}"
@@ -433,7 +431,7 @@ async def _post_message_payload(
                 return False
 
             logger.info(
-                f"Meta {label} sent: recipient={payload.get('to', '')} "
+                f"Meta {label} sent: recipient={mask_phone(payload.get('to', ''))} "
                 f"message_id={messages[0].get('id', '')}"
             )
             return True
@@ -769,7 +767,7 @@ async def send_catalog_pack_images_to_whatsapp(
         else:
             logger.error(
                 f"Catalog pack delivery: image {index}/{total} failed — "
-                f"recipient={recipient_id} media_id={media_id}"
+                f"recipient={mask_phone(recipient_id)} media_id={media_id}"
             )
 
         if index < len(image_urls):
@@ -1121,6 +1119,11 @@ async def _generate_single_pack_style(
         return None
 
 
+# Statuses from which the Pack worker may start: queued by the product tap, or
+# reset to "stored" by the retry endpoint. Same shape as WHITE_BG_RUNNABLE_STATUSES.
+PACK_RUNNABLE_STATUSES = ("pack_queued", "stored")
+
+
 async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
     """Generate the catalog styles in parallel and deliver them to WhatsApp.
 
@@ -1161,17 +1164,16 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         return False
 
     try:
-        # Atomic claim (same rule as before: anything not already processing
-        # may run). A read-then-write let two concurrent starts both claim the
-        # order and pay for every style twice; now only one UPDATE matches.
+        # Atomic claim, like the Clean Studio Shot worker: only a runnable
+        # status can move to processing, and only one UPDATE can match. A
+        # read-then-write let two concurrent starts both claim the order and
+        # pay for every style twice; an open-ended "not processing" rule would
+        # also let a late duplicate re-run a delivered or refunded order.
         claimed = (
             db.query(WhatsAppIngestion)
             .filter(
                 WhatsAppIngestion.id == ingestion_id,
-                or_(
-                    WhatsAppIngestion.status.is_(None),
-                    WhatsAppIngestion.status != "processing",
-                ),
+                WhatsAppIngestion.status.in_(PACK_RUNNABLE_STATUSES),
             )
             .update(
                 {WhatsAppIngestion.status: "processing", WhatsAppIngestion.error_message: None},
@@ -1316,7 +1318,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
             db.commit()
             logger.warning(
                 f"Catalog pack partially delivered: ingestion_id={ingestion_id} "
-                f"sent={sent_count}/{total_images} recipient={ingestion.external_user_id}"
+                f"sent={sent_count}/{total_images} recipient={mask_phone(ingestion.external_user_id)}"
             )
             try:
                 await send_whatsapp_text(
@@ -1336,7 +1338,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
 
         logger.info(
             f"Catalog pack delivered: ingestion_id={ingestion_id} images={len(media_ids)} "
-            f"recipient={ingestion.external_user_id}"
+            f"recipient={mask_phone(ingestion.external_user_id)}"
         )
         await ent.record_trial_success(db, ingestion)  # trial orders only; never raises
         return True

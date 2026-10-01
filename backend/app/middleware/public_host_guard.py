@@ -126,6 +126,81 @@ class PublicHostGuardMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+class WebhookBodyLimitMiddleware:
+    """Cap request bodies on the public webhook paths by counting real bytes.
+
+    The guard's Content-Length check cannot see a chunked upload (no
+    Content-Length), and the routes read the whole body into memory before
+    verifying the signature. This pure-ASGI wrapper counts bytes as they
+    arrive. Past the cap it tells the route the client disconnected (so no
+    more is buffered) and replaces whatever the route answers with a 413 --
+    no exception is used, because the routes catch broad exceptions around
+    body parsing. Honest Meta and Razorpay payloads (a few KB) are unaffected.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope["type"] != "http"
+            or scope.get("method") not in ("POST", "PUT", "PATCH")
+            or ((scope.get("path") or "/").rstrip("/") or "/") not in PUBLIC_ALLOWED_PATHS
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        limit = settings.MAX_WEBHOOK_BODY_BYTES
+        received = 0
+        exceeded = False
+        replaced = False  # the 413 has been sent
+
+        async def send_413():
+            nonlocal replaced
+            if replaced:
+                return
+            replaced = True
+            body = b'{"detail":"Payload too large"}'
+            await send({
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [(b"content-type", b"application/json"),
+                            (b"content-length", str(len(body)).encode("ascii"))],
+            })
+            await send({"type": "http.response.body", "body": body})
+
+        async def limited_receive():
+            nonlocal received, exceeded
+            if exceeded:
+                return {"type": "http.disconnect"}
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    exceeded = True
+                    logger.bind(category="api").warning(
+                        "Public host guard: webhook body exceeded {} bytes while streaming", limit
+                    )
+                    return {"type": "http.disconnect"}
+            return message
+
+        async def guarded_send(message):
+            if exceeded:
+                # Drop the route's own answer; the client gets the 413 instead.
+                await send_413()
+                return
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, guarded_send)
+        except Exception:
+            if not exceeded:
+                raise
+        if exceeded:
+            await send_413()
+
+
 def setup_public_host_guard(app: FastAPI) -> None:
-    """Add last so it runs first (outermost middleware)."""
+    """Install the body limiter, then the guard last so the guard runs first (outermost)."""
+    app.add_middleware(WebhookBodyLimitMiddleware)
     app.add_middleware(PublicHostGuardMiddleware)

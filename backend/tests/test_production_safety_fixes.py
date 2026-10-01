@@ -438,3 +438,44 @@ class PaidOrderSafetyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChunkedBodyLimitTests(unittest.TestCase):
+    """A chunked upload has no Content-Length, so the byte-counting limiter must stop it."""
+
+    def setUp(self):
+        self.client = TestClient(app)
+
+    @staticmethod
+    def _chunks(total, size=100):
+        def gen():
+            sent = 0
+            while sent < total:
+                piece = min(size, total - sent)
+                sent += piece
+                yield b" " * piece
+        return gen()
+
+    def test_oversized_chunked_webhook_body_gets_413(self):
+        with patch.object(settings, "MAX_WEBHOOK_BODY_BYTES", 1000):
+            for path in ("/api/meta/webhook", "/api/payments/razorpay/webhook"):
+                r = self.client.post(path, content=self._chunks(5000),
+                                     headers={"host": NGROK, "content-type": "application/json"})
+                self.assertEqual(r.status_code, 413, path)
+
+    def test_small_chunked_webhook_body_still_processed(self):
+        with patch.object(settings, "MAX_WEBHOOK_BODY_BYTES", 1000), \
+             patch.object(settings, "ALLOW_UNSIGNED_WEBHOOKS", True), \
+             patch.object(settings, "RAZORPAY_WEBHOOK_SECRET", ""):
+            def body():
+                yield b'{"event":'
+                yield b' "ping"}'
+            r = self.client.post("/api/payments/razorpay/webhook", content=body(),
+                                 headers={"host": NGROK, "content-type": "application/json"})
+        self.assertEqual((r.status_code, r.json().get("status")), (200, "ignored"))
+
+    def test_other_routes_are_not_limited_by_the_webhook_cap(self):
+        with patch.object(settings, "MAX_WEBHOOK_BODY_BYTES", 10):
+            r = self.client.post("/api/generate-image", json={"prompt": "x" * 500},
+                                 headers={"host": "localhost:8000"})
+        self.assertNotEqual(r.status_code, 413)

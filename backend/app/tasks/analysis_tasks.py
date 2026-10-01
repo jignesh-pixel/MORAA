@@ -15,7 +15,6 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-import httpx
 from celery import Task
 from sqlalchemy.orm import Session
 
@@ -28,6 +27,7 @@ from app.models.history import HistoryEntry
 from app.models.image import Image
 from app.models.retry_history import RetryHistory
 from app.services.processing_service import ProcessingService
+from app.tasks.retry_policy import TRANSIENT_ERRORS
 from app.utils.logger import logger
 
 # Global pipeline instance (lazily initialised per worker process)
@@ -46,12 +46,6 @@ def get_analysis_pipeline() -> AnalysisPipeline:
         _pipeline = AnalysisPipeline(engine)
         logger.bind(category="system").info(f"Analysis pipeline initialised: {engine.engine_name} v{engine.engine_version}")
     return _pipeline
-
-
-# Failures worth retrying: the call may succeed a moment later. Anything else
-# (missing record, unreadable image, bad prompt, parse error) fails the same
-# way every time, and each retry would re-run a paid AI call for nothing.
-TRANSIENT_ERRORS = (ConnectionError, TimeoutError, httpx.TransportError)
 
 
 class AnalysisTask(Task):

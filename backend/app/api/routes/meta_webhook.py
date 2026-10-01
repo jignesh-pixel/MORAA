@@ -504,7 +504,7 @@ async def _handle_registration_flow(db: Session, event: Dict[str, Any]) -> bool:
 
     if not full_name:
         logger.warning(
-            f"Registration Flow missing name: sender={sender} keys={sorted(data)}"
+            f"Registration Flow missing name: sender={mask_phone(sender)} keys={sorted(data)}"
         )
         await send_whatsapp_text(sender, REGISTRATION_REQUEST_MESSAGE)
         return False
@@ -1182,7 +1182,7 @@ async def retry_delivery(
 
     logger.info(
         f"Retry triggered: ingestion_id={ingestion_id} "
-        f"user={ingestion.external_user_id}"
+        f"user={mask_phone(ingestion.external_user_id)}"
     )
 
     return {

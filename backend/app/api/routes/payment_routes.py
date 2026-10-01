@@ -23,8 +23,7 @@ from app.services.meta_whatsapp_service import (
     send_whatsapp_text,
 )
 from app.services.wallet_service import credit_wallet, find_customer_by_phone, get_balance
-from app.utils.logger import logger
-
+from app.utils.logger import logger, mask_phone
 router = APIRouter(prefix="/api/payments", tags=["Payments"])
 
 SIGNATURE_HEADER = "X-Razorpay-Signature"
@@ -466,20 +465,20 @@ async def razorpay_webhook(
         # The claim was rolled back too, so Razorpay's retry credits normally
         # (and then finds the existing customer). A 200 here lost the money.
         logger.error(
-            f"Payment webhook: customer provisioning conflict for {clean_sender}; "
+            f"Payment webhook: customer provisioning conflict for {mask_phone(clean_sender)}; "
             f"payment {payment_reference} not credited yet, asking Razorpay to retry."
         )
         return _retry_or_give_up(db, payment_reference, amount_paid, "customer provisioning conflict")
     except Exception as e:
         db.rollback()
         logger.error(
-            f"Payment webhook: wallet credit failed for {clean_sender}: {e}; "
+            f"Payment webhook: wallet credit failed for {mask_phone(clean_sender)}: {e}; "
             f"payment {payment_reference} not credited yet, asking Razorpay to retry."
         )
         return _retry_or_give_up(db, payment_reference, amount_paid, f"wallet credit failed: {e}")
 
     logger.info(
-        f"Wallet credited ₹{amount_paid} for {clean_sender}: event={event} "
+        f"Wallet credited ₹{amount_paid} for {mask_phone(clean_sender)}: event={event} "
         f"payment_id={payment_reference} balance_after={get_balance(db, customer.whatsapp_id)}. "
         "Now sending WhatsApp confirmation."
     )
@@ -515,7 +514,7 @@ async def razorpay_webhook(
             send_document_fn=send_document_to_whatsapp,
         )
 
-        logger.info(f"Sent confirmation and tips to {clean_sender}; invoice queued")
+        logger.info(f"Sent confirmation and tips to {mask_phone(clean_sender)}; invoice queued")
     except Exception as e:
         logger.error(f"Post-payment WhatsApp dispatch failed: {e}")
 

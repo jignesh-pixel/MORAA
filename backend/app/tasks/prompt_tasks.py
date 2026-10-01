@@ -8,13 +8,15 @@ from sqlalchemy.orm import Session
 from app.celery_app import celery_app
 from app.database import SessionLocal
 from app.services.prompt_generation_service import PromptGenerationService
+from app.tasks.retry_policy import TRANSIENT_ERRORS
 from app.utils.logger import logger
 
 
 class PromptTask(Task):
     """Base task class for prompt generation tasks."""
 
-    autoretry_for = (Exception,)
+    # Same policy as the analysis tasks: retry only failures that can clear up.
+    autoretry_for = TRANSIENT_ERRORS
     max_retries = 2
     default_retry_delay = 10
     acks_late = True

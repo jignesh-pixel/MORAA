@@ -33,8 +33,7 @@ from app.config import settings
 from app.models.customer import Customer
 from app.models.whatsapp_ingestion import WhatsAppIngestion
 from app.repositories.base import BaseRepository
-from app.utils.logger import logger
-
+from app.utils.logger import logger, mask_phone
 # ─── Ingestion statuses owned by the wallet gate ─────────────────────────
 
 STATUS_PENDING_PAYMENT = "pending_payment"
@@ -147,13 +146,13 @@ def credit_wallet(db: Session, whatsapp_id: str, amount: int, commit: bool = Tru
         db.commit()
         if updated != 1:
             logger.warning(
-                f"Wallet credit skipped — unknown customer whatsapp_id={whatsapp_id}"
+                f"Wallet credit skipped — unknown customer whatsapp_id={mask_phone(whatsapp_id)}"
             )
             return 0
 
         balance = get_balance(db, whatsapp_id)
         logger.info(
-            f"Wallet credited: whatsapp_id={whatsapp_id} amount={amount} "
+            f"Wallet credited: whatsapp_id={mask_phone(whatsapp_id)} amount={amount} "
             f"balance={balance}"
         )
         return balance
@@ -211,13 +210,13 @@ def charge_customer_balance(
 
     if updated != 1:
         logger.warning(
-            f"Wallet charge declined: whatsapp_id={customer.whatsapp_id} "
+            f"Wallet charge declined: whatsapp_id={mask_phone(customer.whatsapp_id)} "
             f"balance={customer.balance_rupees} price={price}"
         )
         return False, customer.balance_rupees
 
     logger.info(
-        f"Wallet charged: whatsapp_id={customer.whatsapp_id} amount={price} "
+        f"Wallet charged: whatsapp_id={mask_phone(customer.whatsapp_id)} amount={price} "
         f"balance={customer.balance_rupees}"
     )
     return True, customer.balance_rupees
@@ -237,7 +236,7 @@ def charge_generation(
     customer = get_customer(db, whatsapp_id)
     if customer is None:
         logger.warning(
-            f"Wallet charge skipped — unknown customer whatsapp_id={whatsapp_id}"
+            f"Wallet charge skipped — unknown customer whatsapp_id={mask_phone(whatsapp_id)}"
         )
         return False, 0
 
@@ -271,11 +270,11 @@ def refund_generation_charge(
 
     if updated != 1:
         logger.warning(
-            f"Wallet refund skipped — unknown customer whatsapp_id={whatsapp_id}"
+            f"Wallet refund skipped — unknown customer whatsapp_id={mask_phone(whatsapp_id)}"
         )
         return False
 
     logger.info(
-        f"Wallet refunded: whatsapp_id={whatsapp_id} amount={amount}"
+        f"Wallet refunded: whatsapp_id={mask_phone(whatsapp_id)} amount={amount}"
     )
     return True

@@ -40,8 +40,7 @@ from app.models.audit_log import AuditLog
 from app.models.whatsapp_payment_order import WhatsAppPaymentOrder
 from app.services.meta_whatsapp_service import _post_message_payload, send_whatsapp_text
 from app.services.wallet_service import credit_wallet, find_customer_by_phone, get_balance
-from app.utils.logger import logger
-
+from app.utils.logger import logger, mask_phone
 _plog = logger.bind(category="payments")
 
 GRAPH_BASE = "https://graph.facebook.com/v21.0"
@@ -113,7 +112,7 @@ def is_native_pay_active(phone: str) -> bool:
 
 
 def _log_native_skip(recipient_id: str, site: str, reason: str) -> None:
-    msg = f"WhatsApp Pay native skipped: site={site} recipient={recipient_id} reason={reason}"
+    msg = f"WhatsApp Pay native skipped: site={site} recipient={mask_phone(recipient_id)} reason={reason}"
     # Gate 1 is the normal "feature off" state: INFO. Everything else means
     # the feature is on but this prompt will not be native: WARNING.
     if reason.startswith("gate1_"):
@@ -250,7 +249,7 @@ async def try_send_native_recharge(
             recipient_id, customer.whatsapp_id, order.reference_id, amount, body_text, expires_at
         )
         _plog.info(
-            f"WhatsApp Pay native attempt: site={site} recipient={recipient_id} "
+            f"WhatsApp Pay native attempt: site={site} recipient={mask_phone(recipient_id)} "
             f"ref={order.reference_id} amount_rupees={amount} config={order.configuration_name}")
         meta_error: Dict[str, Any] = {}
         sent = await _post_message_payload(
@@ -271,14 +270,14 @@ async def try_send_native_recharge(
             logger.info(f"WhatsApp Pay native sent: site={site} ref={order.reference_id}")
         else:
             _plog.warning(
-                f"WhatsApp Pay native dispatch failed: site={site} recipient={recipient_id} "
+                f"WhatsApp Pay native dispatch failed: site={site} recipient={mask_phone(recipient_id)} "
                 f"ref={order.reference_id} code={meta_error.get('code')} subcode={meta_error.get('subcode')} "
                 f"message={meta_error.get('message')!r} details={meta_error.get('details')!r} "
                 f"timeout={bool(meta_error.get('timeout'))}")
         return bool(sent)
     except Exception as e:
         db.rollback()
-        logger.error(f"WhatsApp Pay dispatch error: site={site} recipient={recipient_id}: {e}")
+        logger.error(f"WhatsApp Pay dispatch error: site={site} recipient={mask_phone(recipient_id)}: {e}")
         return False
 
 
@@ -298,12 +297,12 @@ async def send_payment_unavailable(
         return False
     _plog.error(
         f"ALERT WhatsApp Pay strict: native recharge not sent, no link emitted: "
-        f"site={site} recipient={recipient_id}")
+        f"site={site} recipient={mask_phone(recipient_id)}")
     text = f"{body_text}\n\n{PAYMENT_UNAVAILABLE_MESSAGE}" if body_text else PAYMENT_UNAVAILABLE_MESSAGE
     try:
         await send_whatsapp_text(recipient_id, text, reply_to_message_id=reply_to_message_id)
     except Exception as e:
-        logger.error(f"WhatsApp Pay strict notice failed for {recipient_id}: {e}")
+        logger.error(f"WhatsApp Pay strict notice failed for {mask_phone(recipient_id)}: {e}")
     return True
 
 
@@ -483,7 +482,7 @@ async def reconcile_order(db: Session, order: WhatsAppPaymentOrder) -> str:
         return "credit_failed"
 
     logger.info(
-        f"WhatsApp Pay credited ₹{order.amount_rupees} to {order.whatsapp_id} "
+        f"WhatsApp Pay credited ₹{order.amount_rupees} to {mask_phone(order.whatsapp_id)} "
         f"(ref={order.reference_id}, payment={pay_id})"
     )
     await _send_receipt(db, order)

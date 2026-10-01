@@ -15,8 +15,7 @@ from typing import Any, Callable, Dict, Optional
 
 from app.config import settings
 from app.services.erpnext_service import get_erpnext_service
-from app.utils.logger import logger
-
+from app.utils.logger import logger, mask_phone
 _GSTIN_RE = re.compile(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]$")
 _PLACEHOLDER_NAMES = {"", "valued customer", "jewelry business", "there", "customer"}
 
@@ -65,7 +64,7 @@ async def dispatch_payment_invoice(
                     filename=f"{invoice_name}.pdf",
                     caption="",
                 ):
-                    logger.info(f"ERPNext invoice {invoice_name} sent to {recipient_id} (payment={payment_id})")
+                    logger.info(f"ERPNext invoice {invoice_name} sent to {mask_phone(recipient_id)} (payment={payment_id})")
                     return "erpnext"
                 logger.warning(f"ERPNext invoice {invoice_name} could not be sent; sending local receipt")
         except Exception as e:  # noqa: BLE001

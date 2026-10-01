@@ -115,9 +115,9 @@ class Settings(BaseSettings):
     # message), so the dashboard limit would drop real traffic, but an
     # unlimited public endpoint invites floods and verify-token guessing.
     WEBHOOK_RATE_LIMIT_REQUESTS: int = 3000
-    # Largest webhook body accepted from a public client (Meta/Razorpay send
+    # Largest webhook body accepted from a public client (3 MB; Meta/Razorpay send
     # small JSON; media arrive by id, not inline).
-    MAX_WEBHOOK_BODY_BYTES: int = 1_000_000
+    MAX_WEBHOOK_BODY_BYTES: int = 3_000_000
 
     # --- Public host guard ---
     # Requests arriving through a public tunnel/host (e.g. ngrok) may only
