@@ -31,6 +31,8 @@ SIGNATURE_HEADER = "X-Razorpay-Signature"
 PAISE_PER_RUPEE = 100
 
 AUDIT_ACTION_PAYMENT_CAPTURED = "razorpay_payment_captured"
+# Captured payment the webhook could not match to any payer (no phone).
+AUDIT_ACTION_PAYMENT_UNMATCHED = "razorpay_payment_unmatched"
 AUDIT_RESOURCE_TYPE = "razorpay_payment"
 
 PAYMENT_TIPS_MESSAGE = (
@@ -207,6 +209,50 @@ def _already_processed(db: Session, payment_reference: str) -> bool:
         return False
 
 
+def _record_unmatched_payment(
+    db: Session, payment_reference: str, amount_paid: int, event: str
+) -> None:
+    """Keep a durable record of a captured payment with no payer phone.
+
+    Retrying cannot add a phone to the payload, so the webhook still answers
+    200 (Razorpay disables a webhook that keeps failing for 24 hours). This
+    pending audit row plus the ALERT log line let an operator find the
+    payment and credit the payer by hand. Recorded once per payment. Never
+    raises.
+    """
+    logger.error(
+        f"ALERT Razorpay payment {payment_reference} (₹{amount_paid}, event={event}) "
+        "has no payer phone and was NOT credited. Identify the payer and credit manually."
+    )
+    try:
+        exists = (
+            db.query(AuditLog.id)
+            .filter(
+                AuditLog.action == AUDIT_ACTION_PAYMENT_UNMATCHED,
+                AuditLog.resource_id == payment_reference,
+            )
+            .first()
+        )
+        if exists:
+            return
+        db.add(
+            AuditLog(
+                user_id=None,
+                action=AUDIT_ACTION_PAYMENT_UNMATCHED,
+                resource_id=payment_reference,
+                resource_type=AUDIT_RESOURCE_TYPE,
+                status="pending",
+                details=json.dumps(
+                    {"amount_paid": amount_paid, "currency": "INR", "event": event}
+                ),
+            )
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Could not record unmatched payment {payment_reference}: {e}")
+
+
 def _payment_audit_row(
     payment_reference: str,
     sender_id: str,
@@ -291,7 +337,11 @@ async def razorpay_webhook(
 
     sender_id, amount_paid, payment_reference = extracted
     if not sender_id:
-        logger.warning(f"Payment {payment_reference} processed but sender phone number not found.")
+        # Razorpay sends several events per payment; another event that did
+        # carry the phone may already have credited it.
+        if _already_processed(db, payment_reference):
+            return {"status": "already_processed"}
+        _record_unmatched_payment(db, payment_reference, amount_paid, event)
         return {"status": "missing_phone"}
 
     if _already_processed(db, payment_reference):
@@ -342,12 +392,27 @@ async def razorpay_webhook(
         if _already_processed(db, payment_reference):
             logger.info(f"Payment {payment_reference} already processed concurrently, skipping duplicate.")
             return {"status": "already_processed"}
-        logger.error(f"Payment webhook: customer provisioning conflict for {clean_sender}")
-        return {"status": "error", "message": "Customer provisioning failed"}
+        # Usually a concurrent first payment created the same customer row.
+        # The claim was rolled back too, so Razorpay's retry credits normally
+        # (and then finds the existing customer). A 200 here lost the money.
+        logger.error(
+            f"Payment webhook: customer provisioning conflict for {clean_sender}; "
+            f"payment {payment_reference} not credited yet, asking Razorpay to retry."
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Customer provisioning conflict, retry later",
+        )
     except Exception as e:
         db.rollback()
-        logger.error(f"Payment webhook: wallet credit failed for {clean_sender}: {e}")
-        return {"status": "error", "message": "Wallet credit failed"}
+        logger.error(
+            f"Payment webhook: wallet credit failed for {clean_sender}: {e}; "
+            f"payment {payment_reference} not credited yet, asking Razorpay to retry."
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Wallet credit failed, retry later",
+        )
 
     logger.info(
         f"Wallet credited ₹{amount_paid} for {clean_sender}: event={event} "

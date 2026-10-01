@@ -417,6 +417,55 @@ class RazorpayWebhookRouteTests(unittest.TestCase):
         self.assertEqual(response.json(), {"status": "missing_phone"})
         self.assertEqual(self.session.query(Customer).count(), 0)
 
+    def _audits(self, action):
+        return (
+            self.session.query(AuditLog)
+            .filter(AuditLog.action == action, AuditLog.resource_id == PAYMENT_ID)
+            .all()
+        )
+
+    def test_payment_without_phone_is_recorded_for_manual_credit_once(self):
+        for _ in range(3):  # Razorpay re-delivers the same event
+            response = self._post(_payment_captured_payload())
+            self.assertEqual(response.json(), {"status": "missing_phone"})
+
+        rows = self._audits("razorpay_payment_unmatched")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].status, "pending")
+        self.assertEqual(json.loads(rows[0].details)["amount_paid"], 500)
+        self.assertEqual(self._audits("razorpay_payment_captured"), [])
+
+    def test_phoneless_event_after_credit_is_not_flagged_unmatched(self):
+        self._post(_payment_captured_payload(notes={"sender_id": SENDER}))
+        response = self._post(_payment_captured_payload())
+
+        self.assertEqual(response.json(), {"status": "already_processed"})
+        self.assertEqual(self._audits("razorpay_payment_unmatched"), [])
+
+    def test_transient_credit_failure_returns_503_and_retry_credits_once(self):
+        self.session.add(Customer(
+            whatsapp_id=SENDER, full_name="Test", business_name="Test Gems",
+            gst_number="N/A", address="Surat", wallet_balance=100, is_registered=True,
+        ))
+        self.session.commit()
+        payload = _payment_captured_payload(notes={"sender_id": SENDER})
+
+        with patch.object(self.webhook_module, "credit_wallet", side_effect=RuntimeError("db blip")):
+            response = self._post(payload)
+        self.assertEqual(response.status_code, 503)
+        self.session.expire_all()
+        self.assertEqual(self._audits("razorpay_payment_captured"), [])  # claim rolled back
+        self.assertEqual(wallet_service.get_balance(self.session, SENDER), 100)
+
+        retry = self._post(payload)  # Razorpay's automatic retry
+        self.assertEqual((retry.status_code, retry.json()), (200, {"status": "ok"}))
+        self.assertEqual(wallet_service.get_balance(self.session, SENDER), 600)
+        self.assertEqual(len(self._audits("razorpay_payment_captured")), 1)
+
+        again = self._post(payload)
+        self.assertEqual(again.json(), {"status": "already_processed"})
+        self.assertEqual(wallet_service.get_balance(self.session, SENDER), 600)
+
     def test_successful_payment_creates_customer_and_credits_wallet(self):
         response = self._post(
             _payment_captured_payload(notes={"sender_id": SENDER}, amount=100000)
