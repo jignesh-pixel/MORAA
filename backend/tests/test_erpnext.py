@@ -8,9 +8,6 @@ backend_dir = Path(__file__).resolve().parent.parent
 if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
-load_dotenv(backend_dir / ".env")
-load_dotenv(backend_dir.parent / ".env")
-
 import httpx
 
 async def main():
@@ -62,4 +59,8 @@ async def main():
         print("==================================================\n")
 
 if __name__ == "__main__":
+    # Manual script only: load live credentials when run directly. Loading
+    # them at import time leaked backend/.env into every pytest session.
+    load_dotenv(backend_dir / ".env")
+    load_dotenv(backend_dir.parent / ".env")
     asyncio.run(main())

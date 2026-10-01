@@ -59,12 +59,18 @@ class MetaSignatureTests(unittest.TestCase):
             self.assertEqual(self._post(None)["message"], "Invalid signature")
 
     def test_missing_secret_rejected_in_production(self):
-        with patch.object(settings, "META_APP_SECRET", ""), patch.object(settings, "DEBUG", False):
+        with patch.object(settings, "META_APP_SECRET", ""), patch.object(settings, "ALLOW_UNSIGNED_WEBHOOKS", False):
             self.assertEqual(self._post(None)["message"], "Webhook not configured")
 
-    def test_missing_secret_still_accepted_in_debug(self):
-        with patch.object(settings, "META_APP_SECRET", ""), patch.object(settings, "DEBUG", True):
+    def test_missing_secret_accepted_only_with_dev_flag(self):
+        with patch.object(settings, "META_APP_SECRET", ""), patch.object(settings, "ALLOW_UNSIGNED_WEBHOOKS", True):
             self.assertEqual(self._post(None).get("status"), "ok")
+
+    def test_debug_alone_never_accepts_unsigned(self):
+        with patch.object(settings, "META_APP_SECRET", ""), \
+             patch.object(settings, "ALLOW_UNSIGNED_WEBHOOKS", False), \
+             patch.object(settings, "DEBUG", True):
+            self.assertEqual(self._post(None)["message"], "Webhook not configured")
 
     def test_verify_function_fails_closed_without_secret(self):
         with patch.object(settings, "META_APP_SECRET", ""):
@@ -98,7 +104,7 @@ class PublicHostGuardTests(unittest.TestCase):
         self.assertEqual(r.status_code, 422)
 
     def test_razorpay_webhook_allowed_publicly(self):
-        with patch.object(settings, "RAZORPAY_WEBHOOK_SECRET", ""), patch.object(settings, "DEBUG", True):
+        with patch.object(settings, "RAZORPAY_WEBHOOK_SECRET", ""), patch.object(settings, "ALLOW_UNSIGNED_WEBHOOKS", True):
             r = self.client.post("/api/payments/razorpay/webhook", json={"event": "ping"}, headers={"host": NGROK})
         self.assertEqual((r.status_code, r.json().get("status")), (200, "ignored"))
 

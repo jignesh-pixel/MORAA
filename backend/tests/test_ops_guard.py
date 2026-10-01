@@ -127,7 +127,7 @@ class DisabledTests(unittest.TestCase):
 class WebhookEndToEnd(_Patched):
     def _post(self, msg):
         body = {"object": "whatsapp_business_account", "entry": [_entry(msg)]}
-        with patch.object(settings, "META_APP_SECRET", ""), patch.object(settings, "DEBUG", True):
+        with patch.object(settings, "META_APP_SECRET", ""), patch.object(settings, "ALLOW_UNSIGNED_WEBHOOKS", True):
             return TestClient(app).post("/api/meta/webhook", json=body, headers={"host": NGROK})
 
     def test_team_text_forwarded_and_customer_logic_skipped(self):

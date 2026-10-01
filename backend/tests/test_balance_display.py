@@ -61,7 +61,7 @@ class PaymentConfirmationShowsRealBalanceTests(unittest.TestCase):
             "id": "pay_display1", "amount": 50000, "notes": {"sender_id": SENDER}}}}}
         try:
             with patch.object(settings, "RAZORPAY_WEBHOOK_SECRET", ""), \
-                 patch.object(settings, "DEBUG", True), \
+                 patch.object(settings, "ALLOW_UNSIGNED_WEBHOOKS", True), \
                  patch.object(settings, "RATE_LIMIT_ENABLED", False), \
                  patch.object(payment_routes, "send_whatsapp_text", new=AsyncMock(side_effect=capture)), \
                  patch.object(payment_routes, "send_document_to_whatsapp", new=AsyncMock(return_value=True)), \

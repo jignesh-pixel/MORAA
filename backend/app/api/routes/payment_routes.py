@@ -45,7 +45,9 @@ PAYMENT_TIPS_MESSAGE = (
 def verify_razorpay_signature(raw_body: bytes, signature_header: Optional[str]) -> bool:
     secret = (settings.RAZORPAY_WEBHOOK_SECRET or "").strip()
     if not secret:
-        return True
+        # Fail closed: nothing can be verified without the secret. The route
+        # decides separately whether the dev-only unsigned mode applies.
+        return False
     if not signature_header:
         return False
 
@@ -250,8 +252,11 @@ async def razorpay_webhook(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid Razorpay webhook signature",
             )
-    elif not settings.DEBUG:
-        logger.error("Razorpay webhook rejected: RAZORPAY_WEBHOOK_SECRET not configured and DEBUG is False.")
+    elif not settings.ALLOW_UNSIGNED_WEBHOOKS:
+        logger.error(
+            "Razorpay webhook rejected: RAZORPAY_WEBHOOK_SECRET not configured "
+            "and ALLOW_UNSIGNED_WEBHOOKS is off."
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Webhook not configured",

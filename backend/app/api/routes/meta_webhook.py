@@ -921,15 +921,13 @@ async def receive_webhook(
         signature = request.headers.get("X-Hub-Signature-256")
         if not verify_webhook_signature(raw_body, signature):
             return {"status": "error", "message": "Invalid signature"}
-    elif not settings.DEBUG:
-        # Fail closed outside DEBUG mode: an unconfigured META_APP_SECRET in
-        # a non-dev deployment must not silently accept unsigned webhook
-        # payloads. DEBUG defaults to True and stays True for local/dev use,
-        # so this does not change behavior there -- it only refuses unsigned
-        # traffic once DEBUG is turned off for a real deployment.
+    elif not settings.ALLOW_UNSIGNED_WEBHOOKS:
+        # Fail closed: with no META_APP_SECRET an unsigned payload is only
+        # accepted under the explicit development flag (refused at boot in
+        # production). DEBUG no longer relaxes this check.
         logger.error(
-            "Webhook rejected: META_APP_SECRET is not configured and DEBUG "
-            "is False -- refusing to accept an unsigned payload."
+            "Webhook rejected: META_APP_SECRET is not configured and "
+            "ALLOW_UNSIGNED_WEBHOOKS is off -- refusing an unsigned payload."
         )
         return {"status": "error", "message": "Webhook not configured"}
 

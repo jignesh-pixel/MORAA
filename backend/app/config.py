@@ -4,19 +4,43 @@ import logging
 import os
 import secrets
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _config_logger = logging.getLogger(__name__)
 
+# backend/ -- .env and logs resolve against this folder, never against the
+# process working directory (a start from another folder used to silently
+# skip .env and run on unsafe defaults).
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Images in a WhatsApp Catalog Pack (CATALOG_PACK_STYLES in
+# meta_whatsapp_service.py); a daily cap below this cannot serve one Pack.
+_PACK_IMAGE_COUNT = 6
+
+
+def _resolve_env_file() -> Optional[str]:
+    """Absolute path of backend/.env.
+
+    MORAA_ENV_FILE overrides it; an empty MORAA_ENV_FILE loads no file at all
+    (tests and the load harness use this so live secrets are never read).
+    """
+    override = os.environ.get("MORAA_ENV_FILE")
+    if override is not None:
+        return override or None
+    return str(BASE_DIR / ".env")
+
+
+ENV_FILE: Optional[str] = _resolve_env_file()
+
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables/.env file."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=ENV_FILE,
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -26,10 +50,17 @@ class Settings(BaseSettings):
     APP_NAME: str = "MORAA GemVision"
     APP_VERSION: str = "1.0.0"
     APP_DESCRIPTION: str = "AI-Powered Jewellery Image Analysis Platform"
-    DEBUG: bool = True
+    # "production" refuses to boot on unsafe config (see _enforce_safe_runtime).
+    ENVIRONMENT: Literal["development", "production"] = "development"
+    # DEBUG only controls developer conveniences (SQL echo, auto-reload,
+    # verbose tracebacks). It never relaxes a security check.
+    DEBUG: bool = False
+    # Development-only escape hatch: accept Meta/Razorpay webhooks that carry
+    # no signature when the matching secret is unset. Refused in production.
+    ALLOW_UNSIGNED_WEBHOOKS: bool = False
 
     # Server
-    HOST: str = "0.0.0.0"
+    HOST: str = "127.0.0.1"
     PORT: int = 8000
     WORKERS: int = 4
 
@@ -67,6 +98,10 @@ class Settings(BaseSettings):
     # Hosts treated as local (comma-separated). Add a LAN IP here if the
     # dashboard is opened from another machine on the network.
     LOCAL_API_HOSTS: str = "localhost,127.0.0.1,::1,0.0.0.0"
+    # Socket peer addresses treated as this machine. A request is local only
+    # when its real peer is one of these -- the Host header alone is never
+    # trusted (anyone can send "Host: localhost").
+    LOCAL_PEER_ADDRESSES: str = "127.0.0.1,::1"
 
     # --- Auth ---
     # Public self-signup is off by default; set ALLOW_SIGNUP=true to enable.
@@ -350,6 +385,8 @@ class Settings(BaseSettings):
     PREPROCESS_COMPRESSION_QUALITY: int = 85
 
     # Logging
+    # Relative values resolve against backend/ (see LOG_PATH).
+    LOG_DIR: str = "logs"
     LOG_LEVEL: str = "DEBUG"
     LOG_FORMAT: str = (
         "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
@@ -371,6 +408,54 @@ class Settings(BaseSettings):
 
     # Number of Celery worker processes (only used when not eager)
     CELERY_WORKER_CONCURRENCY: int = 2
+
+    @model_validator(mode="after")
+    def _enforce_safe_runtime(self) -> "Settings":
+        """Refuse to boot in production on unsafe config; warn in development.
+
+        Runs before the SECRET_KEY fallback below so a missing production key
+        is an error, not a silently generated one.
+        """
+        if self.ENVIRONMENT == "production":
+            problems: List[str] = []
+            if not (self.SECRET_KEY or "").strip():
+                problems.append("SECRET_KEY is not set")
+            if not self.META_APP_SECRET.strip():
+                problems.append("META_APP_SECRET is not set")
+            if not self.RAZORPAY_WEBHOOK_SECRET.strip():
+                problems.append("RAZORPAY_WEBHOOK_SECRET is not set")
+            if self.IS_SQLITE:
+                problems.append("DATABASE_URL points at SQLite")
+            if self.DEBUG:
+                problems.append("DEBUG is true")
+            if self.ALLOW_UNSIGNED_WEBHOOKS:
+                problems.append("ALLOW_UNSIGNED_WEBHOOKS is true")
+            if problems:
+                raise ValueError(
+                    "Refusing to start with ENVIRONMENT=production: "
+                    + "; ".join(problems)
+                )
+        elif self.ALLOW_UNSIGNED_WEBHOOKS:
+            _config_logger.warning(
+                "ALLOW_UNSIGNED_WEBHOOKS is on: webhooks without a signature "
+                "are accepted when their secret is unset. Development only."
+            )
+
+        if self.MAX_GENERATIONS_PER_DAY < _PACK_IMAGE_COUNT:
+            _config_logger.warning(
+                f"MAX_GENERATIONS_PER_DAY={self.MAX_GENERATIONS_PER_DAY} is "
+                f"below one Pack ({_PACK_IMAGE_COUNT} images): Pack orders "
+                "will be refused once charged."
+            )
+
+        if Path.cwd().resolve() != BASE_DIR:
+            _config_logger.warning(
+                f"Working directory is {Path.cwd()}, not {BASE_DIR}. Uploads "
+                f"and reports use paths relative to the working directory "
+                f"({self.UPLOAD_DIR}, {self.REPORT_DIR}); start the server "
+                "from backend/ so stored file paths keep resolving."
+            )
+        return self
 
     @model_validator(mode="after")
     def _default_secret_key(self) -> "Settings":
@@ -418,6 +503,17 @@ class Settings(BaseSettings):
     def REPORT_PATH(self) -> Path:
         """Return report directory as Path."""
         return Path(self.REPORT_DIR)
+
+    @property
+    def LOG_PATH(self) -> Path:
+        """Log directory; a relative LOG_DIR resolves against backend/."""
+        path = Path(self.LOG_DIR)
+        return path if path.is_absolute() else BASE_DIR / path
+
+    @property
+    def IS_PRODUCTION(self) -> bool:
+        """True when ENVIRONMENT=production."""
+        return self.ENVIRONMENT == "production"
 
 
 settings = Settings()

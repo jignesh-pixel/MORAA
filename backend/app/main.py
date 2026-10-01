@@ -25,7 +25,7 @@ from app.api.routes.health import router as health_router
 
 # Import Celery task modules so they register with the Celery app
 import app.tasks.prompt_tasks  # noqa: F401, E402
-from app.config import settings
+from app.config import ENV_FILE, settings
 from app.database import init_db
 from app.middleware.cors import setup_cors
 from app.middleware.error_handler import setup_error_handlers
@@ -42,6 +42,11 @@ async def lifespan(app: FastAPI):
     setup_logging()
     logger.info(
         f"Starting {settings.APP_NAME} v{settings.APP_VERSION}",
+        extra={"category": "system"},
+    )
+    logger.info(
+        f"Config: environment={settings.ENVIRONMENT} "
+        f"env_file={ENV_FILE or 'none'} debug={settings.DEBUG}",
         extra={"category": "system"},
     )
 
