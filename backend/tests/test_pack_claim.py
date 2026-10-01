@@ -8,6 +8,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+
+from tests.db_support import make_engine
 import app.models  # noqa: F401 -- register every model with Base.metadata
 from app.database import Base
 from app.models.whatsapp_ingestion import WhatsAppIngestion
@@ -18,8 +20,7 @@ SENDER = "919812345678"
 
 class PackClaimTests(unittest.TestCase):
     def setUp(self):
-        self.engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False},
-                                    poolclass=StaticPool)
+        self.engine = make_engine()
         Base.metadata.create_all(bind=self.engine)
         self.db = sessionmaker(bind=self.engine)()
         self.provider = AsyncMock()

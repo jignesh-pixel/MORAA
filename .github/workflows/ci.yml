@@ -19,6 +19,19 @@ jobs:
     defaults:
       run:
         working-directory: backend
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: moraa_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d moraa_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v4
 
@@ -39,6 +52,19 @@ jobs:
 
       - name: Tests (SQLite, default suite)
         run: python -m pytest -q
+
+      - name: Tests (PostgreSQL, same suite plus PostgreSQL-only tests)
+        # Every test database becomes its own schema in a real PostgreSQL, so row locks,
+        # strict typing and foreign keys are exercised. TEST_DATABASE_URL points at the
+        # service container above (db_support refuses non-local hosts).
+        env:
+          MORAA_TEST_DB: postgres
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/moraa_test
+        run: |
+          python -m pytest -q -rs | tee pg-test-output.txt
+          if grep -q "PostgreSQL-only test" pg-test-output.txt; then
+            echo "A PostgreSQL-only test was skipped in the PostgreSQL run"; exit 1
+          fi
 
       - name: Dependency audit (pip-audit)
         # Audits the exact pinned versions. Accepted findings must be listed with a reason in

@@ -15,6 +15,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+
+from tests.db_support import make_engine
 from app.config import settings
 from app.database import Base
 from app.main import app
@@ -328,8 +330,7 @@ class PrevalidationBoundsTests(unittest.TestCase):
 # ── 3/5. Paid catalog failure + startup recovery ───────────────────────────
 class PaidOrderSafetyTests(unittest.TestCase):
     def setUp(self):
-        self.engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False},
-                                    poolclass=StaticPool)
+        self.engine = make_engine()
         Base.metadata.create_all(bind=self.engine)
         self.Session = sessionmaker(bind=self.engine)
         self.db = self.Session()

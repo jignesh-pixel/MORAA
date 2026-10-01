@@ -90,7 +90,9 @@ def money_once_index_present() -> Optional[bool]:
     """True/False when the index can be checked, None for other dialects."""
     dialect = engine.dialect.name
     if dialect == "postgresql":
-        query = text("SELECT 1 FROM pg_indexes WHERE indexname = :name")
+        query = text(
+            "SELECT 1 FROM pg_indexes WHERE indexname = :name AND schemaname = current_schema()"
+        )
     elif dialect == "sqlite":
         query = text("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = :name")
     else:
