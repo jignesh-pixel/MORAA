@@ -26,7 +26,7 @@ from app.api.routes.health import router as health_router
 # Import Celery task modules so they register with the Celery app
 import app.tasks.prompt_tasks  # noqa: F401, E402
 from app.config import ENV_FILE, settings
-from app.database import MONEY_ONCE_INDEX, init_db, money_once_index_present
+from app.database import MONEY_ONCE_INDEX, ensure_schema_ready, money_once_index_present
 from app.middleware.cors import setup_cors
 from app.middleware.error_handler import setup_error_handlers
 from app.middleware.logging_middleware import setup_logging_middleware
@@ -45,8 +45,9 @@ async def lifespan(app: FastAPI):
         f"env_file={ENV_FILE or 'none'} debug={settings.DEBUG}")
 
     # Initialize database
-    init_db()
-    logger.bind(category="system").info("Database initialized")
+    # The schema is owned by Alembic: verify it, never create_all at startup.
+    schema = ensure_schema_ready()
+    logger.bind(category="system").info(f"Database schema at revision {schema.current}")
 
     # Payment credits and refunds rely on this index to move money at most
     # once. Without it every claim silently succeeds twice under a race.
