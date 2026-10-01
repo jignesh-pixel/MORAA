@@ -20,6 +20,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+from sqlalchemy import or_
 
 from app.config import settings
 from app.utils.logger import logger
@@ -1160,23 +1161,40 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         return False
 
     try:
+        # Atomic claim (same rule as before: anything not already processing
+        # may run). A read-then-write let two concurrent starts both claim the
+        # order and pay for every style twice; now only one UPDATE matches.
+        claimed = (
+            db.query(WhatsAppIngestion)
+            .filter(
+                WhatsAppIngestion.id == ingestion_id,
+                or_(
+                    WhatsAppIngestion.status.is_(None),
+                    WhatsAppIngestion.status != "processing",
+                ),
+            )
+            .update(
+                {WhatsAppIngestion.status: "processing", WhatsAppIngestion.error_message: None},
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        if claimed != 1:
+            exists = db.query(WhatsAppIngestion.id).filter(
+                WhatsAppIngestion.id == ingestion_id
+            ).first()
+            if exists is None:
+                logger.error(f"Catalog pack generation: ingestion not found: {ingestion_id}")
+            else:
+                logger.info(
+                    f"Catalog pack generation: skipping ingestion {ingestion_id} — already in progress"
+                )
+            return False
+
         ingestion = db.query(WhatsAppIngestion).filter(
             WhatsAppIngestion.id == ingestion_id
         ).first()
-
-        if not ingestion:
-            logger.error(f"Catalog pack generation: ingestion not found: {ingestion_id}")
-            return False
-
-        if ingestion.status == "processing":
-            logger.info(
-                f"Catalog pack generation: skipping ingestion {ingestion_id} — already in progress"
-            )
-            return False
-
-        ingestion.status = "processing"
-        ingestion.error_message = None
-        db.commit()
+        db.refresh(ingestion)
 
         image_record = db.query(Image).filter(Image.id == ingestion.image_id).first()
         if not image_record:
