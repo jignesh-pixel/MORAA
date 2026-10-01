@@ -1,0 +1,7 @@
+# MORAA GemVision - development, test and CI tooling (not installed in production).
+-r requirements.txt
+pytest==8.3.4
+# Throw-away local PostgreSQL for the PostgreSQL test suites (tests/pg_support.py).
+pgserver==0.1.4
+ruff==0.16.9
+pip-audit==2.10.1
