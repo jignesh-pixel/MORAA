@@ -46,10 +46,7 @@ class AuthService:
             full_name=request.full_name,
         )
 
-        logger.info(
-            f"New user registered: {user.username} ({user.email})",
-            extra={"category": "auth"},
-        )
+        logger.bind(category="auth").info(f"New user registered: {user.username} ({user.email})")
 
         # Generate tokens
         return self._generate_auth_response(user)
@@ -66,9 +63,7 @@ class AuthService:
         if not user.is_active:
             raise ValueError("Account is deactivated")
 
-        logger.info(
-            f"User logged in: {user.username}", extra={"category": "auth"}
-        )
+        logger.bind(category="auth").info(f"User logged in: {user.username}")
 
         return self._generate_auth_response(user)
 

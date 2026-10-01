@@ -122,10 +122,18 @@ class ConfigAndAlertTests(unittest.TestCase):
             db.add(WhatsAppIngestion(external_user_id=SENDER, external_message_id=f"w{i}",
                                      external_media_id="m", channel="whatsapp", status=status))
         db.commit()
-        with patch.object(generation_metrics.logger, "warning") as warn:
+        # Capture what is really logged (the alert uses logger.bind(...), so
+        # patching logger.warning would not see it).
+        records = []
+        sink_id = generation_metrics.logger.add(lambda m: records.append(m.record), level="WARNING")
+        try:
             report = generation_metrics.alert_if_failure_rate_exceeded(db)
+        finally:
+            generation_metrics.logger.remove(sink_id)
         self.assertTrue(report.exceeds_target)
-        self.assertIn("GENERATION_FAILURE_RATE_ALERT", warn.call_args[0][0])
+        alerts = [r for r in records if "GENERATION_FAILURE_RATE_ALERT" in r["message"]]
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["extra"].get("category"), "alert")
         db.close()
         engine.dispose()
 

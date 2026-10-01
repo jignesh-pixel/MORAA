@@ -40,19 +40,13 @@ async def lifespan(app: FastAPI):
     """Application lifespan: startup and shutdown events."""
     # Startup
     setup_logging()
-    logger.info(
-        f"Starting {settings.APP_NAME} v{settings.APP_VERSION}",
-        extra={"category": "system"},
-    )
-    logger.info(
-        f"Config: environment={settings.ENVIRONMENT} "
-        f"env_file={ENV_FILE or 'none'} debug={settings.DEBUG}",
-        extra={"category": "system"},
-    )
+    logger.bind(category="system").info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
+    logger.bind(category="system").info(f"Config: environment={settings.ENVIRONMENT} "
+        f"env_file={ENV_FILE or 'none'} debug={settings.DEBUG}")
 
     # Initialize database
     init_db()
-    logger.info("Database initialized", extra={"category": "system"})
+    logger.bind(category="system").info("Database initialized")
 
     # Payment credits and refunds rely on this index to move money at most
     # once. Without it every claim silently succeeds twice under a race.
@@ -63,12 +57,12 @@ async def lifespan(app: FastAPI):
         )
         if settings.IS_PRODUCTION:
             raise RuntimeError(message)
-        logger.error(message, extra={"category": "system"})
+        logger.bind(category="system").error(message)
 
     # Ensure upload and report directories exist
     settings.UPLOAD_PATH.mkdir(parents=True, exist_ok=True)
     settings.REPORT_PATH.mkdir(parents=True, exist_ok=True)
-    logger.info("Storage directories ready", extra={"category": "system"})
+    logger.bind(category="system").info("Storage directories ready")
 
     # Storage hygiene — sweep upload directories that have no matching
     # Image record (crash/aborted-upload leftovers) so unused files do not
@@ -87,15 +81,10 @@ async def lifespan(app: FastAPI):
             settings.UPLOAD_PATH, known_ids
         )
         if cleaned:
-            logger.info(
-                f"Storage sweep: removed {cleaned} orphaned upload "
-                f"director(ies)",
-                extra={"category": "system"},
-            )
+            logger.bind(category="system").info(f"Storage sweep: removed {cleaned} orphaned upload "
+                f"director(ies)")
     except Exception as e:
-        logger.warning(
-            f"Storage sweep skipped: {e}", extra={"category": "system"}
-        )
+        logger.bind(category="system").warning(f"Storage sweep skipped: {e}")
 
     # Paid-order recovery (best-effort, non-fatal): background jobs do not
     # survive a restart, so a paid order left queued/processing longer than
@@ -106,14 +95,9 @@ async def lifespan(app: FastAPI):
 
         recovered = await recover_stuck_paid_orders(STUCK_WHITE_AFTER)
         if recovered:
-            logger.warning(
-                f"Recovered {recovered} stuck paid order(s) at startup",
-                extra={"category": "system"},
-            )
+            logger.bind(category="system").warning(f"Recovered {recovered} stuck paid order(s) at startup")
     except Exception as e:
-        logger.warning(
-            f"Stuck paid order recovery skipped: {e}", extra={"category": "system"}
-        )
+        logger.bind(category="system").warning(f"Stuck paid order recovery skipped: {e}")
 
     # Image provider startup diagnosis (best-effort, non-fatal). Probes the
     # configured Gemini image model once at boot and logs an actionable cause
@@ -126,10 +110,7 @@ async def lifespan(app: FastAPI):
 
         await log_startup_image_provider_diagnosis()
     except Exception as e:
-        logger.warning(
-            f"Image provider startup diagnosis skipped: {e}",
-            extra={"category": "system"},
-        )
+        logger.bind(category="system").warning(f"Image provider startup diagnosis skipped: {e}")
 
     # WhatsApp Pay reconcile sweep (best-effort): credits in-chat payments
     # whose webhook was missed. Loop is idle while WHATSAPP_PAY_ENABLED=false.
@@ -141,19 +122,14 @@ async def lifespan(app: FastAPI):
 
         reconcile_task = asyncio.create_task(run_reconcile_sweep_forever())
     except Exception as e:
-        logger.warning(
-            f"WhatsApp Pay reconcile sweep not started: {e}", extra={"category": "system"}
-        )
+        logger.bind(category="system").warning(f"WhatsApp Pay reconcile sweep not started: {e}")
 
     yield
 
     # Shutdown
     if reconcile_task is not None:
         reconcile_task.cancel()
-    logger.info(
-        f"Shutting down {settings.APP_NAME}",
-        extra={"category": "system"},
-    )
+    logger.bind(category="system").info(f"Shutting down {settings.APP_NAME}")
 
 
 # Create FastAPI application

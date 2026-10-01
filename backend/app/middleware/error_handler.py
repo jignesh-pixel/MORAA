@@ -16,11 +16,11 @@ def setup_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(request: Request, exc: StarletteHTTPException):
         """Handle HTTP exceptions with consistent response format."""
-        logger.warning(
-            "HTTP {}: {}",
-            exc.status_code,
-            str(exc.detail),
-            extra={"category": "api", "path": str(request.url)},
+        # Path only: the full URL can carry secrets in its query string
+        # (e.g. Meta's hub.verify_token).
+        path = request.scope.get("path")
+        logger.bind(category="api", path=path).warning(
+            "HTTP {}: {} {}", exc.status_code, str(exc.detail), path
         )
         return JSONResponse(
             status_code=exc.status_code,
@@ -41,10 +41,9 @@ def setup_error_handlers(app: FastAPI) -> None:
             message = error.get("msg", "Validation error")
             errors.append({"field": field, "message": message})
 
-        logger.warning(
-            "Validation error: {}",
-            errors,
-            extra={"category": "api", "path": str(request.url)},
+        path = request.scope.get("path")
+        logger.bind(category="api", path=path).warning(
+            "Validation error on {}: {}", path, errors
         )
 
         return JSONResponse(
@@ -59,10 +58,9 @@ def setup_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(Exception)
     async def general_exception_handler(request: Request, exc: Exception):
         """Handle unhandled exceptions gracefully."""
-        logger.opt(exception=exc).error(
-            "Unhandled exception: {}",
-            repr(exc),
-            extra={"category": "api", "path": str(request.url)},
+        path = request.scope.get("path")
+        logger.bind(category="api", path=path).opt(exception=exc).error(
+            "Unhandled exception on {}: {}", path, repr(exc)
         )
         return JSONResponse(
             status_code=500,

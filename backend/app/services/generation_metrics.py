@@ -80,10 +80,7 @@ def alert_if_failure_rate_exceeded(
     """
     report = compute_generation_failure_rate(db, window_hours=window_hours)
     if report.exceeds_target:
-        logger.warning(
-            f"GENERATION_FAILURE_RATE_ALERT rate={report.failure_rate:.2%} "
+        logger.bind(category="alert").warning(f"GENERATION_FAILURE_RATE_ALERT rate={report.failure_rate:.2%} "
             f"target={TARGET_FAILURE_RATE:.0%} failed={report.failed_attempts} "
-            f"total={report.total_attempts} window_hours={window_hours}",
-            extra={"category": "alert"},
-        )
+            f"total={report.total_attempts} window_hours={window_hours}")
     return report

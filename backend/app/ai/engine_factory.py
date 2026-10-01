@@ -45,8 +45,7 @@ def create_engine(engine_type: str = "") -> AIEngine:
 
     engine_cls = _ENGINE_REGISTRY.get(key)
     if engine_cls is None:
-        logger.warning(
-            f"Unknown AI engine type '{key}', falling back to 'mock'. "
+        logger.bind(category="system").warning(f"Unknown AI engine type '{key}', falling back to 'mock'. "
             f"Available: {list(_ENGINE_REGISTRY.keys())}"
         )
         engine_cls = MockAIEngine
@@ -54,7 +53,5 @@ def create_engine(engine_type: str = "") -> AIEngine:
     engine = engine_cls()
     logger.info(
         f"Created AI engine: {engine.engine_name} v{engine.engine_version} "
-        f"(type='{key}')",
-        extra={"category": "system"},
-    )
+        f"(type='{key}')")
     return engine

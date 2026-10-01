@@ -1,18 +1,29 @@
 """Logging configuration using loguru for structured logs."""
 
 import sys
-from pathlib import Path
 
 from loguru import logger
 
 from app.config import settings
 
 
+def mask_phone(value: object) -> str:
+    """Mask a phone number / WhatsApp id for logs: '919812345678' -> '91******5678'.
+
+    Keeps enough to correlate a customer's log lines without writing the full
+    number (personal data) into log files.
+    """
+    digits = str(value or "")
+    if len(digits) <= 6:
+        return "*" * len(digits)
+    return f"{digits[:2]}{'*' * (len(digits) - 6)}{digits[-4:]}"
+
+
 def setup_logging() -> None:
     """Configure application-wide logging."""
 
     # Remove default handler
-    logger.remove()
+    logger.bind(category="system").remove()
 
     # Console handler
     logger.add(
@@ -24,9 +35,9 @@ def setup_logging() -> None:
         diagnose=settings.DEBUG,
     )
 
-    # File handler - error logs
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
+    # File handler - error logs (LOG_PATH is absolute: backend/logs by default)
+    log_dir = settings.LOG_PATH
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     logger.add(
         log_dir / "error_{time:YYYY-MM-DD}.log",
@@ -36,7 +47,9 @@ def setup_logging() -> None:
         retention="30 days",
         compression="gz",
         backtrace=True,
-        diagnose=True,
+        # diagnose=True wrote every local variable (payment payloads, tokens,
+        # phone numbers) into the error log on each exception.
+        diagnose=False,
     )
 
     # File handler - all logs
@@ -69,4 +82,4 @@ def setup_logging() -> None:
         filter=lambda record: record["extra"].get("category") == "api",
     )
 
-    logger.info("Logging configured successfully", extra={"category": "system"})
+    logger.info("Logging configured successfully")

@@ -22,10 +22,12 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         start_time = time.time()
 
         # Log request
-        logger.info(
-            f"→ [{request_id}] {request.method} {request.url.path}",
-            extra={"category": "api"},
-        )
+        # scope["path"] is the routed path (request.url is rebuilt from the
+        # Host header). Values are passed as arguments, never formatted into
+        # the template, so a path containing "{x}" cannot break logging.
+        path = request.scope.get("path", "")
+        api_log = logger.bind(category="api")
+        api_log.info("→ [{}] {} {}", request_id, request.method, path)
 
         try:
             response = await call_next(request)
@@ -34,10 +36,9 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             duration_ms = (time.time() - start_time) * 1000
 
             # Log response
-            logger.info(
-                f"← [{request_id}] {request.method} {request.url.path} "
-                f"→ {response.status_code} ({duration_ms:.1f}ms)",
-                extra={"category": "api"},
+            api_log.info(
+                "← [{}] {} {} → {} ({:.1f}ms)",
+                request_id, request.method, path, response.status_code, duration_ms,
             )
 
             # Add request ID to response headers
@@ -46,10 +47,9 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
         except Exception as e:
             duration_ms = (time.time() - start_time) * 1000
-            logger.error(
-                f"✗ [{request_id}] {request.method} {request.url.path} "
-                f"→ ERROR ({duration_ms:.1f}ms): {str(e)}",
-                extra={"category": "api"},
+            api_log.error(
+                "✗ [{}] {} {} → ERROR ({:.1f}ms): {}",
+                request_id, request.method, path, duration_ms, str(e),
             )
             raise
 

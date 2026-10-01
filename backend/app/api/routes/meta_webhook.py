@@ -89,7 +89,7 @@ from app.services.wallet_service import (
     price_per_image,
     refund_generation_charge,
 )
-from app.utils.logger import logger
+from app.utils.logger import logger, mask_phone
 
 router = APIRouter(prefix="/api/meta", tags=["Meta WhatsApp Webhook"])
 
@@ -143,14 +143,14 @@ def _ensure_wallet_row(db: Session, sender: str) -> Optional[Customer]:
         )
         db.add(cust)
         db.commit()
-        logger.info(f"Created unregistered wallet row for native pay: sender={sender}")
+        logger.info(f"Created unregistered wallet row for native pay: sender={mask_phone(sender)}")
         return cust
     except IntegrityError:
         db.rollback()  # concurrent create won; read it back
         return find_customer_by_phone(db, sender)
     except Exception as e:
         db.rollback()
-        logger.error(f"Wallet row creation failed for {sender}: {e}")
+        logger.error(f"Wallet row creation failed for {mask_phone(sender)}: {e}")
         return None
 
 
@@ -565,10 +565,10 @@ async def _handle_registration_flow(db: Session, event: Dict[str, Any]) -> bool:
             cust = None
         except Exception as e:
             db.rollback()
-            logger.error(f"Registration Flow save failed for {sender}: {e}")
+            logger.error(f"Registration Flow save failed for {mask_phone(sender)}: {e}")
             return False
     if cust is None:
-        logger.error(f"Registration Flow could not be saved for {sender}")
+        logger.error(f"Registration Flow could not be saved for {mask_phone(sender)}")
         return False
 
     # GST first: "You're all set" is sent only once the GSTIN is resolved
@@ -756,7 +756,7 @@ async def _handle_product_choice(
 
     ingestion = db.query(WhatsAppIngestion).filter(WhatsAppIngestion.id == ingestion_id).first()
     if ingestion is None or not _same_sender(ingestion.external_user_id, sender):
-        logger.warning(f"Product choice for unknown/foreign ingestion: id={ingestion_id} sender={sender}")
+        logger.warning(f"Product choice for unknown/foreign ingestion: id={ingestion_id} sender={mask_phone(sender)}")
         await send_whatsapp_text(recipient_id=sender, message_text=UNKNOWN_CHOICE_MESSAGE)
         return None
     quote_id = ingestion.external_message_id
@@ -963,7 +963,8 @@ async def receive_webhook(
                 sender = event.get("sender", "")
                 raw_text = event.get("body", "").strip()
                 lower_text = raw_text.lower()
-                logger.info("Text message received: sender={} text='{}'", sender, raw_text)
+                # Never log the body: registration replies carry name, GSTIN and address.
+                logger.info("Text message received: sender={} chars={}", mask_phone(sender), len(raw_text or ""))
 
                 # After "Re-enter GSTIN" the next text is the GSTIN itself
                 # (always False unless GST_VERIFICATION_ENABLED).
@@ -1004,7 +1005,7 @@ async def receive_webhook(
                             continue
                         logger.warning(
                             "Registration Flow not sent (unconfigured or rejected by Meta) — "
-                            "falling back to text registration: sender={}", sender
+                            "falling back to text registration: sender={}", mask_phone(sender)
                         )
                     await send_whatsapp_text(sender, REGISTRATION_REQUEST_MESSAGE)
                     continue

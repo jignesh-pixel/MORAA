@@ -43,10 +43,7 @@ def get_analysis_pipeline() -> AnalysisPipeline:
     if _pipeline is None:
         engine = create_engine()
         _pipeline = AnalysisPipeline(engine)
-        logger.info(
-            f"Analysis pipeline initialised: {engine.engine_name} v{engine.engine_version}",
-            extra={"category": "system"},
-        )
+        logger.bind(category="system").info(f"Analysis pipeline initialised: {engine.engine_name} v{engine.engine_version}")
     return _pipeline
 
 

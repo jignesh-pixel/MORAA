@@ -20,6 +20,9 @@ engine = create_engine(
     echo=settings.DEBUG,
     connect_args={"check_same_thread": False} if settings.IS_SQLITE else {},
     pool_pre_ping=True,
+    # Exception messages otherwise embed every bound value (customer names,
+    # phone numbers, GSTINs, addresses) and those messages are logged.
+    hide_parameters=True,
 )
 
 # Enable WAL mode for SQLite for better concurrency
