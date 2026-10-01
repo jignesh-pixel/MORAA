@@ -144,6 +144,33 @@ class PublicHostGuardTests(unittest.TestCase):
                                      headers={"host": "localhost"})
             self.assertEqual(r.status_code, 200)
 
+    def test_host_header_path_injection_rejected(self):
+        # Starlette rebuilds request.url from Host: "x/api/meta/webhook#" used
+        # to make the guard see a webhook path while the router served
+        # /api/history to a remote peer.
+        with patch.object(settings, "LOCAL_PEER_ADDRESSES", "127.0.0.1,::1"):
+            for host in ("x/api/meta/webhook#", "x/api/meta/webhook?", "a b", "x@y", "h:po"):
+                r = self.client.get("/api/history", headers={"host": host})
+                self.assertEqual(r.status_code, 400, host)
+            r = self.client.get("/api/history", headers={"host": NGROK})
+            self.assertEqual(r.status_code, 404)
+
+    def test_empty_or_duplicate_proxy_header_still_public(self):
+        for headers in ([("host", "localhost:8000"), ("x-forwarded-for", "")],
+                        [("host", "localhost:8000"), ("x-real-ip", "203.0.113.9")],
+                        [("host", "localhost:8000"), ("FORWARDED", "for=203.0.113.9")]):
+            r = self.client.get("/api/history", headers=headers)
+            self.assertEqual(r.status_code, 404, headers)
+
+    def test_oversized_public_webhook_body_refused(self):
+        with patch.object(settings, "MAX_WEBHOOK_BODY_BYTES", 1000):
+            r = self.client.post("/api/meta/webhook", content=b"{" + b" " * 2000 + b"}",
+                                 headers={"host": NGROK, "content-type": "application/json"})
+            self.assertEqual(r.status_code, 413)
+            r = self.client.post("/api/meta/webhook", content=b"{}",
+                                 headers={"host": NGROK, "content-type": "application/json"})
+            self.assertNotEqual(r.status_code, 413)
+
     def test_peer_classification(self):
         from types import SimpleNamespace
 

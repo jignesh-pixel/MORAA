@@ -14,6 +14,7 @@ client, so tunnelled traffic stays public.
 """
 
 import ipaddress
+import re
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -28,7 +29,21 @@ PUBLIC_ALLOWED_PATHS = frozenset({
 })
 
 # Headers a tunnel/reverse proxy adds; a direct local request never has them.
-_PROXY_HEADERS = ("x-forwarded-for", "x-forwarded-host", "forwarded")
+_PROXY_HEADERS = frozenset({b"x-forwarded-for", b"x-forwarded-host", b"forwarded", b"x-real-ip"})
+
+# A Host header is a name or IP literal with an optional port, nothing else.
+# Starlette builds request.url from the Host header, so "x/api/meta/webhook#"
+# used to make request.url.path look like a webhook while the router served
+# a different route. Anything else is rejected outright.
+_VALID_HOST = re.compile(r"^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(:\d{1,5})?$")
+
+
+def routed_path(request: Request) -> str:
+    """The path the router matches (scope["path"]), never derived from Host.
+
+    Normalised without a trailing slash so it compares with PUBLIC_ALLOWED_PATHS.
+    """
+    return (request.scope.get("path") or "/").rstrip("/") or "/"
 
 
 def _hostname(host_header: str) -> str:
@@ -57,26 +72,57 @@ def _is_local_peer(request: Request) -> bool:
     return address.is_loopback or bool(mapped and mapped.is_loopback)
 
 
+def _has_proxy_header(request: Request) -> bool:
+    """True if any proxy header is present at all, even empty or duplicated."""
+    return any(name.lower() in _PROXY_HEADERS for name, _ in request.scope.get("headers", []))
+
+
 def is_public_request(request: Request) -> bool:
     if not _is_local_peer(request):
         return True
     local_hosts = {h.strip().lower() for h in settings.LOCAL_API_HOSTS.split(",") if h.strip()}
     if _hostname(request.headers.get("host", "")) not in local_hosts:
         return True
-    return any(request.headers.get(h) for h in _PROXY_HEADERS)
+    return _has_proxy_header(request)
+
+
+def _content_length(request: Request) -> int:
+    try:
+        return int(request.headers.get("content-length") or 0)
+    except ValueError:
+        return -1
 
 
 class PublicHostGuardMiddleware(BaseHTTPMiddleware):
+    """HTTP only: BaseHTTPMiddleware does not see websocket scopes, and the
+    app has no websocket routes. Add websocket handling here before adding any.
+    """
+
     async def dispatch(self, request: Request, call_next):
+        host = request.headers.get("host", "")
+        if host and not _VALID_HOST.match(host):
+            logger.bind(category="api").warning(
+                "Public host guard: rejected malformed Host header {!r}", host[:100]
+            )
+            return JSONResponse(status_code=400, content={"detail": "Invalid Host header"})
+
         if settings.PUBLIC_HOST_GUARD_ENABLED and is_public_request(request):
-            path = request.url.path.rstrip("/") or "/"
+            path = routed_path(request)
             if path not in PUBLIC_ALLOWED_PATHS:
-                logger.warning(
-                    f"Public host guard: blocked {request.method} {request.url.path} "
-                    f"host={request.headers.get('host', '')}",
-                    extra={"category": "api"},
+                logger.bind(category="api").warning(
+                    "Public host guard: blocked {} {} host={!r}",
+                    request.method, request.scope.get("path"), host[:100],
                 )
                 return JSONResponse(status_code=404, content={"detail": "Not Found"})
+            # Webhook payloads are small JSON; refuse oversized or malformed
+            # bodies before the route reads them into memory.
+            length = _content_length(request)
+            if length < 0 or length > settings.MAX_WEBHOOK_BODY_BYTES:
+                logger.bind(category="api").warning(
+                    "Public host guard: refused webhook body content-length={}",
+                    request.headers.get("content-length"),
+                )
+                return JSONResponse(status_code=413, content={"detail": "Payload too large"})
         return await call_next(request)
 
 

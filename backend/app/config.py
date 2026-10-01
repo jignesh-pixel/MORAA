@@ -110,6 +110,14 @@ class Settings(BaseSettings):
     RATE_LIMIT_ENABLED: bool = True
     RATE_LIMIT_REQUESTS: int = 100
     RATE_LIMIT_WINDOW_SECONDS: int = 60
+    # The public webhook paths get their own, much larger per-IP budget:
+    # Meta and Razorpay send from few IPs (several status callbacks per
+    # message), so the dashboard limit would drop real traffic, but an
+    # unlimited public endpoint invites floods and verify-token guessing.
+    WEBHOOK_RATE_LIMIT_REQUESTS: int = 3000
+    # Largest webhook body accepted from a public client (Meta/Razorpay send
+    # small JSON; media arrive by id, not inline).
+    MAX_WEBHOOK_BODY_BYTES: int = 1_000_000
 
     # --- Public host guard ---
     # Requests arriving through a public tunnel/host (e.g. ngrok) may only
