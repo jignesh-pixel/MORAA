@@ -79,6 +79,13 @@ class FormatAndParsingTests(unittest.TestCase):
         with patch.object(settings, "GST_PROVIDER", "mock"), patch.object(settings, "DEBUG", True):
             self.assertIsInstance(gst.get_gst_provider(), gst.MockGstProvider)
 
+    def test_mock_provider_never_runs_in_production(self):
+        # The mock marks every well-formed GSTIN verified; DEBUG cannot
+        # re-enable it in production.
+        with patch.object(settings, "GST_PROVIDER", "mock"), patch.object(settings, "DEBUG", True), \
+             patch.object(settings, "ENVIRONMENT", "production"):
+            self.assertIsInstance(gst.get_gst_provider(), gst.NoGstProvider)
+
 
 REG_FORM = "• Name: Anurag Mehta\n• Brand Name: Moraa Jewels\n• City: Surat\n• GSTIN (Optional): {gst}"
 

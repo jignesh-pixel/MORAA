@@ -1,6 +1,9 @@
 """Phase 0 / U1: config loads from an absolute path and refuses unsafe production boots."""
 
+import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from pydantic import ValidationError
@@ -53,8 +56,38 @@ class EnvFileResolutionTests(unittest.TestCase):
             self.assertIsNone(config_module._resolve_env_file())
 
     def test_explicit_override_used(self):
-        with patch.dict("os.environ", {"MORAA_ENV_FILE": "/tmp/test.env"}):
-            self.assertEqual(config_module._resolve_env_file(), "/tmp/test.env")
+        with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as fh:
+            fh.write("ENVIRONMENT=development\n")
+        try:
+            with patch.dict("os.environ", {"MORAA_ENV_FILE": fh.name}):
+                self.assertEqual(config_module._resolve_env_file(), str(Path(fh.name)))
+        finally:
+            os.remove(fh.name)
+
+    def test_missing_override_file_is_an_error_not_silent_defaults(self):
+        with patch.dict("os.environ", {"MORAA_ENV_FILE": "definitely-missing.env"}):
+            with self.assertRaises(RuntimeError) as ctx:
+                config_module._resolve_env_file()
+        # Relative override resolves against backend/, not the working directory.
+        self.assertIn(str(BASE_DIR / "definitely-missing.env"), str(ctx.exception))
+
+    def test_test_suite_never_loads_the_live_env_file(self):
+        self.assertIsNone(config_module.ENV_FILE)
+
+    def test_environment_loaded_from_env_file(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as fh:
+            fh.write("ENVIRONMENT=production\nSECRET_KEY=" + "s" * 40 + "\n"
+                     "META_APP_SECRET=m\nRAZORPAY_WEBHOOK_SECRET=r\n"
+                     "DATABASE_URL=postgresql://u:p@h:5432/d\nDEBUG=true\nDEBUG=false\n")
+        try:
+            # conftest exports a test DATABASE_URL; process env outranks the file.
+            with patch.dict("os.environ", {}) as env:
+                env.pop("DATABASE_URL", None)
+                s = Settings(_env_file=fh.name)
+            self.assertTrue(s.IS_PRODUCTION)
+            self.assertFalse(s.DEBUG)  # duplicate keys: the last one wins
+        finally:
+            os.remove(fh.name)
 
 
 class ProductionGuardTests(unittest.TestCase):
@@ -77,6 +110,19 @@ class ProductionGuardTests(unittest.TestCase):
                 with self.assertRaises(ValidationError) as ctx:
                     _settings(**override)
                 self.assertIn(message, str(ctx.exception))
+
+    def test_short_production_secret_key_refused(self):
+        with self.assertRaises(ValidationError) as ctx:
+            _settings(SECRET_KEY="short")
+        self.assertIn("shorter than 32", str(ctx.exception))
+
+    def test_refusal_never_echoes_secret_values(self):
+        with self.assertRaises(ValidationError) as ctx:
+            _settings(META_APP_SECRET="CANARY-META-VALUE", RAZORPAY_WEBHOOK_SECRET="",
+                      SECRET_KEY="CANARY-SECRET-KEY-" + "x" * 30)
+        text = str(ctx.exception)
+        self.assertNotIn("CANARY", text)
+        self.assertIn("RAZORPAY_WEBHOOK_SECRET is not set", text)
 
     def test_missing_production_secret_key_is_not_silently_generated(self):
         with self.assertRaises(ValidationError):

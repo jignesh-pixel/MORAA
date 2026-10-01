@@ -154,8 +154,9 @@ _PROVIDERS = {"none": NoGstProvider, "mock": MockGstProvider}
 
 def get_gst_provider() -> GstProvider:
     name = str(getattr(settings, "GST_PROVIDER", "none") or "none").strip().lower()
-    if name == "mock" and not settings.DEBUG:
-        logger.warning("GST_PROVIDER=mock ignored because DEBUG is false")
+    if name == "mock" and (settings.IS_PRODUCTION or not settings.DEBUG):
+        # The mock marks every well-formed GSTIN as verified: development only.
+        logger.warning("GST_PROVIDER=mock ignored (needs DEBUG and a non-production ENVIRONMENT)")
         name = "none"
     return _PROVIDERS.get(name, NoGstProvider)()
 

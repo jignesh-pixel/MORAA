@@ -103,6 +103,25 @@ class PublicHostGuardTests(unittest.TestCase):
         r = self.client.post("/api/generate-image", json={}, headers={"host": "localhost:8000"})
         self.assertEqual(r.status_code, 422)
 
+    def test_razorpay_unsigned_rejected_without_dev_flag_even_in_debug(self):
+        from app.api.routes.payment_routes import verify_razorpay_signature
+
+        with patch.object(settings, "RAZORPAY_WEBHOOK_SECRET", ""), \
+             patch.object(settings, "ALLOW_UNSIGNED_WEBHOOKS", False), \
+             patch.object(settings, "DEBUG", True):
+            r = self.client.post("/api/payments/razorpay/webhook", json={"event": "payment.captured"},
+                                 headers={"host": NGROK})
+            self.assertEqual(r.status_code, 400)
+            self.assertFalse(verify_razorpay_signature(b"{}", "anything"))
+        with patch.object(settings, "RAZORPAY_WEBHOOK_SECRET", "   "):
+            self.assertFalse(verify_razorpay_signature(b"{}", "anything"))
+
+    def test_whitespace_meta_secret_counts_as_unset(self):
+        from app.services import meta_whatsapp_service as mws_mod
+
+        with patch.object(settings, "META_APP_SECRET", "   "):
+            self.assertFalse(mws_mod.verify_webhook_signature(b"body", "sha256=abc"))
+
     def test_razorpay_webhook_allowed_publicly(self):
         with patch.object(settings, "RAZORPAY_WEBHOOK_SECRET", ""), patch.object(settings, "ALLOW_UNSIGNED_WEBHOOKS", True):
             r = self.client.post("/api/payments/razorpay/webhook", json={"event": "ping"}, headers={"host": NGROK})

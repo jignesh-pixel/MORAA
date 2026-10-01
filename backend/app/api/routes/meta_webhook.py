@@ -917,7 +917,7 @@ async def receive_webhook(
         logger.error("Failed to parse webhook JSON payload: {}", e)
         return {"status": "error", "message": "Invalid JSON payload"}
 
-    if settings.META_APP_SECRET:
+    if (settings.META_APP_SECRET or "").strip():
         signature = request.headers.get("X-Hub-Signature-256")
         if not verify_webhook_signature(raw_body, signature):
             return {"status": "error", "message": "Invalid signature"}

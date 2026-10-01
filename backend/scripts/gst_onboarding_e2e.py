@@ -6,8 +6,16 @@ every outgoing WhatsApp payload instead of sending it. No network calls."""
 import json, os, sys, socket
 BACKEND = sys.argv[1] if len(sys.argv) > 1 else "."
 sys.path.insert(0, BACKEND); os.chdir(BACKEND)
+# Never load backend/.env (live secrets) into this offline run.
+os.environ["MORAA_ENV_FILE"] = ""
 def _blocked(*a, **k): raise RuntimeError("network blocked in e2e runner")
-socket.socket.connect = _blocked; socket.create_connection = _blocked
+_real_connect = socket.socket.connect
+def _loopback_only(self, address, *a, **k):
+    # asyncio on Windows needs a loopback socket pair; everything else is blocked.
+    host = address[0] if isinstance(address, tuple) else address
+    if host in ("127.0.0.1", "::1", "localhost"): return _real_connect(self, address, *a, **k)
+    return _blocked()
+socket.socket.connect = _loopback_only; socket.create_connection = _blocked
 
 from unittest.mock import AsyncMock, patch
 from sqlalchemy import create_engine
@@ -35,6 +43,7 @@ async def capture(payload, label, reply_to_message_id=None):
 
 settings.GST_VERIFICATION_ENABLED = True; settings.GST_PROVIDER = "mock"; settings.DEBUG = True
 settings.RATE_LIMIT_ENABLED = False; settings.META_APP_SECRET = ""
+settings.ALLOW_UNSIGNED_WEBHOOKS = True  # DEBUG no longer accepts unsigned webhooks
 settings.META_WHATSAPP_TOKEN = "x"; settings.META_PHONE_NUMBER_ID = "x"
 client = TestClient(app)
 results = []
@@ -42,6 +51,7 @@ results = []
 def post(message):
     body = {"object": "whatsapp_business_account", "entry": [{"changes": [{"field": "messages", "value": {"messages": [message]}}]}]}
     r = client.post("/api/meta/webhook", json=body); assert r.status_code == 200, r.text
+    assert r.json().get("status") != "error", r.text
 
 def text(body, mid): post({"type": "text", "id": mid, "from": SENDER, "timestamp": "1", "text": {"body": body}})
 def button(bid, mid): post({"type": "interactive", "id": mid, "from": SENDER, "timestamp": "1",

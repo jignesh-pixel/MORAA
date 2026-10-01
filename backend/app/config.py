@@ -24,16 +24,34 @@ _PACK_IMAGE_COUNT = 6
 def _resolve_env_file() -> Optional[str]:
     """Absolute path of backend/.env.
 
-    MORAA_ENV_FILE overrides it; an empty MORAA_ENV_FILE loads no file at all
-    (tests and the load harness use this so live secrets are never read).
+    MORAA_ENV_FILE overrides it (a relative value resolves against backend/);
+    an empty MORAA_ENV_FILE loads no file at all (tests and the load harness
+    use this so live secrets are never read). A named file that does not
+    exist is an error, never a silent fall back to defaults.
     """
     override = os.environ.get("MORAA_ENV_FILE")
     if override is not None:
-        return override or None
-    return str(BASE_DIR / ".env")
+        if not override.strip():
+            return None
+        path = Path(override)
+        if not path.is_absolute():
+            path = BASE_DIR / path
+        if not path.is_file():
+            raise RuntimeError(f"MORAA_ENV_FILE points at a missing file: {path}")
+        return str(path)
+    default = BASE_DIR / ".env"
+    if not default.is_file():
+        _config_logger.warning(
+            f"No env file at {default}: running on built-in defaults "
+            "(ENVIRONMENT=development, SQLite, no webhook secrets)."
+        )
+    return str(default)
 
 
 ENV_FILE: Optional[str] = _resolve_env_file()
+
+# Production JWT signing keys shorter than this are refused at boot.
+_MIN_SECRET_KEY_LENGTH = 32
 
 
 class Settings(BaseSettings):
@@ -44,6 +62,8 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        # A refused boot must never echo setting values (secrets) to logs.
+        hide_input_in_errors=True,
     )
 
     # Application
@@ -420,8 +440,13 @@ class Settings(BaseSettings):
         """
         if self.ENVIRONMENT == "production":
             problems: List[str] = []
-            if not (self.SECRET_KEY or "").strip():
+            secret_key = (self.SECRET_KEY or "").strip()
+            if not secret_key:
                 problems.append("SECRET_KEY is not set")
+            elif len(secret_key) < _MIN_SECRET_KEY_LENGTH:
+                problems.append(
+                    f"SECRET_KEY is shorter than {_MIN_SECRET_KEY_LENGTH} characters"
+                )
             if not self.META_APP_SECRET.strip():
                 problems.append("META_APP_SECRET is not set")
             if not self.RAZORPAY_WEBHOOK_SECRET.strip():
@@ -451,11 +476,13 @@ class Settings(BaseSettings):
             )
 
         if Path.cwd().resolve() != BASE_DIR:
+            relative_db = self.IS_SQLITE and "///./" in self.DATABASE_URL
             _config_logger.warning(
                 f"Working directory is {Path.cwd()}, not {BASE_DIR}. Uploads "
                 f"and reports use paths relative to the working directory "
-                f"({self.UPLOAD_DIR}, {self.REPORT_DIR}); start the server "
-                "from backend/ so stored file paths keep resolving."
+                f"({self.UPLOAD_DIR}, {self.REPORT_DIR}"
+                f"{', and the SQLite database' if relative_db else ''}); start "
+                "the server from backend/ so stored file paths keep resolving."
             )
         return self
 

@@ -7,6 +7,8 @@ explicitly with mocked HTTP (see test_billing_erpnext.py).
 """
 
 import os
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -15,6 +17,14 @@ import pytest
 # imported by pytest before the test modules. Set MORAA_ENV_FILE to a path
 # beforehand to run the suite against a specific env file on purpose.
 os.environ.setdefault("MORAA_ENV_FILE", "")
+
+# Throw-away storage: tests must not write into backend/data (the local dev
+# SQLite), backend/app/uploads, app/reports or backend/logs.
+_TEST_STORAGE = tempfile.mkdtemp(prefix="moraa_tests_")
+os.environ.setdefault("DATABASE_URL", f"sqlite:///{Path(_TEST_STORAGE, 'test.db').as_posix()}")
+os.environ.setdefault("UPLOAD_DIR", str(Path(_TEST_STORAGE, "uploads")))
+os.environ.setdefault("REPORT_DIR", str(Path(_TEST_STORAGE, "reports")))
+os.environ.setdefault("LOG_DIR", str(Path(_TEST_STORAGE, "logs")))
 
 
 @pytest.fixture(autouse=True)

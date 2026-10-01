@@ -319,7 +319,8 @@ def verify_webhook_signature(
     signature_header: Optional[str],
 ) -> bool:
     """Verify Meta's X-Hub-Signature-256 HMAC-SHA256 signature."""
-    if not settings.META_APP_SECRET:
+    secret = (settings.META_APP_SECRET or "").strip()
+    if not secret:
         # Fail closed: without the app secret no signature can be verified.
         logger.warning("META_APP_SECRET not configured — webhook signature cannot be verified")
         return False
@@ -338,7 +339,7 @@ def verify_webhook_signature(
     signature_hash = signature_header[len(expected_prefix):]
 
     computed = hmac.new(
-        settings.META_APP_SECRET.encode("utf-8"),
+        secret.encode("utf-8"),
         payload_body,
         hashlib.sha256,
     ).hexdigest()
