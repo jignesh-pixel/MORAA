@@ -850,6 +850,7 @@ def _refund_failed_ingestion(db, ingestion) -> None:
         from sqlalchemy.exc import IntegrityError
 
         from app.models.audit_log import AuditLog
+        from app.models.wallet_transaction import KIND_REFUND_ORDER
         from app.services.wallet_service import credit_wallet, price_per_image
 
         already = (
@@ -897,7 +898,10 @@ def _refund_failed_ingestion(db, ingestion) -> None:
             return
 
         # 2. Credit inside the same transaction; 3. commit claim + credit together.
-        if credit_wallet(db, cust.whatsapp_id, price, commit=False) != 1:
+        if credit_wallet(
+            db, cust.whatsapp_id, price, commit=False,
+            kind=KIND_REFUND_ORDER, ingestion_id=ingestion_id,
+        ) != 1:
             db.rollback()
             logger.error(
                 f"Refund rolled back, wallet row not updated: ingestion_id={ingestion_id}"

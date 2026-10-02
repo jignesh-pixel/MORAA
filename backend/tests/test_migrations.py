@@ -115,6 +115,24 @@ class MigrationChainTests(unittest.TestCase):
         self.assertNotIn("customers", tables)           # the hazard above, pinned so a fix is noticed
         self.assertNotIn("onboarding_sessions", tables)
 
+    def test_ledger_migration_backfills_an_opening_balance_per_customer(self):
+        """0009 must make SUM(ledger) == wallet_balance for customers that existed before the ledger."""
+        cfg = alembic_config()
+        with self.engine.begin() as connection:
+            cfg.attributes["connection"] = connection
+            command.upgrade(cfg, "0008_customer_access_tiers")
+            connection.execute(text(
+                "INSERT INTO customers (id, whatsapp_id, full_name, business_name, gst_number, address, wallet_balance) VALUES "
+                "('c-rich', '919000000001', 'R', 'B', 'N/A', 'A', 750), ('c-zero', '919000000002', 'Z', 'B', 'N/A', 'A', 0)"
+            ))
+        upgrade_to_head(self.engine)
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("SELECT customer_id, kind, amount, balance_after FROM wallet_transactions")).fetchall()
+        self.assertEqual([tuple(r) for r in rows], [("c-rich", "opening_balance", 750, 750)])   # zero balance: no row
+        upgrade_to_head(self.engine)                                                              # idempotent
+        with self.engine.connect() as conn:
+            self.assertEqual(conn.execute(text("SELECT count(*) FROM wallet_transactions")).scalar(), 1)
+
     def test_single_head(self):
         from alembic.script import ScriptDirectory
 

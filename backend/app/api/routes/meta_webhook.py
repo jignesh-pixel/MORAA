@@ -81,6 +81,7 @@ from app.services.whatsapp_pay_service import (
     try_send_native_recharge,
 )
 from app.services import entitlement_service as ent
+from app.models.wallet_transaction import KIND_DEBIT_ORDER, WalletTransaction
 from app.services.wallet_service import (
     charge_customer_balance,
     find_customer_by_phone,
@@ -810,9 +811,14 @@ async def _handle_product_choice(
         # Same balance rule, but no money moves in dry-run.
         charged = get_balance(db, customer.whatsapp_id) >= price
     else:
-        charged, _balance_after = charge_customer_balance(db, customer, price)
+        # commit=False: the debit and its ledger row are committed TOGETHER with the order status
+        # below, so a crash can never leave money taken with the order unrecorded.
+        charged, _balance_after = charge_customer_balance(
+            db, customer, price, ingestion_id=ingestion_id, commit=False,
+        )
 
     if not charged:
+        db.rollback()                    # discard any half-applied debit before releasing the claim
         db.query(WhatsAppIngestion).filter(
             WhatsAppIngestion.id == ingestion_id,
             WhatsAppIngestion.status == "choice_claimed",
@@ -838,10 +844,45 @@ async def _handle_product_choice(
         )
         return None
 
-    db.refresh(ingestion)
-    ingestion.amount_charged = 0 if (dry_run or free_access) else price
-    ingestion.status = "white_queued" if product == PRODUCT_WHITE_BG else "pack_queued"
-    db.commit()
+    try:
+        db.refresh(ingestion)
+        ingestion.amount_charged = 0 if (dry_run or free_access) else price
+        ingestion.status = "white_queued" if product == PRODUCT_WHITE_BG else "pack_queued"
+        db.commit()                      # debit + ledger row + status in ONE transaction
+    except Exception:
+        db.rollback()
+        debited = (
+            not (dry_run or free_access)
+            and db.query(WalletTransaction.id)
+            .filter(WalletTransaction.ingestion_id == ingestion_id, WalletTransaction.kind == KIND_DEBIT_ORDER)
+            .first()
+            is not None
+        )
+        if debited:
+            # The commit reached the server before the error: the money IS taken. Finish the order.
+            db.query(WhatsAppIngestion).filter(
+                WhatsAppIngestion.id == ingestion_id,
+                WhatsAppIngestion.status == "choice_claimed",
+            ).update(
+                {
+                    WhatsAppIngestion.amount_charged: price,
+                    WhatsAppIngestion.status: "white_queued" if product == PRODUCT_WHITE_BG else "pack_queued",
+                },
+                synchronize_session=False,
+            )
+            db.commit()
+            logger.error(f"Order {ingestion_id}: commit error after the debit was stored; order completed from the ledger")
+        else:
+            # Nothing was taken; release the claim so the customer can tap again.
+            db.query(WhatsAppIngestion).filter(
+                WhatsAppIngestion.id == ingestion_id,
+                WhatsAppIngestion.status == "choice_claimed",
+            ).update(
+                {WhatsAppIngestion.status: "awaiting_choice", WhatsAppIngestion.product_code: None},
+                synchronize_session=False,
+            )
+            db.commit()
+            raise
 
     if product == PRODUCT_WHITE_BG:
         if free_access == "trial":

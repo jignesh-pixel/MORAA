@@ -54,6 +54,7 @@ class Customer(Base):
             "trial_credits_total >= 0 AND trial_credits_used >= 0",
             name="ck_customers_trial_credits_nonneg",
         ),
+        CheckConstraint("wallet_balance >= 0", name="ck_customers_wallet_nonneg"),
     )
 
     id: Mapped[str] = mapped_column(

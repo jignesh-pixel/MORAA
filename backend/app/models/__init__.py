@@ -18,8 +18,10 @@ from app.models.whatsapp_ingestion import WhatsAppIngestion
 from app.models.customer import Customer
 from app.models.onboarding_session import OnboardingSession
 from app.models.whatsapp_payment_order import WhatsAppPaymentOrder
+from app.models.wallet_transaction import WalletTransaction
 
 __all__ = [
+    "WalletTransaction",
     "User",
     "Image",
     "Analysis",

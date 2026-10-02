@@ -27,10 +27,17 @@ Every WhatsApp message is sent through the existing
 
 from typing import Optional, Tuple
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models.customer import Customer
+from app.models.wallet_transaction import (
+    KIND_CREDIT_PAYMENT,
+    KIND_DEBIT_ORDER,
+    KIND_REFUND_ORDER,
+    WalletTransaction,
+)
 from app.models.whatsapp_ingestion import WhatsAppIngestion
 from app.repositories.base import BaseRepository
 from app.utils.logger import logger, mask_phone
@@ -124,14 +131,58 @@ def find_customer_by_phone(db: Session, phone: str) -> Optional[Customer]:
     return rows[0] if rows else None
 
 
-def credit_wallet(db: Session, whatsapp_id: str, amount: int, commit: bool = True) -> int:
-    """Add funds (payment captured or refund). Returns the new balance."""
+def record_ledger(
+    db: Session,
+    *,
+    customer_id: str,
+    kind: str,
+    amount: int,
+    ingestion_id: Optional[str] = None,
+    ref: Optional[str] = None,
+) -> None:
+    """Add the ledger row for a balance change that was JUST applied in this transaction.
+
+    ``balance_after`` is read inside the same transaction, after the UPDATE that took the row lock,
+    so it is exactly the balance this change produced. The caller commits (or rolls back) the
+    balance change and this row together; a duplicate ``(ingestion_id, kind)`` or ``(kind, ref)``
+    fails at flush with IntegrityError, which is how the database refuses a second debit,
+    refund or payment credit.
+    """
+    balance_after = db.query(Customer.wallet_balance).filter(Customer.id == customer_id).scalar()
+    db.add(
+        WalletTransaction(
+            customer_id=customer_id,
+            kind=kind,
+            amount=int(amount),
+            balance_after=int(balance_after or 0),
+            ingestion_id=ingestion_id,
+            ref=ref,
+        )
+    )
+    db.flush()
+
+
+def credit_wallet(
+    db: Session,
+    whatsapp_id: str,
+    amount: int,
+    commit: bool = True,
+    *,
+    kind: str = KIND_CREDIT_PAYMENT,
+    ingestion_id: Optional[str] = None,
+    ref: Optional[str] = None,
+) -> int:
+    """Add funds (payment captured or refund). Returns the new balance.
+
+    Every credit also writes its ledger row in the same transaction (see ``record_ledger``).
+    """
     amount = max(int(amount), 0)
     if amount == 0 or not whatsapp_id:
         # commit=False callers read the return value as "rows updated".
         return 0 if not commit else get_balance(db, whatsapp_id)
 
     try:
+        customer_id = db.query(Customer.id).filter(Customer.whatsapp_id == whatsapp_id).scalar()
         updated = (
             db.query(Customer)
             .filter(Customer.whatsapp_id == whatsapp_id)
@@ -140,6 +191,8 @@ def credit_wallet(db: Session, whatsapp_id: str, amount: int, commit: bool = Tru
                 synchronize_session=False,
             )
         )
+        if updated == 1 and customer_id:
+            record_ledger(db, customer_id=customer_id, kind=kind, amount=amount, ingestion_id=ingestion_id, ref=ref)
         if not commit:
             # Caller commits (atomically with its own writes); report rows hit.
             return updated
@@ -156,6 +209,12 @@ def credit_wallet(db: Session, whatsapp_id: str, amount: int, commit: bool = Tru
             f"balance={balance}"
         )
         return balance
+    except IntegrityError as e:
+        db.rollback()
+        logger.warning(f"Wallet credit refused by the ledger (duplicate or invalid row): {getattr(e, 'orig', e)}")
+        if not commit:
+            raise
+        return 0        # nothing was credited; never report the old balance as a success
     except Exception as e:
         db.rollback()
         logger.error(f"Wallet credit failed: {e}")
@@ -178,6 +237,9 @@ def charge_customer_balance(
     db: Session,
     customer: Customer,
     price: int,
+    *,
+    ingestion_id: Optional[str] = None,
+    commit: bool = True,
 ) -> Tuple[bool, int]:
     """Atomically debit ``price`` from an already-resolved customer's wallet.
 
@@ -187,6 +249,10 @@ def charge_customer_balance(
     ``charge_generation`` and the WhatsApp funded-slot gate
     (``app/api/routes/meta_webhook.py``) both call it, so there is a single
     authoritative deduction path.
+
+    The debit and its ledger row are written in one transaction. With ``commit=False`` the caller
+    commits them together with its own writes (the order status), so a crash can never leave money
+    taken without the order recording it.
     """
     try:
         updated = (
@@ -200,7 +266,19 @@ def charge_customer_balance(
                 synchronize_session=False,
             )
         )
-        db.commit()
+        if updated == 1:
+            record_ledger(
+                db, customer_id=customer.id, kind=KIND_DEBIT_ORDER, amount=-price, ingestion_id=ingestion_id,
+            )
+        if commit:
+            db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        logger.error(
+            f"Wallet charge refused by the ledger (this order was already debited?): "
+            f"ingestion_id={ingestion_id} {getattr(e, 'orig', e)}"
+        )
+        return False, customer.balance_rupees
     except Exception as e:
         db.rollback()
         logger.error(f"Wallet charge failed: {e}")
@@ -240,13 +318,14 @@ def charge_generation(
         )
         return False, 0
 
-    return charge_customer_balance(db, customer, price)
+    return charge_customer_balance(db, customer, price, ingestion_id=ingestion.id)
 
 
 def refund_generation_charge(
     db: Session,
     whatsapp_id: str,
     amount: int,
+    ingestion_id: Optional[str] = None,
 ) -> bool:
     """Return a charge to the wallet after a failed generation."""
     amount = max(int(amount), 0)
@@ -254,6 +333,7 @@ def refund_generation_charge(
         return False
 
     try:
+        customer_id = db.query(Customer.id).filter(Customer.whatsapp_id == whatsapp_id).scalar()
         updated = (
             db.query(Customer)
             .filter(Customer.whatsapp_id == whatsapp_id)
@@ -262,6 +342,8 @@ def refund_generation_charge(
                 synchronize_session=False,
             )
         )
+        if updated == 1 and customer_id:
+            record_ledger(db, customer_id=customer_id, kind=KIND_REFUND_ORDER, amount=amount, ingestion_id=ingestion_id)
         db.commit()
     except Exception as e:
         db.rollback()

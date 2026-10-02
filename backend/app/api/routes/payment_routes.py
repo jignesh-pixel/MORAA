@@ -23,7 +23,8 @@ from app.services.meta_whatsapp_service import (
     send_document_to_whatsapp,
     send_whatsapp_text,
 )
-from app.services.wallet_service import credit_wallet, find_customer_by_phone, get_balance
+from app.models.wallet_transaction import KIND_CREDIT_PAYMENT
+from app.services.wallet_service import credit_wallet, find_customer_by_phone, get_balance, record_ledger
 from app.utils.logger import logger, mask_phone
 router = APIRouter(prefix="/api/payments", tags=["Payments"])
 
@@ -446,8 +447,11 @@ async def razorpay_webhook(
         )
         db.add(customer)
     try:
-        if not customer_was_created:
-            if credit_wallet(db, customer.whatsapp_id, amount_paid, commit=False) != 1:
+        if customer_was_created:
+            db.flush()      # assigns customer.id; a concurrent first payment conflicts here (IntegrityError)
+            record_ledger(db, customer_id=customer.id, kind=KIND_CREDIT_PAYMENT, amount=amount_paid, ref=payment_reference)
+        else:
+            if credit_wallet(db, customer.whatsapp_id, amount_paid, commit=False, ref=payment_reference) != 1:
                 raise RuntimeError("customer row not updated")
             if getattr(customer, "full_name", None):
                 customer_name = customer.full_name
@@ -459,8 +463,9 @@ async def razorpay_webhook(
             AuditLog.status == "pending",
         ).update({AuditLog.status: "resolved"}, synchronize_session=False)
         db.commit()
-    except IntegrityError:
+    except IntegrityError as integrity_error:
         db.rollback()
+        logger.warning(f"Payment {payment_reference}: integrity error: {getattr(integrity_error, 'orig', integrity_error)}")
         if _already_processed(db, payment_reference):
             logger.info(f"Payment {payment_reference} already processed concurrently, skipping duplicate.")
             return {"status": "already_processed"}

@@ -39,6 +39,7 @@ from app.config import settings
 from app.models.audit_log import AuditLog
 from app.models.whatsapp_payment_order import WhatsAppPaymentOrder
 from app.services.meta_whatsapp_service import _post_message_payload, send_whatsapp_text
+from app.models.wallet_transaction import KIND_CREDIT_WHATSAPP_PAY
 from app.services.wallet_service import credit_wallet, find_customer_by_phone, get_balance
 from app.utils.logger import logger, mask_phone
 _plog = logger.bind(category="payments")
@@ -472,7 +473,10 @@ async def reconcile_order(db: Session, order: WhatsAppPaymentOrder) -> str:
         return "already_credited"
 
     try:
-        if credit_wallet(db, order.whatsapp_id, order.amount_rupees, commit=False) != 1:
+        if credit_wallet(
+            db, order.whatsapp_id, order.amount_rupees, commit=False,
+            kind=KIND_CREDIT_WHATSAPP_PAY, ref=pay_id,
+        ) != 1:
             raise RuntimeError("customer row not updated")
         order.status, order.credited = "captured", True
         db.commit()
