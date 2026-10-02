@@ -91,6 +91,7 @@ from app.services.wallet_service import (
     price_per_image,
 )
 from app.utils.logger import logger, mask_phone
+from app.ai.image_generation_manager import generation_capacity_blocked
 from app.utils.phone import same_phone
 from app.services.message_dedupe import claim_message, release_messages
 
@@ -579,6 +580,10 @@ ALREADY_CHOSEN_MESSAGE = (
     "Send the photo again if you want to place another order."
 )
 UNKNOWN_CHOICE_MESSAGE = "Sorry, we couldn't find that photo. Please send it again."
+CAPACITY_MESSAGE = (
+    "We can't generate new images right now, so nothing was charged. "
+    "Your photo is saved, so you can tap your choice again once generation is available 🙏"
+)
 UNREADABLE_IMAGE_MESSAGE = (
     "Sorry, we couldn't read this photo. Please send a clear JPG, PNG or WebP photo of the earring."
 )
@@ -773,6 +778,25 @@ async def _handle_product_choice(
     price = _product_price(product)
     dry_run = product == PRODUCT_WHITE_BG and bool(_mws.DRY_RUN_IMAGE_MODE)
     customer = find_customer_by_phone(db, sender)
+
+    # Capacity BEFORE any money moves (UX-4): if today's generation limit (or the kill switch) leaves no room
+    # for this order, decline it now with nothing charged and keep the photo choosable. Team (ADMIN) orders
+    # are not counted against the daily cap, and dry-run makes no provider calls.
+    if not _mws.DRY_RUN_IMAGE_MODE and not (customer is not None and ent.is_admin(customer)):
+        needed = 1 if product == PRODUCT_WHITE_BG else _mws.pack_generation_count()
+        no_capacity = generation_capacity_blocked(needed)
+        if no_capacity:
+            logger.warning(f"Order {ingestion_id} declined before charging: {no_capacity}")
+            db.query(WhatsAppIngestion).filter(
+                WhatsAppIngestion.id == ingestion_id,
+                WhatsAppIngestion.status == "choice_claimed",
+            ).update(
+                {WhatsAppIngestion.status: "awaiting_choice", WhatsAppIngestion.product_code: None},
+                synchronize_session=False,
+            )
+            db.commit()
+            await send_whatsapp_text(sender, CAPACITY_MESSAGE, reply_to_message_id=quote_id)
+            return None
 
     # Tiered access (entitlement_service): ADMIN is free; a TRIAL customer
     # with credits for this product is free (a credit is used only when the

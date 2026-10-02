@@ -138,12 +138,8 @@ _spend_day: Optional[str] = None
 _spend_count: int = 0
 
 
-def _spend_blocked(count: int = 1) -> Optional[str]:
-    """Consume ``count`` generation slots, or return why that is not allowed.
-
-    All-or-nothing: when fewer than ``count`` slots remain, nothing is
-    consumed. ``count=1`` is the original per-call behaviour.
-    """
+def _spend_check(count: int, consume: bool) -> Optional[str]:
+    """The one rule for the kill switch and the daily cap; ``consume`` decides whether slots are taken."""
     global _spend_day, _spend_count
     if getattr(settings, "GENERATION_ENABLED", True) is False:
         return "Image generation is disabled (GENERATION_ENABLED=false)"
@@ -155,8 +151,27 @@ def _spend_blocked(count: int = 1) -> Optional[str]:
         _spend_day, _spend_count = today, 0
     if _spend_count + max(count, 1) > max(cap, 1):
         return "Daily image-generation cap reached (MAX_GENERATIONS_PER_DAY)"
-    _spend_count += max(count, 1)
+    if consume:
+        _spend_count += max(count, 1)
     return None
+
+
+def _spend_blocked(count: int = 1) -> Optional[str]:
+    """Consume ``count`` generation slots, or return why that is not allowed.
+
+    All-or-nothing: when fewer than ``count`` slots remain, nothing is
+    consumed. ``count=1`` is the original per-call behaviour.
+    """
+    return _spend_check(count, consume=True)
+
+
+def generation_capacity_blocked(count: int = 1) -> Optional[str]:
+    """Would ``count`` generations be allowed right now? Same rules as ``_spend_blocked``, but consumes nothing.
+
+    Used BEFORE a customer is charged (UX-4), so an order that cannot be generated today is declined
+    without taking money. Best effort: the real slots are still taken when generation starts.
+    """
+    return _spend_check(count, consume=False)
 
 
 def reserve_generation_slots(count: int) -> Optional[str]:

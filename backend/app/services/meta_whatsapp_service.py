@@ -55,6 +55,13 @@ def _pack_style_count_label() -> str:
     return "1 test style" if count == 1 else f"{count} test styles"
 
 
+def pack_generation_count() -> int:
+    """How many images one Catalog Pack generates (all styles, or fewer under the development throttle)."""
+    if MAX_STYLES_PER_PACK is None:
+        return len(CATALOG_PACK_STYLES)
+    return min(len(CATALOG_PACK_STYLES), max(MAX_STYLES_PER_PACK, 1))
+
+
 CATALOG_PACK_ACK_TEMPLATE = (
     f"✨ Processing your Earring Catalog Pack (generating {_pack_style_count_label()})... "
     "Please allow 20-30 seconds."
