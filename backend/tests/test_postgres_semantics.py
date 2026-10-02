@@ -57,20 +57,25 @@ class WalletDebitUnderRealLocksTests(unittest.TestCase):
 
     def test_100_concurrent_debits_never_overspend(self):
         price, attempts = 50, 100
-        results, barrier = [], threading.Barrier(attempts, timeout=30)
+        results, errors, barrier = [], [], threading.Barrier(attempts, timeout=120)
 
         def debit():
-            barrier.wait()                      # release all 100 together, BEFORE taking a pooled connection
-            with self.Session() as db:
-                customer = db.get(Customer, self.customer_id)
-                charged, _ = wallet_service.charge_customer_balance(db, customer, price)
-                results.append(charged)
+            try:
+                barrier.wait()                  # release all 100 together, BEFORE taking a pooled connection
+                with self.Session() as db:
+                    customer = db.get(Customer, self.customer_id)
+                    charged, _ = wallet_service.charge_customer_balance(db, customer, price)
+                    results.append(charged)
+            except Exception as exc:            # a dying thread must be reported, not silently shrink `results`
+                errors.append(repr(exc))
 
         threads = [threading.Thread(target=debit) for _ in range(attempts)]
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=60)
+            t.join(timeout=180)
+        self.assertFalse([t for t in threads if t.is_alive()], "debit threads still running")
+        self.assertEqual(errors, [])
 
         with self.Session() as db:
             balance = db.get(Customer, self.customer_id).wallet_balance
@@ -94,14 +99,15 @@ class UniqueClaimSemanticsTests(unittest.TestCase):
         db.add(AuditLog(action=CAPTURED, resource_id=resource_id, resource_type="razorpay_payment", status="success"))
         db.flush()
 
-    def _wait_until_a_session_is_blocked_on_a_lock(self, timeout=20.0):
-        """Poll pg_stat_activity until some backend is genuinely waiting for a lock."""
+    def _wait_until_a_session_is_blocked_on_a_lock(self, timeout=60.0):
+        """Poll pg_stat_activity until another backend is genuinely waiting for the first claim's transaction."""
         deadline = time.monotonic() + timeout
         with self.engine.connect() as conn:
             while time.monotonic() < deadline:
                 waiting = conn.execute(text(
                     "SELECT count(*) FROM pg_stat_activity "
-                    "WHERE datname = current_database() AND wait_event_type = 'Lock'"
+                    "WHERE datname = current_database() AND wait_event_type = 'Lock' "
+                    "AND wait_event = 'transactionid' AND pid <> pg_backend_pid()"
                 )).scalar()
                 if waiting:
                     return
@@ -129,7 +135,8 @@ class UniqueClaimSemanticsTests(unittest.TestCase):
             self._wait_until_a_session_is_blocked_on_a_lock()      # proven: it is waiting on the first claim
             self.assertTrue(second.is_alive())
             first.commit()
-            second.join(timeout=20)
+            second.join(timeout=60)
+        self.assertFalse(second.is_alive())
         self.assertEqual(outcome.get("result"), "duplicate")
         with self.Session() as db:
             self.assertEqual(db.query(AuditLog).filter(AuditLog.resource_id == "pay_wait_commit").count(), 1)
@@ -143,29 +150,34 @@ class UniqueClaimSemanticsTests(unittest.TestCase):
             self._wait_until_a_session_is_blocked_on_a_lock()
             self.assertTrue(second.is_alive())
             first.rollback()                                       # first transaction aborts (e.g. credit failed)
-            second.join(timeout=20)
+            second.join(timeout=60)
+        self.assertFalse(second.is_alive())
         self.assertEqual(outcome.get("result"), "claimed")
         with self.Session() as db:
             self.assertEqual(db.query(AuditLog).filter(AuditLog.resource_id == "pay_wait_rollback").count(), 1)
 
     def test_20_racing_claimants_produce_exactly_one_winner(self):
-        winners, barrier = [], threading.Barrier(20, timeout=30)
+        winners, errors, barrier = [], [], threading.Barrier(20, timeout=120)
 
         def race():
-            barrier.wait()
-            with self.Session() as db:
-                try:
-                    self._claim(db, "pay_race")
-                    db.commit()
-                    winners.append(1)
-                except IntegrityError:
-                    db.rollback()
+            try:
+                barrier.wait()
+                with self.Session() as db:
+                    try:
+                        self._claim(db, "pay_race")
+                        db.commit()
+                        winners.append(1)
+                    except IntegrityError:
+                        db.rollback()
+            except Exception as exc:
+                errors.append(repr(exc))
 
         threads = [threading.Thread(target=race) for _ in range(20)]
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=60)
+            t.join(timeout=180)
+        self.assertEqual(errors, [])
         self.assertEqual(len(winners), 1)
 
     def test_unrelated_actions_are_not_blocked_by_the_partial_index(self):

@@ -26,6 +26,7 @@ import shutil
 import tempfile
 import unittest
 import uuid
+import warnings
 from typing import Optional
 
 import pytest
@@ -139,16 +140,17 @@ def _postgres_engine() -> Engine:
         connect_args={"options": f"-csearch_path={schema}"},
         pool_size=10,
         max_overflow=20,
-        pool_timeout=15,
+        pool_timeout=120,
     )
 
     @event.listens_for(engine, "engine_disposed")
     def _drop_schema(_engine: Engine) -> None:
         try:
             with _admin().connect() as conn:
+                conn.execute(text("SET lock_timeout = '10s'"))     # a leaked session must not hang the whole suite
                 conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
-        except Exception:  # pragma: no cover - best effort cleanup of a throw-away schema
-            pass
+        except Exception as exc:  # pragma: no cover - best effort cleanup of a throw-away schema
+            warnings.warn(f"could not drop test schema {schema}: {type(exc).__name__}")
 
     engine.moraa_schema = schema  # type: ignore[attr-defined]
     return engine

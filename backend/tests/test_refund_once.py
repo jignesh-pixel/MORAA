@@ -81,7 +81,7 @@ class RefundOnceTests(unittest.TestCase):
 
     def test_racing_refunds_credit_exactly_once(self):
         racers = 12
-        barrier = threading.Barrier(racers, timeout=20)
+        barrier = threading.Barrier(racers, timeout=120)
         real_lookup = wallet_service.find_customer_by_phone
 
         def lookup_after_everyone_passed_the_fast_check(db, phone):
@@ -104,8 +104,9 @@ class RefundOnceTests(unittest.TestCase):
             for t in threads:
                 t.start()
             for t in threads:
-                t.join(timeout=60)
+                t.join(timeout=180)
 
+        self.assertFalse([t for t in threads if t.is_alive()])
         self.assertEqual(errors, [])
         self.assertEqual(self._balance(), START_BALANCE + CHARGED)
         self.assertEqual(self._refund_rows(), 1)
