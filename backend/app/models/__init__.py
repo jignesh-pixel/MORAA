@@ -21,6 +21,7 @@ from app.models.whatsapp_payment_order import WhatsAppPaymentOrder
 from app.models.wallet_transaction import WalletTransaction
 from app.models.processed_message import ProcessedMessage
 from app.models.pending_payment import PendingPayment
+from app.models.razorpay_payment_link import RazorpayPaymentLink
 
 __all__ = [
     "WalletTransaction",

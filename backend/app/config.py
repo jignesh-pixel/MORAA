@@ -288,6 +288,9 @@ class Settings(BaseSettings):
     # Background sweep for orders whose payment webhook was missed (seconds;
     # 0 disables). Runs only while WHATSAPP_PAY_ENABLED is true.
     WHATSAPP_PAY_RECONCILE_INTERVAL_SECONDS: int = 300
+    # Seconds between sweeps that ask Razorpay about recharge links whose payment webhook never arrived
+    # (0 disables). Runs only while the Razorpay API keys are set.
+    RAZORPAY_LINK_RECONCILE_INTERVAL_SECONDS: int = 300
 
     # --- Live GSTIN verification during onboarding ---
     # False (default) = onboarding behaves exactly as before (format check

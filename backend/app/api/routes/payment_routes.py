@@ -566,6 +566,17 @@ async def razorpay_webhook(
             detail="Invalid JSON payload",
         )
 
+    return await process_razorpay_event(db, payload, background_tasks)
+
+
+async def process_razorpay_event(
+    db: Session, payload: Dict[str, Any], background_tasks: BackgroundTasks
+) -> Dict[str, str]:
+    """Apply one (already verified) Razorpay event: credit a payment, take back a refund, or flag it.
+
+    The webhook calls this after checking the signature; the payment-link reconcile sweep calls it with an
+    event rebuilt from Razorpay's own answer. Both therefore credit through exactly the same once-only claim.
+    """
     event = payload.get("event", "")
     logger.info(f"Received Razorpay webhook event: '{event}'")
 

@@ -134,6 +134,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.bind(category="system").warning(f"WhatsApp Pay reconcile sweep not started: {e}")
 
+    link_reconcile_task = None
+    try:
+        from app.services.razorpay_link_reconcile import run_payment_link_reconcile_forever
+
+        link_reconcile_task = asyncio.create_task(run_payment_link_reconcile_forever())
+    except Exception as e:
+        logger.bind(category="system").warning(f"Razorpay payment link reconcile sweep not started: {e}")
+
     recovery_task = None
     try:
         from app.api.routes.meta_webhook import STUCK_WHITE_AFTER as _STUCK_AFTER
@@ -148,6 +156,8 @@ async def lifespan(app: FastAPI):
     # Shutdown
     if reconcile_task is not None:
         reconcile_task.cancel()
+    if link_reconcile_task is not None:
+        link_reconcile_task.cancel()
     if recovery_task is not None:
         recovery_task.cancel()
     logger.bind(category="system").info(f"Shutting down {settings.APP_NAME}")

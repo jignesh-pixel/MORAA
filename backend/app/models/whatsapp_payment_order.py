@@ -52,6 +52,11 @@ class WhatsAppPaymentOrder(Base):
     fallback_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str] = mapped_column(Text, nullable=True)
+    next_check_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True,
+        comment="Reconcile sweep: do not look at this order before this time (backoff)",
+    )
+    check_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
