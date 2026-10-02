@@ -334,6 +334,10 @@ class Settings(BaseSettings):
     ERPNEXT_INVOICE_ENABLED: bool = False
     ERPNEXT_RECHARGE_ITEM_CODE: str = ""
     ERPNEXT_TAX_TEMPLATE: str = ""
+    # Sales to a buyer in another state are IGST, not CGST+SGST (PRIV-4). Set the seller's two-digit GST state code
+    # and the ERPNext tax template that carries IGST; until both are set every invoice uses ERPNEXT_TAX_TEMPLATE.
+    ERPNEXT_COMPANY_STATE_CODE: str = ""
+    ERPNEXT_TAX_TEMPLATE_INTERSTATE: str = ""
     ERPNEXT_MODE_OF_PAYMENT: str = ""
     ERPNEXT_PRINT_FORMAT: str = "Standard"
     ERPNEXT_PRICES_INCLUDE_TAX: bool = True

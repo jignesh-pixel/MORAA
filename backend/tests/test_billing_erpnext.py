@@ -254,3 +254,34 @@ class RazorpayWebhookBillingTests(FundedSlotGateTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InterStateTaxTests(_ERPTestBase):
+    """PRIV-4: a buyer in another state is billed IGST and the place of supply is sent."""
+
+    def _bill(self, gstin, **cfg):
+        fake = FakeERPNext()
+        with patch.multiple(settings, **cfg):
+            self._run(fake, lambda: _service().create_paid_invoice_pdf(SENDER, "Buyer", gstin, 500, "pay_IGST1"))
+        return fake.posts("/api/resource/Sales Invoice")[0][3], fake
+
+    def test_other_state_buyer_gets_the_igst_template_and_place_of_supply(self):
+        inv, fake = self._bill("24AAAPS1234C1Z5", ERPNEXT_COMPANY_STATE_CODE="27",
+                               ERPNEXT_TAX_TEMPLATE_INTERSTATE="Output IGST 18% - M")
+        self.assertEqual(inv["taxes_and_charges"], "Output IGST 18% - M")
+        self.assertEqual(inv["place_of_supply"], "24-Gujarat")
+
+    def test_same_state_buyer_keeps_the_default_template(self):
+        inv, _ = self._bill("27AAAPS1234C1Z5", ERPNEXT_COMPANY_STATE_CODE="27",
+                            ERPNEXT_TAX_TEMPLATE_INTERSTATE="Output IGST 18% - M")
+        self.assertEqual(inv["taxes_and_charges"], "Output GST 18% - M")
+        self.assertEqual(inv["place_of_supply"], "27-Maharashtra")
+
+    def test_nothing_changes_until_the_interstate_settings_are_configured(self):
+        inv, _ = self._bill("24AAAPS1234C1Z5", ERPNEXT_COMPANY_STATE_CODE="", ERPNEXT_TAX_TEMPLATE_INTERSTATE="")
+        self.assertEqual(inv["taxes_and_charges"], "Output GST 18% - M")
+
+    def test_a_buyer_without_a_gstin_is_sold_as_in_state(self):
+        inv, _ = self._bill(None, ERPNEXT_COMPANY_STATE_CODE="27", ERPNEXT_TAX_TEMPLATE_INTERSTATE="Output IGST 18% - M")
+        self.assertEqual(inv["taxes_and_charges"], "Output GST 18% - M")
+        self.assertNotIn("place_of_supply", inv)
