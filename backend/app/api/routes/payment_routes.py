@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import re
+import time
 from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
@@ -23,8 +24,16 @@ from app.services.meta_whatsapp_service import (
     send_document_to_whatsapp,
     send_whatsapp_text,
 )
-from app.models.wallet_transaction import KIND_CREDIT_PAYMENT
-from app.services.wallet_service import credit_wallet, find_customer_by_phone, get_balance, record_ledger
+from app.models.wallet_transaction import KIND_CREDIT_PAYMENT, KIND_DEBIT_DISPUTE, KIND_DEBIT_REFUND
+from app.services.wallet_service import (
+    CLAWBACK_OUTCOME_DUPLICATE,
+    CLAWBACK_OUTCOME_NO_PAYMENT,
+    claw_back_payment,
+    credit_wallet,
+    find_customer_by_phone,
+    get_balance,
+    record_ledger,
+)
 from app.utils.logger import logger, mask_phone
 router = APIRouter(prefix="/api/payments", tags=["Payments"])
 
@@ -41,6 +50,14 @@ AUDIT_ACTION_PAYMENT_CREDIT_FAILED = "razorpay_payment_credit_failed"
 # plus an ALERT for a manual credit.
 MAX_CREDIT_ATTEMPTS = 8
 AUDIT_RESOURCE_TYPE = "razorpay_payment"
+# A payment, refund or dispute that needs a person's attention (wrong currency, unknown payment, dispute opened).
+AUDIT_ACTION_PAYMENT_REVIEW = "razorpay_payment_review"
+
+# A refund that finished, or a dispute that was lost, takes the money back out of the wallet.
+MONEY_BACK_EVENTS = ("refund.processed", "payment.dispute.lost")
+EVENT_DISPUTE_CREATED = "payment.dispute.created"
+# A refund whose payment we have not credited yet is retried by Razorpay for this long, then left for review.
+NO_PAYMENT_RETRY_WINDOW_SECONDS = 6 * 3600
 
 PAYMENT_TIPS_MESSAGE = (
     "Payment Received 💳\n\n"
@@ -188,6 +205,135 @@ def extract_payment_data(payload: Dict[str, Any]) -> Optional[Tuple[str, int, st
         # (or anything else) into the middleware as a 500.
         logger.error(f"Razorpay webhook payload extraction failed unexpectedly: {e}")
         return None
+
+
+def extract_currency(payload: Dict[str, Any]) -> str:
+    """Upper-cased currency code of the payment in a payment event ("" when absent)."""
+    for path in (("payload", "payment", "entity"), ("payload", "payment_link", "entity")):
+        entity = _nested_get(payload, *path)
+        if isinstance(entity, dict):
+            code = entity.get("currency")
+            if isinstance(code, str) and code.strip():
+                return code.strip().upper()
+    return ""
+
+
+def _record_payment_review(db: Session, resource_id: str, reason: str, details: Dict[str, Any]) -> None:
+    """Leave a durable "a person must look at this" row (once per ``resource_id`` and reason). Never raises."""
+    try:
+        if _review_reason_exists(db, resource_id, reason):
+            return
+        db.add(
+            AuditLog(
+                user_id=None,
+                action=AUDIT_ACTION_PAYMENT_REVIEW,
+                resource_id=resource_id,
+                resource_type=AUDIT_RESOURCE_TYPE,
+                status="pending",
+                details=json.dumps({"reason": reason, **details}),
+            )
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Could not record payment review row for {resource_id}: {e}")
+
+
+def _review_reason_exists(db: Session, resource_id: str, reason: str) -> bool:
+    rows = (
+        db.query(AuditLog.details)
+        .filter(AuditLog.action == AUDIT_ACTION_PAYMENT_REVIEW, AuditLog.resource_id == resource_id)
+        .all()
+    )
+    return any(f'"reason": "{reason}"' in (row[0] or "") for row in rows)
+
+
+def _is_recent(created_at: Any) -> bool:
+    """True when a Razorpay epoch timestamp is under NO_PAYMENT_RETRY_WINDOW_SECONDS old (or missing/invalid)."""
+    try:
+        age = time.time() - float(created_at)
+    except (TypeError, ValueError):
+        return True
+    return age < NO_PAYMENT_RETRY_WINDOW_SECONDS
+
+
+def _handle_money_back_event(db: Session, payload: Dict[str, Any], event: str) -> Dict[str, str]:
+    """Refund processed / dispute lost: take the money back out of the wallet. Dispute opened: flag it."""
+    is_refund = event.startswith("refund.")
+    entity = _nested_get(payload, "payload", "refund" if is_refund else "dispute", "entity")
+    if not isinstance(entity, dict):
+        return {"status": "unparseable"}
+    entity_id = _as_id(entity.get("id"))
+    payment_id = _as_id(entity.get("payment_id"))
+    try:
+        amount_paise = int(entity.get("amount"))
+    except (TypeError, ValueError):
+        amount_paise = 0
+    if not entity_id or not payment_id or amount_paise <= 0:
+        logger.warning(f"Razorpay {event} payload is missing id, payment id or amount")
+        return {"status": "unparseable"}
+    amount = _paise_to_rupees(amount_paise)
+    if amount == 0:
+        logger.warning(f"Razorpay {event} {entity_id}: {amount_paise} paise is under half a rupee; wallet not changed.")
+        return {"status": "ignored_sub_rupee"}
+
+    currency = str(entity.get("currency") or "").strip().upper()
+    # A refund/dispute record that omits its currency is judged by the original payment, which the
+    # credit path already verified as INR; one that names another currency is never applied.
+    if currency and currency != "INR":
+        logger.error(f"ALERT Razorpay {event} {entity_id}: currency '{currency}' is not INR; not applied.")
+        _record_payment_review(db, entity_id, "currency_not_inr", {"event": event, "payment_id": payment_id})
+        return {"status": "unsupported_currency"}
+
+    if event == EVENT_DISPUTE_CREATED:
+        # Razorpay only holds the money while a dispute is open; it is taken back if the dispute is lost.
+        logger.error(
+            f"ALERT Razorpay dispute {entity_id} opened on payment {payment_id} (₹{amount}). "
+            "The wallet is not changed unless the dispute is lost; respond to it in the Razorpay dashboard."
+        )
+        _record_payment_review(db, entity_id, "dispute_opened", {"payment_id": payment_id, "amount": amount})
+        return {"status": "dispute_flagged"}
+
+    kind = KIND_DEBIT_REFUND if is_refund else KIND_DEBIT_DISPUTE
+    try:
+        result = claw_back_payment(db, payment_id=payment_id, entity_id=entity_id, amount=amount, kind=kind)
+    except Exception as e:
+        logger.error(f"Razorpay {event} {entity_id}: claw-back failed, asking Razorpay to retry: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not apply the refund yet, retry later",
+        )
+    if result["outcome"] == CLAWBACK_OUTCOME_NO_PAYMENT:
+        logger.error(
+            f"ALERT Razorpay {event} {entity_id} refers to payment {payment_id}, which this system never credited. "
+            "Nothing was taken from any wallet; review it."
+        )
+        _record_payment_review(db, entity_id, "no_matching_credit", {"event": event, "payment_id": payment_id, "amount": amount})
+        if _is_recent(entity.get("created_at")):
+            # The payment event may simply not have been credited yet (still in flight, or waiting for
+            # Razorpay's own retry). Answer 503 so Razorpay delivers this refund again later; answering
+            # 200 would drop it for good and the customer would keep the refunded money.
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Payment not credited yet, retry later",
+            )
+        return {"status": "no_matching_credit"}
+    if result["outcome"] == CLAWBACK_OUTCOME_DUPLICATE:
+        return {"status": "already_processed"}
+    if not is_refund:
+        # The "dispute opened" flag is closed now that the dispute has been decided.
+        try:
+            db.query(AuditLog).filter(
+                AuditLog.action == AUDIT_ACTION_PAYMENT_REVIEW,
+                AuditLog.resource_id == entity_id,
+                AuditLog.status == "pending",
+                AuditLog.details.contains('"dispute_opened"'),
+            ).update({AuditLog.status: "resolved"}, synchronize_session=False)
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.warning(f"Could not close the dispute flag for {entity_id}: {e}")
+    return {"status": "clawed_back" if not result["shortfall"] else "clawed_back_partial"}
 
 
 def _resolve_customer(db: Session, sender_id: str) -> Optional[Customer]:
@@ -391,6 +537,9 @@ async def razorpay_webhook(
     event = payload.get("event", "")
     logger.info(f"Received Razorpay webhook event: '{event}'")
 
+    if event in MONEY_BACK_EVENTS or event == EVENT_DISPUTE_CREATED:
+        return _handle_money_back_event(db, payload, event)
+
     if event not in ("payment_link.paid", "payment.captured", "order.paid"):
         return {"status": "ignored", "event": event}
 
@@ -400,6 +549,15 @@ async def razorpay_webhook(
         return {"status": "unparseable"}
 
     sender_id, amount_paid, payment_reference = extracted
+    currency = extract_currency(payload)
+    if currency != "INR":
+        # The wallet is in rupees: a payment in any other (or no) currency is never credited as rupees.
+        logger.error(
+            f"ALERT Razorpay payment {payment_reference}: currency '{currency or 'missing'}' is not INR; "
+            "NOT credited. Review it in the Razorpay dashboard."
+        )
+        _record_payment_review(db, payment_reference, "currency_not_inr", {"currency": currency, "event": event})
+        return {"status": "unsupported_currency"}
     if not sender_id:
         # Razorpay sends several events per payment; another event that did
         # carry the phone may already have credited it.

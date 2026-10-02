@@ -403,7 +403,7 @@ class RazorpayWebhookRouteTests(unittest.TestCase):
     # ── normal lifecycle ───────────────────────────────────────────────
 
     def test_unrelated_events_are_ignored(self):
-        response = self._post({"event": "refund.processed", "payload": {}})
+        response = self._post({"event": "payment.authorized", "payload": {}})
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "ignored")

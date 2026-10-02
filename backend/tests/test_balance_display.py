@@ -58,7 +58,7 @@ class PaymentConfirmationShowsRealBalanceTests(unittest.TestCase):
             return True
 
         payload = {"event": "payment.captured", "payload": {"payment": {"entity": {
-            "id": "pay_display1", "amount": 50000, "notes": {"sender_id": SENDER}}}}}
+            "id": "pay_display1", "amount": 50000, "currency": "INR", "notes": {"sender_id": SENDER}}}}}
         try:
             with patch.object(settings, "RAZORPAY_WEBHOOK_SECRET", ""), \
                  patch.object(settings, "ALLOW_UNSIGNED_WEBHOOKS", True), \

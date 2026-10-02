@@ -25,8 +25,10 @@ Every WhatsApp message is sent through the existing
 ``app.services.meta_whatsapp_service`` helpers — no HTTP logic lives here.
 """
 
+import json
 from typing import Optional, Tuple
 
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -34,7 +36,10 @@ from app.config import settings
 from app.models.customer import Customer
 from app.models.wallet_transaction import (
     KIND_CREDIT_PAYMENT,
+    KIND_CREDIT_WHATSAPP_PAY,
+    KIND_DEBIT_DISPUTE,
     KIND_DEBIT_ORDER,
+    KIND_DEBIT_REFUND,
     KIND_REFUND_ORDER,
     WalletTransaction,
 )
@@ -221,6 +226,129 @@ def credit_wallet(
         if not commit:
             raise  # caller's transaction is gone -- let it handle the failure
         return get_balance(db, whatsapp_id)
+
+
+# ─── Taking back refunded / charged-back payments ────────────────────────
+
+AUDIT_ACTION_CLAWBACK = "razorpay_clawback"
+AUDIT_RESOURCE_TYPE_CLAWBACK = "razorpay_payment"
+CLAWBACK_OUTCOME_APPLIED = "applied"
+CLAWBACK_OUTCOME_DUPLICATE = "duplicate"
+CLAWBACK_OUTCOME_NO_PAYMENT = "no_payment"
+
+
+def claw_back_payment(
+    db: Session,
+    *,
+    payment_id: str,
+    entity_id: str,
+    amount: int,
+    kind: str,
+) -> dict:
+    """Take back money Razorpay returned to the payer (a refund, or a chargeback that was lost).
+
+    Policy (decided by the owner): take what is in the wallet and flag the rest. The wallet never
+    goes below zero. If the customer already spent part of it, only the available part is taken
+    and the missing part is written to an audit row with status ``pending`` (needs manual review).
+
+    Safe against repeats and races: every claw-back for a payment first locks the customer row, then
+    looks for the audit row of this refund/dispute (``entity_id``). The audit row, the wallet change
+    and the ledger row are committed together, so each refund or dispute is applied exactly once.
+    Never takes back more than the payment originally credited, across all refunds and disputes.
+
+    Returns ``{"outcome": applied|duplicate|no_payment, "taken": int, "shortfall": int}``.
+    """
+    from app.models.audit_log import AuditLog
+
+    amount = max(int(amount), 0)
+    credit = (
+        db.query(WalletTransaction.customer_id, WalletTransaction.amount)
+        .filter(
+            WalletTransaction.kind.in_((KIND_CREDIT_PAYMENT, KIND_CREDIT_WHATSAPP_PAY)),
+            WalletTransaction.ref == payment_id,
+        )
+        .first()
+    )
+    if credit is None or amount == 0:
+        return {"outcome": CLAWBACK_OUTCOME_NO_PAYMENT, "taken": 0, "shortfall": 0}
+    customer_id, credited = credit[0], int(credit[1])
+
+    try:
+        # The lock makes concurrent claw-backs for this wallet run one after another.
+        balance = int(
+            db.query(Customer.wallet_balance).filter(Customer.id == customer_id).with_for_update().scalar() or 0
+        )
+        already = (
+            db.query(AuditLog.id)
+            .filter(AuditLog.action == AUDIT_ACTION_CLAWBACK, AuditLog.resource_id == entity_id)
+            .first()
+        )
+        if already is not None:
+            db.rollback()
+            return {"outcome": CLAWBACK_OUTCOME_DUPLICATE, "taken": 0, "shortfall": 0}
+
+        prefix = f"{payment_id}:"
+        taken_before = -int(
+            db.query(func.coalesce(func.sum(WalletTransaction.amount), 0))
+            .filter(
+                WalletTransaction.kind.in_((KIND_DEBIT_REFUND, KIND_DEBIT_DISPUTE)),
+                WalletTransaction.ref.startswith(prefix, autoescape=True),
+            )
+            .scalar()
+        )
+        remaining = max(credited - taken_before, 0)
+        wanted = min(amount, remaining)
+        take = min(wanted, balance)
+        shortfall = wanted - take
+
+        if take > 0:
+            updated = (
+                db.query(Customer)
+                .filter(Customer.id == customer_id, Customer.wallet_balance >= take)
+                .update({Customer.wallet_balance: Customer.wallet_balance - take}, synchronize_session=False)
+            )
+            if updated != 1:
+                raise RuntimeError("wallet row changed while locked")
+            record_ledger(db, customer_id=customer_id, kind=kind, amount=-take, ref=f"{prefix}{entity_id}")
+        db.add(
+            AuditLog(
+                user_id=None,
+                action=AUDIT_ACTION_CLAWBACK,
+                resource_id=entity_id,
+                resource_type=AUDIT_RESOURCE_TYPE_CLAWBACK,
+                # "pending" = part of the money could not be taken back; a person must review it.
+                status="pending" if shortfall or amount > remaining else "success",
+                details=json.dumps(
+                    {
+                        "payment_id": payment_id,
+                        "kind": kind,
+                        "requested": amount,
+                        "taken": take,
+                        "shortfall": shortfall,
+                        "over_original_payment": max(amount - remaining, 0),
+                    }
+                ),
+            )
+        )
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        # Only a repeat of this same refund/dispute is a duplicate; any other constraint failure must surface.
+        if db.query(AuditLog.id).filter(
+            AuditLog.action == AUDIT_ACTION_CLAWBACK, AuditLog.resource_id == entity_id
+        ).first() is None:
+            raise
+        return {"outcome": CLAWBACK_OUTCOME_DUPLICATE, "taken": 0, "shortfall": 0}
+    except Exception:
+        db.rollback()
+        raise
+
+    if shortfall:
+        logger.error(
+            f"ALERT payment {payment_id}: {kind} of ₹{amount} but only ₹{take} was in the wallet; "
+            f"₹{shortfall} could not be taken back and needs manual review (audit row {entity_id})."
+        )
+    return {"outcome": CLAWBACK_OUTCOME_APPLIED, "taken": take, "shortfall": shortfall}
 
 
 # ─── Paid generation accounting ──────────────────────────────────────────

@@ -28,9 +28,22 @@ KIND_DEBIT_ORDER = "debit_order"
 KIND_REFUND_ORDER = "refund_order"
 KIND_CREDIT_PAYMENT = "credit_payment"
 KIND_CREDIT_WHATSAPP_PAY = "credit_whatsapp_pay"
+# Money taken back because Razorpay refunded the payer or the payer won a chargeback.
+# ``ref`` is "<payment id>:<refund or dispute id>", so each event is taken back once
+# and the total taken back per payment can be summed.
+KIND_DEBIT_REFUND = "debit_refund"
+KIND_DEBIT_DISPUTE = "debit_dispute"
 
 LEDGER_KINDS = frozenset(
-    {KIND_OPENING_BALANCE, KIND_DEBIT_ORDER, KIND_REFUND_ORDER, KIND_CREDIT_PAYMENT, KIND_CREDIT_WHATSAPP_PAY}
+    {
+        KIND_OPENING_BALANCE,
+        KIND_DEBIT_ORDER,
+        KIND_REFUND_ORDER,
+        KIND_CREDIT_PAYMENT,
+        KIND_CREDIT_WHATSAPP_PAY,
+        KIND_DEBIT_REFUND,
+        KIND_DEBIT_DISPUTE,
+    }
 )
 
 

@@ -219,7 +219,7 @@ class RazorpayWebhookBillingTests(FundedSlotGateTestCase):
 
     def _payload(self, pay_id="pay_WEBHOOK1"):
         return {"event": "payment.captured", "payload": {"payment": {"entity": {
-            "id": pay_id, "amount": 50000, "notes": {"sender_id": SENDER}}}}}
+            "id": pay_id, "amount": 50000, "currency": "INR", "notes": {"sender_id": SENDER}}}}}
 
     def test_webhook_credits_then_sends_erpnext_invoice_once(self):
         _make_customer(self.session, balance=100)
