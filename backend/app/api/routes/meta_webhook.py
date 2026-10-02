@@ -580,6 +580,8 @@ ALREADY_CHOSEN_MESSAGE = (
     "Send the photo again if you want to place another order."
 )
 UNKNOWN_CHOICE_MESSAGE = "Sorry, we couldn't find that photo. Please send it again."
+# Largest wallet recharge a customer can ask for in one message (MON-12).
+MAX_RECHARGE_RUPEES = 50_000
 CAPACITY_MESSAGE = (
     "We can't generate new images right now, so nothing was charged. "
     "Your photo is saved, so you can tap your choice again once generation is available 🙏"
@@ -1114,6 +1116,13 @@ async def receive_webhook(
                         await send_whatsapp_text(
                             sender,
                             "Minimum recharge amount is ₹500 ⚠️\nPlease enter an amount of ₹500 or more."
+                        )
+                        continue
+                    if requested_amount > MAX_RECHARGE_RUPEES:
+                        await send_whatsapp_text(
+                            sender,
+                            f"The maximum recharge amount is ₹{MAX_RECHARGE_RUPEES:,} ⚠️\n"
+                            f"Please enter an amount of ₹{MAX_RECHARGE_RUPEES:,} or less."
                         )
                         continue
 

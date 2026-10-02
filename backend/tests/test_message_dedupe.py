@@ -102,6 +102,13 @@ class WebhookDuplicateTests(TierWebhookBase):
         self._post(_text("recharge 500", "wamid.recharge.1"))
         self.assertEqual(self.cta.await_count, 1)
 
+    def test_a_recharge_above_the_maximum_is_refused_and_the_maximum_is_allowed(self):
+        self._post(_text("recharge 50001", "wamid.big.1"))
+        self.assertEqual(self.cta.await_count, 0)
+        self.assertTrue(any("maximum recharge" in (t or "").lower() for t in self.sent_texts))
+        self._post(_text("recharge 50000", "wamid.big.2"))
+        self.assertEqual(self.cta.await_count, 1)
+
     def test_two_different_messages_are_both_handled(self):
         self._post(_text("recharge 500", "wamid.recharge.1"))
         self._post(_text("recharge 500", "wamid.recharge.2"))
