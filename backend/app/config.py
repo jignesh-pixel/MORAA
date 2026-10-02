@@ -452,6 +452,9 @@ class Settings(BaseSettings):
     # How many paid provider calls may run at once in this process (0 = no limit) and how many paid orders one
     # customer may have in progress (0 = no limit). Size the first to the provider quota (Q-6).
     MAX_CONCURRENT_PROVIDER_CALLS: int = 0
+    # Team (ADMIN) orders are not part of the customers' daily ceiling but have a ceiling of their own, so a mistake
+    # or a loop on a team phone cannot spend without limit (COST-2). 0 = no limit.
+    MAX_ADMIN_GENERATIONS_PER_DAY: int = 200
     MAX_INFLIGHT_ORDERS_PER_CUSTOMER: int = 3
     CIRCUIT_BREAKER_FAILURES: int = 5
     CIRCUIT_BREAKER_COOLDOWN_SECONDS: float = 60.0

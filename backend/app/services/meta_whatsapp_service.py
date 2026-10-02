@@ -1734,9 +1734,16 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
 
         spend_reserved = False
         if not DRY_RUN_IMAGE_MODE and ent.is_admin(_find_cust(db, ingestion.external_user_id)):
-            # Team (ADMIN) order: not counted against the daily spend cap
-            # (the GENERATION_ENABLED kill switch still applies per call).
+            # Team (ADMIN) order: not part of the customers' daily ceiling, but counted against the team ceiling
+            # (COST-2). The GENERATION_ENABLED kill switch still applies per call.
+            from app.ai.image_generation_manager import admin_spend_key, reserve_admin_slots
+
+            _release_db(db)
+            blocked = await run_io(reserve_admin_slots, len(style_jobs))
+            if blocked:
+                return await _fail(f"Generation blocked: {blocked}")
             spend_reserved = True
+            held_slots, held_day = len(style_jobs), admin_spend_key()
         elif not DRY_RUN_IMAGE_MODE:
             from app.ai.image_generation_manager import current_spend_day, reserve_generation_slots
 
@@ -2069,6 +2076,15 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
 
             admin_order = ent.is_admin(_find_cust(db, recipient_id))
             _release_db(db)           # no connection held during the 15-40 s provider wait (PERF-1)
+            admin_key = None
+            if admin_order:
+                # Counted against the team ceiling (COST-2) instead of the customers' one.
+                from app.ai.image_generation_manager import admin_spend_key, reserve_admin_slots
+
+                blocked = await run_io(reserve_admin_slots, 1)
+                if blocked:
+                    return await _fail(f"Generation blocked: {blocked}")
+                admin_key = admin_spend_key()
             result = await ImageGenerationManager().generate_image(
                 prompt=build_ecommerce_shot_prompt(),
                 context={"request_id": order_request_id, "aspect_ratio": "1:1"},
@@ -2076,6 +2092,10 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
                 reference_mime_type=reference_mime_type,
                 **({"spend_reserved": True} if admin_order else {}),
             )
+            if admin_key and not result.success:
+                from app.ai.image_generation_manager import release_admin_slots
+
+                await run_io(release_admin_slots, 1, admin_key)         # a failed team call does not use up the ceiling
             generated_bytes = _result_bytes(result) if result.success else None
             if not result.success or (not generated_bytes and not getattr(result, "image_url", None)
                                       and not getattr(result, "image_data", None)):

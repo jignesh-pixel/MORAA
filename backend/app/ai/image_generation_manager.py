@@ -279,6 +279,55 @@ def _spend_check(count: int, consume: bool) -> Optional[str]:
     return None
 
 
+_admin_lock = threading.Lock()
+_admin_day: Optional[str] = None
+_admin_count: int = 0
+
+
+def admin_spend_key() -> str:
+    """Counter key for team orders: 'a' + YYMMDD (the counter's day column is 10 characters wide)."""
+    return "a" + _today().replace("-", "")[2:]
+
+
+def reserve_admin_slots(count: int) -> Optional[str]:
+    """Take ``count`` slots from the TEAM daily ceiling (MAX_ADMIN_GENERATIONS_PER_DAY). None = reserved (or the team
+    ceiling is off), else the reason the order is refused. The kill switch applies."""
+    global _admin_day, _admin_count
+    if getattr(settings, "GENERATION_ENABLED", True) is False:
+        return "Image generation is disabled (GENERATION_ENABLED=false)"
+    cap = int(getattr(settings, "MAX_ADMIN_GENERATIONS_PER_DAY", 0) or 0)
+    if cap <= 0:
+        return None
+    n = max(int(count), 1)
+    key = admin_spend_key()
+    shared = spend_counter.reserve(key, n, cap)
+    if shared is True:
+        return None
+    if shared is False:
+        return "Team daily image limit reached (MAX_ADMIN_GENERATIONS_PER_DAY)"
+    with _admin_lock:
+        if _admin_day != key:
+            _admin_day, _admin_count = key, 0
+        if _admin_count + n > cap:
+            return "Team daily image limit reached (MAX_ADMIN_GENERATIONS_PER_DAY)"
+        _admin_count += n
+    return None
+
+
+def release_admin_slots(count: int, key: Optional[str] = None) -> None:
+    """Give team slots back after a failed call."""
+    global _admin_count
+    n = max(int(count), 0)
+    if not n or int(getattr(settings, "MAX_ADMIN_GENERATIONS_PER_DAY", 0) or 0) <= 0:
+        return
+    charged = key or admin_spend_key()
+    if spend_counter.release(charged, n) is True:
+        return
+    with _admin_lock:
+        if _admin_day == charged:
+            _admin_count = max(_admin_count - n, 0)
+
+
 def current_spend_day() -> str:
     """Today's UTC date as used by the spend counter. Capture it when slots are taken and pass it to
     ``release_generation_slots``, so a release after midnight UTC still credits the day that was charged."""
@@ -291,6 +340,9 @@ def release_generation_slots(count: int, day: Optional[str] = None) -> None:
     ``day`` is the day the slots were taken on (default: today)."""
     global _spend_count
     n = max(int(count), 0)
+    if day and day.startswith("a"):             # a team slot: see reserve_admin_slots
+        release_admin_slots(n, day)
+        return
     if not n or not _counts_against_cap():
         return
     charged_day = day or _today()
