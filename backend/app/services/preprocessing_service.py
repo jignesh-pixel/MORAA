@@ -19,6 +19,7 @@ from PIL import Image as PILImage
 from PIL import ImageOps, UnidentifiedImageError
 
 from app.config import settings
+from app.utils.executors import run_cpu
 from app.utils.logger import logger
 
 
@@ -99,6 +100,9 @@ class PreprocessingService:
     ) -> PreprocessingResult:
         """Preprocess a single image: validate, resize, compress.
 
+        The decode / resize / JPEG encode is CPU-heavy (seconds for a large photo), so it runs on the CPU pool
+        and never blocks the event loop (PERF-6).
+
         Args:
             file_path: Absolute path to the original image.
             output_dir: Optional directory for the processed image.
@@ -107,6 +111,14 @@ class PreprocessingService:
         Returns:
             ``PreprocessingResult`` with processed image details.
         """
+        return await run_cpu(self._preprocess_sync, file_path, output_dir)
+
+    def _preprocess_sync(
+        self,
+        file_path: str,
+        output_dir: Optional[str] = None,
+    ) -> PreprocessingResult:
+        """The blocking body of ``preprocess`` (unchanged logic)."""
         path = Path(file_path)
         original_size = path.stat().st_size if path.exists() else 0
 

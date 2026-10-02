@@ -62,6 +62,8 @@ def setup_logging() -> None:
         # diagnose=True wrote every local variable (payment payloads, tokens,
         # phone numbers) into the error log on each exception.
         diagnose=False,
+        # File writes go through a background queue so logging never blocks the event loop (PERF-6).
+        enqueue=True,
     )
 
     # File handler - all logs
@@ -72,6 +74,7 @@ def setup_logging() -> None:
         rotation="1 day",
         retention="7 days",
         compression="gz",
+        enqueue=True,
     )
 
     # File handler - upload logs (separate file)
@@ -82,6 +85,7 @@ def setup_logging() -> None:
         rotation="1 day",
         retention="30 days",
         filter=lambda record: record["extra"].get("category") == "upload",
+        enqueue=True,
     )
 
     # File handler - API logs
@@ -92,6 +96,7 @@ def setup_logging() -> None:
         rotation="1 day",
         retention="7 days",
         filter=lambda record: record["extra"].get("category") == "api",
+        enqueue=True,
     )
 
     logger.info("Logging configured successfully")

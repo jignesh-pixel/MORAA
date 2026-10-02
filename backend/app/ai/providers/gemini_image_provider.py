@@ -190,18 +190,16 @@ class GeminiImageProvider(BaseImageGenerationProvider):
                         image_data = part.inline_data.data
                         mime_type = part.inline_data.mime_type or "image/png"
 
-                        image_base64 = base64.b64encode(image_data).decode("utf-8")
-                        image_url = f"data:{mime_type};base64,{image_base64}"
-
                         processing_time = time.time() - start_time
                         logger.info(
                             f"GeminiImageProvider completed "
                             f"request_id={request_id} time={processing_time:.2f}s"
                         )
 
+                        # Raw bytes only: the base64 data URL is built by result.as_data_url() if a caller
+                        # ever needs it (PERF-5).
                         return ImageGenerationResult(
                             success=True,
-                            image_url=image_url,
                             image_data=image_data,
                             mime_type=mime_type,
                             provider_name=self.provider_name,

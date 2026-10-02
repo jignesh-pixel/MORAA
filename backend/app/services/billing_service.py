@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, Optional
 
 from app.config import settings
 from app.services.erpnext_service import get_erpnext_service
+from app.utils.executors import run_cpu
 from app.utils.logger import logger, mask_phone
 _GSTIN_RE = re.compile(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]$")
 _PLACEHOLDER_NAMES = {"", "valued customer", "jewelry business", "there", "customer"}
@@ -74,7 +75,8 @@ async def dispatch_payment_invoice(
     try:
         inv_suffix = payment_id[-4:] if len(payment_id) >= 4 else "1042"
         inv_number = f"Invoice_MoraaStudio_{inv_suffix}"
-        pdf_bytes = local_pdf_fn(customer_name=customer_name, invoice_number=inv_number, amount=amount)
+        # ReportLab rendering is CPU work: keep it off the event loop.
+        pdf_bytes = await run_cpu(local_pdf_fn, customer_name=customer_name, invoice_number=inv_number, amount=amount)
         await send_document_fn(
             recipient_id=recipient_id,
             document_bytes=pdf_bytes,

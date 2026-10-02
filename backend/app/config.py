@@ -396,6 +396,11 @@ class Settings(BaseSettings):
     # Daily ceiling on ImageGenerationManager.generate_image() calls.
     MAX_GENERATIONS_PER_DAY: int = 100000
 
+    # --- Worker thread pools (app/utils/executors.py); 0 = automatic ---
+    CPU_WORKER_THREADS: int = 0
+    IO_WORKER_THREADS: int = 0
+    NET_WORKER_THREADS: int = 0
+
     # --- Database connection pool (PostgreSQL; app/database.py) ---
     DB_POOL_SIZE: int = 10
     DB_MAX_OVERFLOW: int = 10
@@ -417,8 +422,8 @@ class Settings(BaseSettings):
     # Whole Catalog Pack: styles still running after this long are dropped and the pack ships with the
     # styles that finished (a pack whose styles all fail is failed and refunded as before).
     # Sized for the worst case of one style (a rate-limited primary with retries, then a slow fallback, about
-    # 350 s) and kept under the 10-minute stuck-order limit.
-    PACK_GENERATION_DEADLINE_SECONDS: float = 420.0
+    # 350 s) and, with the Meta upload that follows (up to ~190 s), kept under the 10-minute stuck-order limit.
+    PACK_GENERATION_DEADLINE_SECONDS: float = 360.0
 
     # Styles generated per WhatsApp Earring Catalog Pack (6 styles exist).
     # None = all styles (production: the full 6-shot E-Com Pack 1).

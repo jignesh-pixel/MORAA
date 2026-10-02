@@ -92,6 +92,7 @@ from app.services.wallet_service import (
 )
 from app.utils.logger import logger, mask_phone
 from app.ai.image_generation_manager import generation_capacity_blocked
+from app.utils.executors import run_cpu
 from app.utils.phone import same_phone
 from app.services.message_dedupe import claim_message, release_messages
 
@@ -688,7 +689,7 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
         await send_whatsapp_text(sender, UNREADABLE_IMAGE_MESSAGE, reply_to_message_id=message_id)
         return None
     image_bytes, content_type = download_result
-    is_valid, validation_error = validate_image(image_bytes, content_type)
+    is_valid, validation_error = await run_cpu(validate_image, image_bytes, content_type)   # PIL decode: off the loop
     if not is_valid:
         _reject(f"Invalid image: {validation_error}")
         await send_whatsapp_text(sender, UNREADABLE_IMAGE_MESSAGE, reply_to_message_id=message_id)

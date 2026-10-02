@@ -75,7 +75,7 @@ def test_whatsapp_dry_run_follows_settings_not_os_environ():
             with patch.object(igm.ImageGenerationManager, "generate_image", boom):
                 out = asyncio.run(mws._generate_single_pack_style(
                     "ing-1", "Clean E-Commerce", "p", b"\x89PNG", "image/png", "req-1"))
-            assert out and out.startswith("data:image/png")
+            assert out == b"\x89PNG"      # raw bytes now (PERF-5); the dry run echoes the reference image back
     finally:
         with patch.object(settings, "DRY_RUN_IMAGE_MODE", False):
             importlib.reload(mws)

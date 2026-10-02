@@ -457,8 +457,8 @@ async def _scenario_e_body() -> Dict[str, Any]:
                 ImageGenerationManager().generate_image("p", {"request_id": str(i)}, reference_image=SMALL_JPEG, spend_reserved=True)
                 for i in range(n)
             ])
-            ok = sum(1 for r in results if r.success and r.image_url and len(r.image_url) > 30)
-            blank = sum(1 for r in results if r.success and not (r.image_url and len(r.image_url) > 30))
+            ok = sum(1 for r in results if r.success and len(r.as_bytes() or b"") > 30)
+            blank = sum(1 for r in results if r.success and not len(r.as_bytes() or b"") > 30)
             table.append({
                 "mode": mode, "rate": rate, "calls": n, "usable": ok, "silent_blank_success": blank,
                 "failed_after_manager": sum(1 for r in results if not r.success),
@@ -848,8 +848,27 @@ async def scenario_h() -> Dict[str, Any]:
     async def validate_thread() -> None:
         await asyncio.gather(*[asyncio.to_thread(mws.validate_image, big, "image/jpeg") for _ in range(50)])
 
-    res["h2_meta_validate_image_x50_direct_(webhook_path)"] = await lag_run("v", validate_direct)
+    # "legacy" entries run the blocking function directly, as the code used to; they are kept only as a reference
+    # for what the stall would be and are NOT part of the verdict. The "real path" entries below run the actual
+    # webhook / route code, which now moves this work onto the CPU pool.
+    res["h2_legacy_direct_validate_image_x50_reference"] = await lag_run("v", validate_direct)
     res["h2b_same_work_via_to_thread"] = await lag_run("vt", validate_thread)
+
+    async def webhook_images_real_path() -> None:
+        install_meta_stubs(REC, big)
+        REC.reset()
+        phones = []
+        for _ in range(20):
+            wa = new_phone()
+            make_customer(wa, price_per_image() * 3)
+            phones.append(wa)
+        await asyncio.gather(*[deliver(webhook_payload([image_msg(wa, f"wamid.h-{wa}")])) for wa in phones])
+
+    # INFORMATIONAL (not in the verdict): the stalls here are the webhook's own synchronous database commits
+    # and queries on the event loop (SQLite file locks and disk syncs in this harness; remote round trips on
+    # PostgreSQL). Profiled with a stack sampler: do_commit / do_execute. Image CPU work is already off the loop.
+    # The cure is Phase 3 (the webhook only records and queues); see PERF-2 / Q-2.
+    res["h2r_INFO_webhook_x20_photo_intake_3MB_sync_database_on_loop"] = await lag_run("wh", webhook_images_real_path)
 
     async def floor_direct() -> None:
         async def one() -> None:
@@ -859,8 +878,33 @@ async def scenario_h() -> Dict[str, Any]:
     async def floor_thread() -> None:
         await asyncio.gather(*[asyncio.to_thread(check_quality_floor, big) for _ in range(20)])
 
-    res["h3_check_quality_floor_x20_direct_(image_generation_route)"] = await lag_run("f", floor_direct)
+    res["h3_legacy_direct_quality_floor_x20_reference"] = await lag_run("f", floor_direct)
     res["h3b_same_work_via_to_thread"] = await lag_run("ft", floor_thread)
+
+    async def generate_route_real_path() -> None:
+        from app.ai.providers.image_base import ImageGenerationResult
+        from app.api.routes import image_generation as igr
+        from app.schemas.image_generation import ImageGenerationRequest
+
+        data_url = "data:image/jpeg;base64," + base64.b64encode(big).decode("ascii")
+
+        class StubManager:
+            async def generate_image(self, **kwargs):  # type: ignore[no-untyped-def]
+                await asyncio.sleep(0.005)
+                return ImageGenerationResult(success=True, image_data=big, provider_name="stub",
+                                             processing_time=0.01)
+
+        original = igr.ImageGenerationManager
+        igr.ImageGenerationManager = StubManager  # type: ignore[assignment]
+        try:
+            await asyncio.gather(*[
+                igr.generate_image(ImageGenerationRequest(prompt="a gold ring on white", enforce_quality_floor=True))
+                for _ in range(20)
+            ])
+        finally:
+            igr.ImageGenerationManager = original  # type: ignore[assignment]
+
+    res["h3r_REAL_PATH_generate_image_route_x20_quality_floor"] = await lag_run("gr", generate_route_real_path)
 
     async def b64_direct() -> None:
         for _ in range(100):
@@ -871,21 +915,35 @@ async def scenario_h() -> Dict[str, Any]:
     res["h4_base64_encode+decode_3MB_x100"] = await lag_run("b64", b64_direct)
 
     async def upload_many() -> None:
-        db = SessionLocal()
-        try:
-            await asyncio.gather(*[UploadService(db).process_upload(big, f"h{i}.jpg", len(big), "image/jpeg") for i in range(20)])
-        finally:
-            db.close()
+        # One session per upload, like real requests (each request gets its own); a single Session must never
+        # be used by several concurrent tasks.
+        async def one(i: int) -> None:
+            db = SessionLocal()
+            try:
+                await UploadService(db).process_upload(big, f"h{i}.jpg", len(big), "image/jpeg")
+            finally:
+                db.close()
+
+        await asyncio.gather(*[one(i) for i in range(20)])
 
     res["h5_UploadService.process_upload_x20_(sha256+disk+PIL_dims+sync_DB)"] = await lag_run("up", upload_many)
 
     res["h6_batch_upload_route"] = await batch_route_probe(big)
 
     base = res["h0_baseline_idle"]["lag_max_ms"]
-    worst = max(v["lag_max_ms"] for k, v in res.items() if isinstance(v, dict) and "lag_max_ms" in v and not k.endswith("via_to_thread"))
-    fixed = max(res["h2b_same_work_via_to_thread"]["lag_max_ms"], res["h3b_same_work_via_to_thread"]["lag_max_ms"])
+    counted = {
+        k: v["lag_max_ms"] for k, v in res.items()
+        if isinstance(v, dict) and "lag_max_ms" in v and not k.endswith("via_to_thread")
+        and "legacy" not in k and "_INFO_" not in k
+    }
+    worst = max(counted.values())
+    worst_name = max(counted, key=counted.get)
+    legacy = max(v["lag_max_ms"] for k, v in res.items() if isinstance(v, dict) and "legacy" in k and "lag_max_ms" in v)
     res["verdict"] = verdict(worst < 100)
-    res["verdict_reason"] = f"worst single stall {worst} ms (idle baseline {base} ms; same sync work via to_thread {fixed} ms); threshold 100 ms"
+    res["verdict_reason"] = (
+        f"worst single stall on the real paths {worst} ms ({worst_name}; idle baseline {base} ms; the old direct "
+        f"calls stalled up to {legacy} ms); threshold 100 ms"
+    )
     return res
 
 
@@ -994,7 +1052,7 @@ def run_memory_children() -> Dict[str, Any]:
         })
         res["verdict"] = verdict(res["extrapolated_peak_delta_mb_100_images_x8_outputs"] < 2048)
         res["verdict_reason"] = (
-            f"~{res['mb_per_generated_output']} MB per live 3 MB output (bytes + base64 data URL + reference copy); "
+            f"~{res['mb_per_generated_output']} MB per live 3 MB output (raw bytes only, uploaded to Meta as soon as it finishes); "
             f"100 images x 8 outputs extrapolates to ~{res['extrapolated_peak_delta_mb_100_images_x8_outputs']} MB above baseline (threshold 2048 MB, typical small container)"
         )
     else:

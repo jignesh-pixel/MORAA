@@ -148,12 +148,12 @@ class FakeImageProvider(BaseImageGenerationProvider):
                 return ImageGenerationResult(
                     success=True, image_url="data:image/png;base64,", image_data=b"", provider_name=self._name, processing_time=elapsed
                 )
-            # Fresh allocation per result, like a real API response (bytes + base64 data URL).
+            # Fresh allocation per result, like a real API response. The real providers return the raw bytes
+            # only (no base64 data-URL copy, PERF-5), so the fake does the same.
             data = self._payload[:-1] + bytes([salt])
-            url = "data:image/png;base64," + base64.b64encode(data).decode("utf-8")
             self.stats.leave(True, None)
             return ImageGenerationResult(
-                success=True, image_url=url, image_data=data, provider_name=self._name, processing_time=elapsed
+                success=True, image_data=data, provider_name=self._name, processing_time=elapsed
             )
         except BaseException:
             self.stats.leave(False, "cancelled")

@@ -21,13 +21,13 @@ No customer-facing message ever contains raw model output: rejections use the
 fixed templates in this module.
 """
 
-import asyncio
 import json
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from app.config import settings
+from app.utils.executors import run_net
 from app.utils.logger import logger
 
 # ─── Reason codes ────────────────────────────────────────────────────────
@@ -305,8 +305,9 @@ async def check_image_quality(
             max_output_tokens=max_output_tokens,
         )
 
-        # Mirror GeminiImageProvider: run the sync SDK call in a thread.
-        response = await asyncio.to_thread(
+        # The sync SDK call (up to 30 s) runs on its own network pool, so a burst of pre-checks can neither
+        # starve nor be starved by image generation or the short database jobs (PERF-3).
+        response = await run_net(
             client.models.generate_content,
             model=model_name,
             contents=[VALIDATION_PROMPT, image_part],

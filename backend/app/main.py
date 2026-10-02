@@ -157,6 +157,12 @@ async def lifespan(app: FastAPI):
     if reconcile_task is not None:
         reconcile_task.cancel()
     try:
+        from app.utils.executors import shutdown_executors
+
+        shutdown_executors()
+    except Exception as e:  # noqa: BLE001
+        logger.bind(category="system").warning(f"Worker pool shutdown skipped: {e}")
+    try:
         from app.ai.providers.gemini_image_provider import close_gemini_client
         from app.ai.providers.openai_image_provider import close_openai_client
 

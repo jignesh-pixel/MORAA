@@ -1280,6 +1280,17 @@ def _data_url_to_bytes(data_url: str) -> Optional[bytes]:
         return None
 
 
+def _result_bytes(result: Any) -> Optional[bytes]:
+    """Raw image bytes of a generation result: its ``image_data``, else decoded from a data URL (older callers)."""
+    data = getattr(result, "image_data", None)
+    if isinstance(data, (bytes, bytearray)) and data:
+        return bytes(data)
+    url = getattr(result, "image_url", None)
+    if isinstance(url, str) and url:
+        return _data_url_to_bytes(url)
+    return None
+
+
 def _bytes_to_data_url(
     image_bytes: bytes, mime_type: Optional[str] = None
 ) -> str:
@@ -1301,8 +1312,8 @@ async def _generate_single_pack_style(
     reference_mime_type: str,
     request_id: str,
     spend_reserved: bool = False,
-) -> Optional[str]:
-    """Generate one style of the catalog pack and return its image data URL."""
+) -> Optional[bytes]:
+    """Generate one style of the catalog pack and return the raw image bytes (None when it failed)."""
     if DRY_RUN_IMAGE_MODE:
         # ZERO-COST TEST MODE — never call the Gemini / Nano Banana API. Echo the
         # uploaded reference image back so the rest of the pipeline still runs.
@@ -1310,7 +1321,7 @@ async def _generate_single_pack_style(
             f"[TEST MODE - No API Charge] dry-run generation for style='{style_title}' "
             f"ingestion_id={ingestion_id}: returning input image, no provider call made"
         )
-        return _bytes_to_data_url(reference_image_bytes, reference_mime_type)
+        return reference_image_bytes
 
     try:
         from app.ai.image_generation_manager import ImageGenerationManager
@@ -1324,14 +1335,15 @@ async def _generate_single_pack_style(
             spend_reserved=spend_reserved,
         )
 
-        if not result.success or not result.image_url:
+        image_bytes = _result_bytes(result) if result.success else None
+        if not image_bytes:
             logger.error(
                 f"Catalog pack generation failed for style='{style_title}' "
                 f"ingestion_id={ingestion_id}: {result.error}"
             )
             return None
 
-        return result.image_url
+        return image_bytes
 
     except Exception as e:
         logger.error(
@@ -1339,6 +1351,37 @@ async def _generate_single_pack_style(
             f"ingestion_id={ingestion_id}: {e}"
         )
         return None
+
+
+async def _generate_and_upload_style(
+    generate_deadline_seconds: float = 0.0, **kwargs: Any
+) -> Tuple[bool, Optional[str]]:
+    """Generate one style, then upload it to Meta AT ONCE and let go of the bytes (PERF-5).
+
+    Holding all six finished images (each several MB) until the last style completes is what made memory grow
+    with every concurrent Pack; now each image lives only from "generated" to "uploaded". Returns
+    ``(generated, media_id)``: ``(False, None)`` = the style failed, ``(True, None)`` = generated but the
+    Meta upload failed, so the worker can still tell those two failures apart.
+
+    ``generate_deadline_seconds`` bounds the GENERATION only (EXT-1): a style that finished in time is always
+    uploaded and delivered, never cancelled half-way through its upload by the pack deadline.
+    """
+    try:
+        if generate_deadline_seconds and generate_deadline_seconds > 0:
+            image_bytes = await asyncio.wait_for(_generate_single_pack_style(**kwargs), timeout=generate_deadline_seconds)
+        else:
+            image_bytes = await _generate_single_pack_style(**kwargs)
+    except asyncio.TimeoutError:
+        logger.error(
+            f"Catalog pack style '{kwargs.get('style_title')}' still generating after "
+            f"{generate_deadline_seconds:.0f}s; dropped ingestion_id={kwargs.get('ingestion_id')}"
+        )
+        return False, None
+    if not image_bytes:
+        return False, None
+    media_id = await upload_media_to_meta(image_bytes)
+    del image_bytes
+    return True, (media_id or None)
 
 
 async def _gather_styles_with_deadline(
@@ -1521,7 +1564,8 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
 
         gather_results = await _gather_styles_with_deadline(
             [
-                _generate_single_pack_style(
+                _generate_and_upload_style(
+                    generate_deadline_seconds=float(settings.PACK_GENERATION_DEADLINE_SECONDS or 0),
                     ingestion_id=ingestion_id,
                     style_title=style_title,
                     prompt=prompt,
@@ -1532,31 +1576,20 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
                 )
                 for style_title, prompt in style_jobs
             ],
-            float(settings.PACK_GENERATION_DEADLINE_SECONDS or 0),
+            0,      # no overall cut-off here: each style bounds its own generation, and uploads are never cut
             ingestion_id,
         )
 
-        generated_data_urls: List[str] = [
-            data_url for data_url in gather_results if data_url
-        ]
+        # Each style was uploaded to Meta the moment it finished; a style that failed (or was dropped at the
+        # deadline) is None. Same order as the styles, failures skipped, exactly as before.
+        generated_any = any(r and r[0] for r in gather_results)
+        media_ids: List[str] = [r[1] for r in gather_results if r and r[1]]
 
-        if not generated_data_urls:
+        if not generated_any:
             return await _fail("All catalog style generations failed")
 
         if not _advance_status(db, ingestion_id, "processing", "generated"):
             return False
-
-        media_ids: List[str] = []
-        for data_url in generated_data_urls:
-            generated_image_bytes = _data_url_to_bytes(data_url)
-            if not generated_image_bytes:
-                continue
-
-            media_id = await upload_media_to_meta(generated_image_bytes)
-            if not media_id:
-                continue
-
-            media_ids.append(media_id)
 
         if not media_ids:
             return await _fail("All Meta media uploads failed", delivery=True)
@@ -1797,7 +1830,7 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
                 f"[TEST MODE - No API Charge] White BG dry-run ingestion_id={ingestion_id}: "
                 "echoing input image, no provider call made"
             )
-            data_url = _bytes_to_data_url(reference_image_bytes, reference_mime_type)
+            generated_bytes: Optional[bytes] = reference_image_bytes
         else:
             from app.ai.image_generation_manager import ImageGenerationManager
 
@@ -1817,14 +1850,14 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
                 reference_mime_type=reference_mime_type,
                 **({"spend_reserved": True} if admin_order else {}),
             )
-            if not result.success or not result.image_url:
+            generated_bytes = _result_bytes(result) if result.success else None
+            if not result.success or (not generated_bytes and not getattr(result, "image_url", None)
+                                      and not getattr(result, "image_data", None)):
                 return await _fail(f"Generation failed: {result.error}")
-            data_url = result.image_url
             provider_name = result.provider_name or ""
             model_used = result.model_used or ""
             fallback_used = bool(result.fallback_used)
 
-        generated_bytes = _data_url_to_bytes(data_url)
         if not generated_bytes:
             return await _fail("Failed to decode generated image data")
 

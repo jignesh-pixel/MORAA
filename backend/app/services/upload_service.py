@@ -37,6 +37,7 @@ from app.utils.file_helpers import (
     validate_file_extension,
     validate_file_size,
 )
+from app.utils.executors import run_cpu, run_io
 from app.utils.logger import logger
 
 
@@ -83,8 +84,6 @@ class UploadService:
         The ``request_id`` is the single correlation ID used throughout
         the entire processing lifecycle.
         """
-        proc = ProcessingService(self.db)
-
         # ── Generate request ID ──────────────────────────────────────────
         request_id = str(uuid.uuid4())
 
@@ -94,18 +93,49 @@ class UploadService:
         # ── Sanitise filename ────────────────────────────────────────────
         safe_filename = sanitize_filename(filename)
 
+        # Hashing, writing the file and reading its dimensions are CPU / disk work (PERF-6): done on the CPU
+        # pool. The database records are written on the I/O pool (PERF-2), so a slow remote database round
+        # trip never blocks the event loop. The session is used by one thread at a time (awaited in turn).
+        image_hash, file_path, stored_name, width, height = await run_cpu(
+            self._store_file, file_data, request_id, safe_filename
+        )
+        return await run_io(
+            self._persist_upload,
+            request_id, safe_filename, filename, file_size, mime_type,
+            image_hash, file_path, stored_name, width, height, user_id, session_id,
+        )
+
+    def _store_file(self, file_data: bytes, request_id: str, safe_filename: str):
+        """Hash the bytes, store them in the isolated request directory, read the image size (blocking)."""
         # ── Compute SHA-256 hash for integrity & deduplication ───────────
         image_hash = hashlib.sha256(file_data).hexdigest()
 
         # ── Store file in isolated directory ─────────────────────────────
         upload_dir = settings.UPLOAD_PATH
-        file_path, stored_name = generate_storage_path(
-            upload_dir, request_id, safe_filename
-        )
+        file_path, stored_name = generate_storage_path(upload_dir, request_id, safe_filename)
         save_upload_file(file_path.parent, file_data, file_path.name)
 
         # ── Extract metadata ─────────────────────────────────────────────
         width, height = get_image_dimensions(str(file_path))
+        return image_hash, file_path, stored_name, width, height
+
+    def _persist_upload(
+        self,
+        request_id: str,
+        safe_filename: str,
+        filename: str,
+        file_size: int,
+        mime_type: str,
+        image_hash: str,
+        file_path,
+        stored_name: str,
+        width,
+        height,
+        user_id: Optional[str],
+        session_id: Optional[str],
+    ) -> UploadResponse:
+        """Write the image record, the processing steps and the audit row (blocking database work)."""
+        proc = ProcessingService(self.db)
         ext = get_file_extension(safe_filename)
         image_url = f"/uploads/{request_id}/{file_path.name}"
 

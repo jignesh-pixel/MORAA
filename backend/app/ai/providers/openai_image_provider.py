@@ -283,7 +283,6 @@ class OpenAIImageProvider(BaseImageGenerationProvider):
                 # Prefer b64_json if available (faster, no extra fetch)
                 if image_data_b64:
                     image_bytes = base64.b64decode(image_data_b64)
-                    data_url = f"data:image/png;base64,{image_data_b64}"
 
                     processing_time = time.time() - start_time
                     logger.info(
@@ -291,9 +290,9 @@ class OpenAIImageProvider(BaseImageGenerationProvider):
                         f"request_id={request_id} time={processing_time:.2f}s"
                     )
 
+                    # Raw bytes only (PERF-5): result.as_data_url() builds the data URL on demand.
                     return ImageGenerationResult(
                         success=True,
-                        image_url=data_url,
                         image_data=image_bytes,
                         mime_type="image/png",
                         provider_name=self.provider_name,
@@ -311,8 +310,6 @@ class OpenAIImageProvider(BaseImageGenerationProvider):
                         img_resp = await hx.get(image_url_from_api)
                         img_resp.raise_for_status()
                         image_bytes = img_resp.content
-                        image_data_b64 = base64.b64encode(image_bytes).decode("utf-8")
-                        data_url = f"data:image/png;base64,{image_data_b64}"
 
                     processing_time = time.time() - start_time
                     revised_prompt = getattr(response.data[0], "revised_prompt", None)
@@ -324,7 +321,6 @@ class OpenAIImageProvider(BaseImageGenerationProvider):
 
                     return ImageGenerationResult(
                         success=True,
-                        image_url=data_url,
                         image_data=image_bytes,
                         mime_type="image/png",
                         provider_name=self.provider_name,
