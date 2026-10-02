@@ -24,5 +24,21 @@ auth hardening (0015: admin role, token revocation, single-use refresh), config 
 live database check, which fails until production is upgraded past revision 0008 (by design).
 Owner questions: see `docs/QUESTIONS_FOR_MORNING.md` (Operations section).
 
-## Scale architecture - IN PROGRESS (branch `phase-5-scale`) (some parts need owner decisions: hosting, Redis, storage)
+## Scale architecture - DEVELOPED in part (branch `phase-5-scale`); awaiting verification
+Built (all behind settings, nothing needs Redis): pure-ASGI middleware (PERF-7; the rate-limit table was already pruned, PERF-8);
+streamed upload size checks and length caps on base64 fields (SEC-8); API docs off in production and an admin-only ingestion
+status endpoint (SEC-7, part); per-provider circuit breaker and token bucket (EXT-6); a durable outbox in the database (Q-5)
+that now carries ops-team forwards, invoice sends and the start of every paid order (Q-1, part: a crash or deploy before an order
+starts no longer strands it); scheduler leases so periodic jobs run in one process only (ARC-2); a priority gate for provider
+calls and a per-customer limit on orders in progress (Q-6); interrupted-photo recovery (Q-2, part); honest delivery estimates
+(UX-2); Dockerfile, compose and HTTPS proxy files plus graceful shutdown (DEP-1, DEP-2, not yet run on a server).
+New migrations: 0016 (outbox_jobs), 0017 (scheduler_leases) - applied by `scripts/release.py`.
+NOT built, and why:
+- UX-1 photo-burst grouping: needs the owner's pricing/flow decision (QUESTIONS_FOR_MORNING).
+- DEP-3 object storage and signed image links (SEC-7 rest): needs the owner's choice of storage provider.
+- Q-1 full Celery/Redis generation queue and Q-2 "webhook only records and answers": larger changes whose benefit depends on real load; the
+  database outbox covers the lost-order risk for now.
+- ARC-4 / ARC-5 structural refactors (move shared constants out of route files, one generation job for all products): they touch every
+  test patch point and the money paths; scheduled last, together with MAINT-1, in the cleanup phase.
+
 ## Compliance and cleanup - NOT STARTED

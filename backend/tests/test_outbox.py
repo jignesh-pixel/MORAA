@@ -147,3 +147,67 @@ class CallSiteTests(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OrderRunTests(_Base):
+    def _patched_workers(self):
+        from app.services import meta_whatsapp_service as mws
+
+        pack, white = AsyncMock(return_value=True), AsyncMock(return_value=True)
+        for p in (patch.object(mws, "process_whatsapp_catalog_pack", pack), patch.object(mws, "process_whatsapp_white_bg", white)):
+            p.start()
+            self.addCleanup(p.stop)
+        return pack, white
+
+    def test_a_paid_order_is_recorded_then_run_once_directly(self):
+        pack, white = self._patched_workers()
+        job_id = outbox.enqueue_order_run("pack", "ing-1")
+        self.assertIsNotNone(job_id)
+        self.assertTrue(asyncio.run(outbox.run_job_now(job_id)))
+        self.assertFalse(asyncio.run(outbox.run_job_now(job_id)))            # a second start finds it already taken
+        pack.assert_awaited_once_with("ing-1")
+        white.assert_not_awaited()
+        self.assertEqual(self.jobs()[0].status, DONE)
+
+    def test_the_sweep_does_not_race_the_direct_run_but_rescues_an_order_nobody_started(self):
+        pack, white = self._patched_workers()
+
+        async def sweep():
+            started = await outbox.drain_once()
+            await outbox.wait_for_detached(5)
+            return started
+
+        outbox.enqueue_order_run("white", "ing-2")                              # grace period not over yet
+        self.assertEqual(asyncio.run(sweep()), 0)
+        white.assert_not_awaited()
+        with SessionLocal() as db:                                              # the process died before starting it
+            db.query(OutboxJob).update({"next_attempt_at": datetime.now(timezone.utc) - timedelta(seconds=1)})
+            db.commit()
+        self.assertEqual(asyncio.run(sweep()), 1)
+        white.assert_awaited_once_with("ing-2")
+        self.assertEqual(self.jobs()[0].status, DONE)
+
+    def test_a_worker_that_crashes_before_starting_is_retried(self):
+        from app.services import meta_whatsapp_service as mws
+
+        with patch.object(mws, "process_whatsapp_catalog_pack", AsyncMock(side_effect=RuntimeError("boom"))):
+            job_id = outbox.enqueue_order_run("pack", "ing-3")
+            asyncio.run(outbox.run_job_now(job_id))
+        job = self.jobs()[0]
+        self.assertEqual((job.status, job.attempts), (PENDING, 1))
+
+    def test_the_webhook_records_the_order_when_the_outbox_is_on_and_runs_it_directly_otherwise(self):
+        from fastapi import BackgroundTasks
+
+        from app.api.routes import meta_webhook
+
+        tasks = BackgroundTasks()
+        with patch.object(settings, "OUTBOX_ENABLED", True):
+            meta_webhook._queue_order_run(tasks, (meta_webhook.process_whatsapp_catalog_pack, "ing-4"))
+        self.assertEqual(self.jobs()[0].payload, {"worker": "pack", "ingestion_id": "ing-4"})
+        self.assertEqual(tasks.tasks[0].func, outbox.run_job_now)
+
+        tasks = BackgroundTasks()
+        meta_webhook._queue_order_run(tasks, (meta_webhook.process_whatsapp_white_bg, "ing-5"))   # outbox off
+        self.assertEqual(len(self.jobs()), 1)
+        self.assertEqual(tasks.tasks[0].func, meta_webhook.process_whatsapp_white_bg)

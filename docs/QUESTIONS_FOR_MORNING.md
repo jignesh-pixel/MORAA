@@ -27,3 +27,12 @@ Nothing here stops other work; I moved on to the next part every time.
 - Please pin GEMINI_IMAGE_MODEL in the production .env (so image quality can't change by surprise).
 - Sentry: do you want error reporting? If yes, create a Sentry project and give the DSN to your developer (needs `pip install sentry-sdk`).
 - Which WhatsApp number(s) should receive operations alerts (OPS_ALERT_WHATSAPP_NUMBERS)? Alerts to your own number only arrive inside WhatsApp's 24-hour window unless a message template is approved by Meta.
+
+## Added during the Scale phase
+- **Provider limits:** what is your real Gemini image quota (calls per minute)? Once known, set `IMAGE_PROVIDER_RPM` (smooths bursts) and `MAX_CONCURRENT_PROVIDER_CALLS` (how many image calls run at once). Both are 0 = "no limit" until you tell us.
+- **Orders per customer:** a customer can now have at most 3 paid orders in progress at once (`MAX_INFLIGHT_ORDERS_PER_CUSTOMER`); the 4th tap is declined with nothing charged. Is 3 right?
+- **Photo bursts (UX-1):** today every photo gets its own "choose Studio Shot or Pack" message. Grouping a burst (e.g. "12 photos, ₹600, confirm?") changes the customer flow and how you charge. How should a batch be priced and confirmed? (Not built yet; needs your decision.)
+- **Delivery time message (UX-2):** the message still says "Please allow 20-30 seconds" until the system has measured 3 real orders, then it says "Usually ready in about N minutes". Do you want different wording?
+- **Customer photos on disk / signed links (DEP-3, SEC-7):** photos are stored on the server's disk and the images folder is only reachable from the server itself (the public-host guard). To run on more than one server they must move to object storage (Cloudflare R2, S3 or Supabase Storage). Which one? (Not built; needs your choice and an account.)
+- **Redis / Celery queue (Q-1):** orders are now recorded in the database before they start and are picked up again if the server restarts (no Redis needed). A separate worker queue (Redis + Celery) is only needed if one server cannot cope with the load. Do you want it?
+- **Hosting (DEP-1):** `docker/` now has a Dockerfile, a compose file and an HTTPS proxy config, but it has not been run on a real server yet. Which server / provider will it run on?

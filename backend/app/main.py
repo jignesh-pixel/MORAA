@@ -212,6 +212,12 @@ async def lifespan(app: FastAPI):
         recovery_task.cancel()
     if outbox_task is not None:
         outbox_task.cancel()
+    try:
+        from app.services.outbox import wait_for_detached
+
+        await wait_for_detached(100)          # orders the outbox sweep started get time to finish (DEP-2)
+    except Exception as e:  # noqa: BLE001
+        logger.bind(category="system").warning(f"Waiting for background orders skipped: {e}")
     logger.bind(category="system").info(f"Shutting down {settings.APP_NAME}")
 
 

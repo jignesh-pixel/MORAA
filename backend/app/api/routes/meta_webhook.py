@@ -748,6 +748,21 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
     return new_ingestion_id
 
 
+def _queue_order_run(background_tasks: BackgroundTasks, job: Tuple[Any, str]) -> None:
+    """Start a paid order. With the outbox on, the order is first recorded in the database (so a crash or deploy
+    before it starts does not strand it: the sweep starts it) and then run right here as before."""
+    worker, ingestion_id = job
+    if settings.OUTBOX_ENABLED:
+        from app.services import outbox
+
+        kind = "white" if worker is process_whatsapp_white_bg else "pack"
+        job_id = outbox.enqueue_order_run(kind, ingestion_id)
+        if job_id is not None:
+            background_tasks.add_task(outbox.run_job_now, job_id)
+            return
+    background_tasks.add_task(worker, ingestion_id)
+
+
 def _orders_ahead(ingestion_id: str) -> int:
     """Paid orders currently in progress, from every customer, other than this one (sync; own session)."""
     from app.database import SessionLocal
@@ -1250,7 +1265,7 @@ async def receive_webhook(
                     if job:
                         # Ecommerce Shot -> process_whatsapp_white_bg,
                         # Pack 1 -> existing process_whatsapp_catalog_pack.
-                        background_tasks.add_task(*job)
+                        _queue_order_run(background_tasks, job)
                     continue
 
                 if b_id.startswith("feedback_"):

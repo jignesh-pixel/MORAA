@@ -1267,9 +1267,64 @@ async def release_abandoned_choice_claims(older_than) -> int:
     return int(released or 0)
 
 
+INTERRUPTED_PHOTO_MESSAGE = (
+    "Sorry, we couldn't finish processing your photo and nothing was charged. Please send it again."
+)
+
+
+async def recover_interrupted_photos(older_than) -> int:
+    """A photo whose processing was cut off (the server restarted while it was downloading or being checked) stays
+    in ``received`` forever and the customer never gets the choice buttons (Q-2). No money moves at that stage, so the
+    row is closed and the customer is asked to send the photo again. Returns how many were closed."""
+    from datetime import datetime, timezone
+
+    from app.database import SessionLocal
+    from app.models.whatsapp_ingestion import WhatsAppIngestion
+
+    closed: list = []
+    db = SessionLocal()
+    try:
+        cutoff = datetime.now(timezone.utc) - older_than
+        rows = (
+            db.query(WhatsAppIngestion)
+            .filter(WhatsAppIngestion.status == "received", WhatsAppIngestion.updated_at < cutoff)
+            .limit(50)
+            .all()
+        )
+        for row in rows:
+            claimed = (
+                db.query(WhatsAppIngestion)
+                .filter(WhatsAppIngestion.id == row.id, WhatsAppIngestion.status == "received")
+                .update(
+                    {WhatsAppIngestion.status: "rejected", WhatsAppIngestion.error_message: "Photo processing interrupted"},
+                    synchronize_session=False,
+                )
+            )
+            if claimed == 1:
+                closed.append((row.external_user_id, row.external_message_id))
+        db.commit()
+    except Exception as e:
+        logger.error(f"Interrupted photo recovery failed: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        db.close()
+    for sender, message_id in closed:
+        try:
+            await send_whatsapp_text(sender, INTERRUPTED_PHOTO_MESSAGE, reply_to_message_id=message_id)
+        except Exception as e:
+            logger.error(f"Interrupted photo notice not sent: {e}")
+    if closed:
+        logger.warning(f"Closed {len(closed)} interrupted photo(s); customers asked to resend")
+    return len(closed)
+
+
 RECOVERY_SWEEP_INTERVAL_SECONDS = 180
 FAILED_REFUND_GRACE = timedelta(minutes=2)       # let the live failure path finish its own refund first
 CHOICE_CLAIM_GRACE = timedelta(minutes=5)
+INTERRUPTED_PHOTO_GRACE = timedelta(minutes=10)    # a photo normally takes seconds; far longer means it was cut off
 
 
 async def run_recovery_sweep_forever(stuck_after) -> None:
@@ -1288,6 +1343,7 @@ async def run_recovery_sweep_forever(stuck_after) -> None:
             stuck = await recover_stuck_paid_orders(stuck_after)
             unrefunded = await recover_unrefunded_failed_orders(FAILED_REFUND_GRACE)
             released = await release_abandoned_choice_claims(CHOICE_CLAIM_GRACE)
+            await recover_interrupted_photos(INTERRUPTED_PHOTO_GRACE)
             from app.services.message_dedupe import purge_old_processed_messages
 
             await asyncio.to_thread(purge_old_processed_messages)
