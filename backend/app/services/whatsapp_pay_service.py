@@ -42,6 +42,7 @@ from app.services.meta_whatsapp_service import _post_message_payload, send_whats
 from app.models.wallet_transaction import KIND_CREDIT_WHATSAPP_PAY
 from app.services.wallet_service import credit_wallet, find_customer_by_phone, get_balance
 from app.utils.logger import logger, mask_phone
+from app.utils.phone import normalize_phone
 _plog = logger.bind(category="payments")
 
 GRAPH_BASE = "https://graph.facebook.com/v21.0"
@@ -73,8 +74,8 @@ def _allowlisted(phone: str) -> bool:
     raw = (settings.WHATSAPP_PAY_ALLOWLIST or "").strip()
     if not raw:
         return True
-    wanted = {_digits(p)[-10:] for p in raw.split(",") if p.strip()}
-    return _digits(phone)[-10:] in wanted
+    wanted = {normalize_phone(p) for p in raw.split(",") if p.strip()}
+    return normalize_phone(phone) in wanted
 
 
 def _importer_address() -> Optional[Dict[str, str]]:

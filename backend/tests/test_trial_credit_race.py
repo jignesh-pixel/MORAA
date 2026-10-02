@@ -49,6 +49,28 @@ class TrialCreditSequentialTests(_TrialBase):
         self.assertEqual(self.status_of(a.id), "pack_queued")
         self.assertEqual(self.status_of(b.id), "awaiting_choice")
 
+    def test_delivered_order_keeps_its_credit_reserved_until_it_is_counted(self):
+        """Between 'delivered' and the credit being recorded, another tap must not get the same credit."""
+        self.make_trial_customer(total=1)
+        a = self.make_ingestion(message_id="wamid.trial.a")
+        b = self.make_ingestion(message_id="wamid.trial.b")
+        self.assertIsNotNone(self.tap(self.db, a.id))
+        self.db.query(WhatsAppIngestion).filter(WhatsAppIngestion.id == a.id).update({"status": "delivered"})
+        self.db.commit()                                         # delivered, credit not counted yet
+        self.assertIsNone(self.tap(self.db, b.id))
+        self.assertEqual(self.status_of(b.id), "awaiting_choice")
+
+    def test_an_old_delivered_order_that_was_never_metered_does_not_hold_a_credit_forever(self):
+        from datetime import datetime, timedelta, timezone
+
+        self.make_trial_customer(total=1)
+        old = self.make_ingestion(message_id="wamid.trial.old", status="delivered", amount_charged=0)
+        self.db.query(WhatsAppIngestion).filter(WhatsAppIngestion.id == old.id).update(
+            {"updated_at": datetime.now(timezone.utc) - timedelta(hours=2)})
+        self.db.commit()
+        fresh = self.make_ingestion(message_id="wamid.trial.fresh")
+        self.assertIsNotNone(self.tap(self.db, fresh.id))
+
     def test_two_credits_cover_two_taps(self):
         self.make_trial_customer(total=2)
         a = self.make_ingestion(message_id="wamid.trial.a")

@@ -46,6 +46,7 @@ from app.models.wallet_transaction import (
 from app.models.whatsapp_ingestion import WhatsAppIngestion
 from app.repositories.base import BaseRepository
 from app.utils.logger import logger, mask_phone
+from app.utils.phone import INDIA_CODE, normalize_phone
 # ─── Ingestion statuses owned by the wallet gate ─────────────────────────
 
 STATUS_PENDING_PAYMENT = "pending_payment"
@@ -114,15 +115,18 @@ def find_customer_by_phone(db: Session, phone: str) -> Optional[Customer]:
     """Exact, index-backed customer lookup across the stored number formats.
 
     WhatsApp senders arrive as ``919876543210``; Razorpay contacts may arrive as
-    ``+919876543210`` or ``9876543210``. Equality on the known variants replaces
-    the old leading-wildcard ``.contains()`` scan with the same matches.
+    ``+919876543210`` or ``9876543210`` (no country code = Indian). A number that
+    carries a country code matches only that exact number, never another country's
+    number with the same last 10 digits (MON-5).
     """
     raw = (phone or "").strip()
-    digits = raw.lstrip("+")
+    digits = normalize_phone(raw)
     if not digits:
         return None
-    last10 = digits[-10:]
-    candidates = {raw, digits, "+" + digits, last10, "91" + last10, "+91" + last10}
+    candidates = {raw, digits, "+" + digits}
+    if digits.startswith(INDIA_CODE) and len(digits) == 12:
+        # Older Indian rows were stored without the country code. Only an Indian number may match them.
+        candidates.add(digits[2:])
     try:
         rows = db.query(Customer).filter(Customer.whatsapp_id.in_(candidates)).all()
     except Exception as e:

@@ -6,7 +6,6 @@ Handles both standard payment links and Razorpay Payment Pages.
 import hashlib
 import hmac
 import json
-import re
 import time
 from typing import Any, Dict, Optional, Tuple
 
@@ -35,6 +34,7 @@ from app.services.wallet_service import (
     record_ledger,
 )
 from app.utils.logger import logger, mask_phone
+from app.utils.phone import normalize_phone
 router = APIRouter(prefix="/api/payments", tags=["Payments"])
 
 SIGNATURE_HEADER = "X-Razorpay-Signature"
@@ -572,7 +572,7 @@ async def razorpay_webhook(
 
     # Digits only: spaces/hyphens/brackets in the payer's number must not
     # create a second wallet row for the same phone.
-    clean_sender = re.sub(r"[\s\-().]", "", sender_id).lstrip("+")
+    clean_sender = normalize_phone(sender_id)
     customer = _resolve_customer(db, clean_sender)
     customer_name = "Valued Customer"
 

@@ -91,6 +91,7 @@ from app.services.wallet_service import (
     price_per_image,
 )
 from app.utils.logger import logger, mask_phone
+from app.utils.phone import same_phone
 
 router = APIRouter(prefix="/api/meta", tags=["Meta WhatsApp Webhook"])
 
@@ -596,9 +597,7 @@ def _product_price(product_code: str) -> int:
 
 
 def _same_sender(stored: str, sender: str) -> bool:
-    a = (stored or "").strip().lstrip("+")
-    b = (sender or "").strip().lstrip("+")
-    return bool(a) and bool(b) and (a == b or a[-10:] == b[-10:])
+    return same_phone(stored, sender)
 
 
 async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Optional[str]:
