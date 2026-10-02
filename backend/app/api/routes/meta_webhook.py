@@ -91,7 +91,7 @@ from app.services.wallet_service import (
     get_customer,
     price_per_image,
 )
-from app.services import eta_service
+from app.services import data_lifecycle, eta_service
 from app.utils.logger import logger, mask_phone
 from app.ai.image_generation_manager import generation_capacity_blocked
 from app.utils.executors import run_cpu, run_io
@@ -752,6 +752,29 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
 _recorded_runs: Dict[str, int] = {}
 
 
+async def _handle_erasure_command(db: Session, sender: str, raw_text: str) -> None:
+    """"DELETE MY DATA" asks for confirmation; "CONFIRM DELETE" within 15 minutes erases (PRIV-3)."""
+    customer = find_customer_by_phone(db, sender)
+    if customer is None:
+        await send_whatsapp_text(sender, data_lifecycle.ERASURE_NOTHING_MESSAGE)
+        return
+    if data_lifecycle.is_erasure_request(raw_text):
+        data_lifecycle.request_erasure(db, customer)
+        await send_whatsapp_text(sender, data_lifecycle.ERASURE_ASK_MESSAGE)
+        return
+    if not data_lifecycle.erasure_requested_recently(db, customer):
+        await send_whatsapp_text(sender, data_lifecycle.ERASURE_EXPIRED_MESSAGE)
+        return
+    customer_id = customer.id
+    db.commit()                          # end this transaction: the erasure below uses its own connection
+    try:
+        await run_io(data_lifecycle.erase_customer_by_id, customer_id)
+    except data_lifecycle.ErasureRefused as refused:
+        await send_whatsapp_text(sender, str(refused))
+        return
+    await send_whatsapp_text(sender, data_lifecycle.ERASURE_DONE_MESSAGE)
+
+
 def _queue_order_run(background_tasks: BackgroundTasks, job: Tuple[Any, str]) -> None:
     """Start a paid order. With the outbox on, the order is first recorded in the database (so a crash or deploy
     before it starts does not strand it: the sweep starts it) and then run right here as before."""
@@ -1209,6 +1232,12 @@ async def receive_webhook(
                         db, sender, raw_gst,
                         on_complete=lambda: _send_registration_confirmation(db, sender, cust, user_name),
                     )
+                    continue
+
+                if settings.ERASURE_COMMAND_ENABLED and (
+                    data_lifecycle.is_erasure_request(raw_text) or data_lifecycle.is_erasure_confirmation(raw_text)
+                ):
+                    await _handle_erasure_command(db, sender, raw_text)
                     continue
 
                 if re.search(r"\b(hi|hii|hello|hey|start)\b", lower_text):

@@ -169,6 +169,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.bind(category="system").warning(f"Outbox worker not started: {e}")
 
+    retention_task = None
+    try:
+        from app.services.data_lifecycle import run_retention_forever
+
+        retention_task = asyncio.create_task(run_retention_forever())
+    except Exception as e:
+        logger.bind(category="system").warning(f"Retention sweep not started: {e}")
+
     recovery_task = None
     try:
         from app.api.routes.meta_webhook import STUCK_WHITE_AFTER as _STUCK_AFTER
@@ -191,7 +199,7 @@ async def lifespan(app: FastAPI):
     # Shutdown. Order matters: stop the periodic jobs first, let orders the outbox sweep started finish (they still
     # need the worker pools and the provider clients), give the periodic-job leases back, and only then close the
     # pools and clients.
-    for sweep in (reconcile_task, alert_task, link_reconcile_task, recovery_task, outbox_task):
+    for sweep in (reconcile_task, alert_task, link_reconcile_task, recovery_task, outbox_task, retention_task):
         if sweep is not None:
             sweep.cancel()
     try:

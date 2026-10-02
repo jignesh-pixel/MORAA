@@ -455,6 +455,14 @@ class Settings(BaseSettings):
     # Team (ADMIN) orders are not part of the customers' daily ceiling but have a ceiling of their own, so a mistake
     # or a loop on a team phone cannot spend without limit (COST-2). 0 = no limit.
     MAX_ADMIN_GENERATIONS_PER_DAY: int = 200
+
+    # Data retention (DATA-7). OFF until the owner confirms the periods: it deletes customer photos from disk.
+    # Financial records (wallet ledger, payments, refunds, invoices) are never touched by retention.
+    RETENTION_ENABLED: bool = False
+    RETENTION_MEDIA_DAYS: int = 90            # customer photos of finished orders
+    RETENTION_AUDIT_MASK_DAYS: int = 30       # phone numbers inside audit-log details are masked after this long
+    # "DELETE MY DATA" (PRIV-3): lets a customer erase their photos and personal details by WhatsApp message.
+    ERASURE_COMMAND_ENABLED: bool = True
     MAX_INFLIGHT_ORDERS_PER_CUSTOMER: int = 3
     CIRCUIT_BREAKER_FAILURES: int = 5
     CIRCUIT_BREAKER_COOLDOWN_SECONDS: float = 60.0
