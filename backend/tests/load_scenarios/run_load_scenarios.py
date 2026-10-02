@@ -66,6 +66,11 @@ from sqlalchemy import func  # noqa: E402
 
 from app.api.routes import meta_webhook as mw  # noqa: E402
 from app.config import settings  # noqa: E402
+
+# The scenarios fire many orders from one test customer on purpose; the per-customer limit (a production safety net) is
+# not what they measure, and it has its own tests. The outbox is also off: these scenarios call the workers directly.
+settings.MAX_INFLIGHT_ORDERS_PER_CUSTOMER = 0
+settings.OUTBOX_ENABLED = False
 from app.database import SessionLocal  # noqa: E402
 from app.models.audit_log import AuditLog  # noqa: E402
 from app.models.customer import Customer  # noqa: E402

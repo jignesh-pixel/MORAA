@@ -777,6 +777,13 @@ def _orders_ahead(ingestion_id: str) -> int:
         return 0
 
 
+async def _orders_ahead_released(db: Session, ingestion_id: str) -> int:
+    """``_orders_ahead`` after ending this request's transaction: the count uses its own connection, and holding two per
+    order exhausts the pool under bursts (PERF-1)."""
+    db.commit()
+    return await run_io(_orders_ahead, ingestion_id)
+
+
 def _parallel_orders(calls_per_order: int) -> Optional[int]:
     """How many orders the server works on at once (None = no limit configured, so nobody waits in line)."""
     limit = int(getattr(settings, "MAX_CONCURRENT_PROVIDER_CALLS", 0) or 0)
@@ -998,7 +1005,7 @@ async def _handle_product_choice(
             cost_note = ", test mode - no charge"
         else:
             cost_note = f", ₹{price}"
-        ahead = await run_io(_orders_ahead, ingestion.id)
+        ahead = await _orders_ahead_released(db, ingestion.id)
         suffix = eta_service.ack_suffix("white_bg", ahead, _parallel_orders(1), "Please allow 20-30 seconds.")
         await send_whatsapp_text(
             sender,
@@ -1011,7 +1018,7 @@ async def _handle_product_choice(
         return process_whatsapp_white_bg, ingestion.id
     # Pack 1 acknowledgement + worker. The time estimate is measured from recent orders (UX-2); until some have
     # been measured the original wording is sent unchanged.
-    ahead = await run_io(_orders_ahead, ingestion.id)
+    ahead = await _orders_ahead_released(db, ingestion.id)
     default_tail = "Please allow 20-30 seconds."
     suffix = eta_service.ack_suffix("pack", ahead, _parallel_orders(_mws.pack_generation_count()), default_tail)
     ack = CATALOG_PACK_ACK_TEMPLATE if suffix == default_tail else CATALOG_PACK_ACK_TEMPLATE.replace(default_tail, suffix)

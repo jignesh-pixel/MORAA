@@ -97,7 +97,7 @@ class TestAsyncProcessing(unittest.TestCase):
         import inspect
         source = inspect.getsource(receive_webhook)
         self.assertIn("BackgroundTasks", source)
-        self.assertIn("background_tasks.add_task", source)
+        self.assertTrue("background_tasks.add_task" in source or "_queue_order_run(background_tasks" in source)
 
     def test_celery_eager_mode_is_dev_only(self):
         """CELERY_TASK_ALWAYS_EAGER defaults to True (dev mode)."""
