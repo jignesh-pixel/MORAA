@@ -43,6 +43,8 @@ def _erpnext_billing_off_by_default(monkeypatch):
     monkeypatch.setattr(settings, "LOCAL_PEER_ADDRESSES", "127.0.0.1,::1,testclient")
     # Existing tests exercise the plain background-task path; outbox tests switch the durable queue on themselves.
     monkeypatch.setattr(settings, "OUTBOX_ENABLED", False)
+    # Legacy tests download from made-up hosts; the host check has its own tests.
+    monkeypatch.setattr(settings, "META_MEDIA_HOST_CHECK", False)
     # Provider health memory is process-wide: one test's simulated outage must not open a circuit for the next.
     from app.ai.provider_protection import breaker, bucket
 

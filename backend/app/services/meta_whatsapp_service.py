@@ -19,6 +19,7 @@ import json
 from datetime import datetime, timedelta, timezone
 import os
 import random
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -276,10 +277,39 @@ async def _meta_request(call: Any, label: str, *, idempotent: bool) -> "httpx.Re
 # ─── Media retrieval ─────────────────────────────────────────────────────
 
 
+_MEDIA_ID_RE = re.compile(r"^[0-9A-Za-z_-]{1,100}$")
+
+
+def is_valid_media_id(media_id: object) -> bool:
+    """A WhatsApp media id is a short token of digits/letters. Anything else (slashes, dots, query strings) could change
+    which address the lookup is sent to, so it is refused before any request is made."""
+    return isinstance(media_id, str) and bool(_MEDIA_ID_RE.match(media_id))
+
+
+def is_meta_media_host(url: object) -> bool:
+    """True when ``url`` is https and its host is one of Meta's (the access token is sent to it)."""
+    if not settings.META_MEDIA_HOST_CHECK:
+        return True
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(str(url))
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    if parts.scheme != "https" or not host:
+        return False
+    suffixes = [s.strip().lower() for s in (settings.META_MEDIA_HOST_SUFFIXES or "").split(",") if s.strip()]
+    return any(host.endswith(s) or host == s.lstrip(".") for s in suffixes)
+
+
 async def get_media_url(media_id: str) -> Optional[str]:
     """Retrieve the temporary download URL for a Meta media ID."""
     if not settings.META_WHATSAPP_TOKEN:
         logger.error("META_WHATSAPP_TOKEN not configured — cannot retrieve media")
+        return None
+    if not is_valid_media_id(media_id):
+        logger.error("Refusing media lookup: the media id is not a plain token")
         return None
 
     url = META_MEDIA_URL_TEMPLATE.format(media_id=media_id)
@@ -303,6 +333,9 @@ async def get_media_url(media_id: str) -> Optional[str]:
             if not media_url:
                 logger.error(f"Meta media metadata response missing 'url' field: media_id={media_id[:20]}...")
                 return None
+            if not is_meta_media_host(media_url):
+                logger.error(f"Meta returned a media link on an unexpected host; not following it: media_id={media_id[:20]}...")
+                return None
 
             return media_url
 
@@ -317,6 +350,9 @@ async def get_media_url(media_id: str) -> Optional[str]:
 async def download_media(media_url: str) -> Optional[Tuple[bytes, str]]:
     """Download media from Meta CDN using Bearer auth and redirect handling."""
     if not media_url:
+        return None
+    if not is_meta_media_host(media_url):
+        logger.error("Refusing media download: the link is not on a Meta host (the access token is not sent)")
         return None
 
     headers = {

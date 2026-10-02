@@ -258,6 +258,14 @@ class Settings(BaseSettings):
     OPS_TEAM: str = ""  # JSON: {"name": "91XXXXXXXXXX", ...}
     OPS_SECRET: str = ""  # shared with the Next.js app (x-ops-secret header)
     OPS_INBOUND_URL: str = ""
+    # When True a team message is an ops command only if it starts with the word "ops " ("ops start", "ops help"); the
+    # word is removed before the message is forwarded. Plain "start" / "help" from a team number then reach the customer
+    # flow like any other message (EXT-8). Off by default so the team's current habits keep working.
+    OPS_EXPLICIT_PREFIX: bool = False
+
+    # The photo download link Meta returns must point at Meta's own hosts before the access token is sent to it (SEC-11).
+    META_MEDIA_HOST_CHECK: bool = True
+    META_MEDIA_HOST_SUFFIXES: str = ".facebook.com,.fbsbx.com,.fbcdn.net,.whatsapp.net,.whatsapp.com"
 
     # --- WhatsApp Pay (native in-chat order_details, India) ---
     # OFF by default: while False nothing below is used and every recharge
