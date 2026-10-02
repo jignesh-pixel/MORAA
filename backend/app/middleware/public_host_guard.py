@@ -17,9 +17,9 @@ import ipaddress
 import re
 import time
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 
 from app.config import settings
 from app.utils.logger import logger, safe_log
@@ -122,22 +122,34 @@ def _content_length(request: Request) -> int:
         return -1
 
 
-class PublicHostGuardMiddleware(BaseHTTPMiddleware):
-    """HTTP only: BaseHTTPMiddleware does not see websocket scopes, and the
-    app has no websocket routes. Add websocket handling here before adding any.
-    """
+class PublicHostGuardMiddleware:
+    """Pure ASGI. The app has no websocket routes: a websocket that would be public is closed, so one can never
+    slip past the guard."""
 
-    async def dispatch(self, request: Request, call_next):
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope)
         host = request.headers.get("host", "")
-        if host and not _VALID_HOST.match(host):
-            _log_blocked(request.method, request.scope.get("path"), host)
-            return JSONResponse(status_code=400, content={"detail": "Invalid Host header"})
+        method = scope.get("method", "WS")
+        if scope["type"] == "http" and host and not _VALID_HOST.match(host):
+            _log_blocked(method, scope.get("path"), host)
+            await JSONResponse(status_code=400, content={"detail": "Invalid Host header"})(scope, receive, send)
+            return
 
         if settings.PUBLIC_HOST_GUARD_ENABLED and is_public_request(request):
             path = routed_path(request)
-            if path not in PUBLIC_ALLOWED_PATHS:
-                _log_blocked(request.method, request.scope.get("path"), host)
-                return JSONResponse(status_code=404, content={"detail": "Not Found"})
+            if scope["type"] == "websocket" or path not in PUBLIC_ALLOWED_PATHS:
+                _log_blocked(method, scope.get("path"), host)
+                if scope["type"] == "websocket":
+                    await send({"type": "websocket.close", "code": 1008})
+                    return
+                await JSONResponse(status_code=404, content={"detail": "Not Found"})(scope, receive, send)
+                return
             # Webhook payloads are small JSON; refuse oversized or malformed
             # bodies before the route reads them into memory.
             length = _content_length(request)
@@ -146,8 +158,9 @@ class PublicHostGuardMiddleware(BaseHTTPMiddleware):
                     "Public host guard: refused webhook body content-length={}",
                     request.headers.get("content-length"),
                 )
-                return JSONResponse(status_code=413, content={"detail": "Payload too large"})
-        return await call_next(request)
+                await JSONResponse(status_code=413, content={"detail": "Payload too large"})(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
 
 class WebhookBodyLimitMiddleware:

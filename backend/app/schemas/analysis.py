@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+from app.utils.upload_limits import MAX_BASE64_CHARS
+
 
 class AnalysisRequest(BaseModel):
     """Analysis initiation request."""
@@ -74,7 +76,7 @@ class SyncAnalysisRequest(BaseModel):
     """
 
     image_base64: str = Field(
-        ..., description="Base64-encoded image data (without data URI prefix)"
+        ..., max_length=MAX_BASE64_CHARS, description="Base64-encoded image data (without data URI prefix)"
     )
     mime_type: str = Field(
         ..., description="MIME type of the image (e.g. image/jpeg, image/png)"

@@ -4,9 +4,9 @@ import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 
 from app.config import settings
 from app.middleware.public_host_guard import PUBLIC_ALLOWED_PATHS, routed_path
@@ -40,29 +40,32 @@ def rate_limit_bucket(path: str) -> Optional[str]:
     return _DEFAULT_BUCKET
 
 
-class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Simple in-memory rate limiter based on client IP, one window per bucket."""
+class RateLimitMiddleware:
+    """Simple in-memory rate limiter based on client IP, one window per bucket (pure ASGI)."""
 
     def __init__(self, app):
-        super().__init__(app)
+        self.app = app
         self._request_counts: Dict[Tuple[str, str], List[float]] = defaultdict(list)
         self.max_requests = settings.RATE_LIMIT_REQUESTS
         self.webhook_max_requests = settings.WEBHOOK_RATE_LIMIT_REQUESTS
         self.window_seconds = settings.RATE_LIMIT_WINDOW_SECONDS
         self._last_prune = 0.0
 
-    async def dispatch(self, request: Request, call_next):
+    async def __call__(self, scope, receive, send):
         """Check rate limit before processing request."""
-        if not settings.RATE_LIMIT_ENABLED:
-            return await call_next(request)
+        if scope["type"] != "http" or not settings.RATE_LIMIT_ENABLED:
+            await self.app(scope, receive, send)
+            return
 
         # scope["path"] is what the router serves; request.url.path is rebuilt
         # from the Host header and can be made to look like another path.
-        bucket = rate_limit_bucket(request.scope.get("path") or "/")
+        bucket = rate_limit_bucket(scope.get("path") or "/")
         if bucket is None:
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
-        client_ip = request.client.host if request.client else "unknown"
+        client = scope.get("client")
+        client_ip = client[0] if client else "unknown"
         key = (bucket, client_ip)
         limit = self.webhook_max_requests if bucket == _WEBHOOK_BUCKET else self.max_requests
         # Monotonic: a wall-clock step backwards must not stall the window.
@@ -78,9 +81,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         if len(self._request_counts[key]) >= limit:
             logger.bind(category="api").warning(
-                "Rate limit exceeded for {} on {} ({})", client_ip, safe_log(routed_path(request)), bucket
+                "Rate limit exceeded for {} on {} ({})", client_ip, safe_log(routed_path(Request(scope))), bucket
             )
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=429,
                 content={
                     "detail": "Too many requests. Please try again later.",
@@ -88,9 +91,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 },
                 headers={"Retry-After": str(self.window_seconds)},
             )
+            await response(scope, receive, send)
+            return
 
         self._request_counts[key].append(now)
-        return await call_next(request)
+        await self.app(scope, receive, send)
 
     def _prune(self, now: float) -> None:
         """Forget keys whose newest request is outside the window (at most once per window)."""

@@ -20,6 +20,7 @@ from app.services.processing_service import ProcessingService
 from app.services.upload_service import UploadService
 from app.utils.executors import run_io
 from app.utils.logger import logger
+from app.utils.upload_limits import read_capped
 
 router = APIRouter(prefix="/api", tags=["Batch Upload"])
 
@@ -100,7 +101,7 @@ async def upload_images_batch(
 
     for order, file in enumerate(files):
         try:
-            file_data = await file.read()
+            file_data = await read_capped(file)
             file_size = len(file_data)
             filename = file.filename or f"untitled_{order}"
             mime_type = file.content_type or "image/jpeg"

@@ -1369,6 +1369,7 @@ def retry_delivery(
 )
 def get_ingestion_status(
     ingestion_id: str,
+    current_user: Any = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """Get the current status of a WhatsApp ingestion."""
@@ -1387,7 +1388,7 @@ def get_ingestion_status(
         "request_id": ingestion.request_id,
         "status": ingestion.status,
         "channel": ingestion.channel,
-        "external_user_id": ingestion.external_user_id,
+        "external_user_id": mask_phone(ingestion.external_user_id),
         "image_id": ingestion.image_id,
         "file_size": ingestion.file_size,
         "error_message": ingestion.error_message,
