@@ -12,6 +12,7 @@ That is why the gate's "live database" step fails today: it is a deployment step
 | 0010 `processed_messages` | Remembers handled WhatsApp message ids so a repeat delivery is ignored | Yes |
 | 0011 `pending_payments` | A parking list for Razorpay payments with no usable phone number | Yes |
 | 0012 `payment_reconcile` | "Next check" columns on WhatsApp Pay orders, and a table of Razorpay links we sent | Yes |
+| 0013 `generation_spend` | The shared daily count of paid AI image calls (Phase 3 runtime hardening; applies in the same `alembic upgrade head`) | Yes |
 
 Rolling back past 0001 or 0002 no longer deletes customers or balances (those downgrades now keep the data).
 
@@ -34,7 +35,17 @@ If a freeze is impossible, the alternative is a one-time correcting entry per cu
 ## New settings (all optional, safe defaults)
 
 - `RAZORPAY_LINK_RECONCILE_INTERVAL_SECONDS` (default 300; 0 turns the Razorpay link check off). Needs the Razorpay API keys already in use.
+- Phase 3 (runtime hardening) added more, all with safe defaults, none required:
+  - Image providers: `GEMINI_IMAGE_TIMEOUT_SECONDS` (90), `OPENAI_IMAGE_TIMEOUT_SECONDS` (120), `IMAGE_PROVIDER_TIMEOUT_SECONDS` (130),
+    `IMAGE_RATE_LIMIT_RETRIES` (2), `PACK_GENERATION_DEADLINE_SECONDS` (360).
+  - Meta: `META_REQUEST_RETRIES` (2). Razorpay: `RAZORPAY_API_TIMEOUT_SECONDS` (10).
+  - Database pool (PostgreSQL): `DB_POOL_SIZE` (10), `DB_MAX_OVERFLOW` (10), `DB_POOL_TIMEOUT_SECONDS` (5). With several app processes,
+    multiply by the process count and check it stays under the Supabase connection limit.
+  - Worker threads: `CPU_WORKER_THREADS`, `IO_WORKER_THREADS`, `NET_WORKER_THREADS` (0 = automatic).
+  - Celery: `CELERY_TASK_SOFT_TIME_LIMIT_SECONDS` (240), `CELERY_TASK_TIME_LIMIT_SECONDS` (300).
 - No new secrets are required.
+- `MAX_GENERATIONS_PER_DAY` is now ONE shared daily ceiling for all app processes (it was per process). Before 0013 is applied the app
+  falls back to the old per-process counter, so a forgotten migration never stops orders.
 
 ## Things to know after deploying
 
