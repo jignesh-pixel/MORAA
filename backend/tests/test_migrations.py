@@ -99,21 +99,34 @@ class MigrationChainTests(unittest.TestCase):
         upgrade_to_head(self.engine)
         self.assertTrue(get_schema_status(self.engine).up_to_date)
 
-    def test_downgrading_below_the_baseline_keeps_the_baseline_tables(self):
-        """The baseline's downgrade is intentionally a no-op, so its tables survive a deep rollback.
+    def test_downgrading_to_base_never_destroys_customers_or_their_money(self):
+        """Phase 2: 0001/0002 used to drop `customers` / `wallet_balance` on `alembic downgrade base`.
 
-        KNOWN HAZARD (documented, not changed in Phase 1): migrations 0001/0002 sit BELOW the
-        baseline and their downgrades drop `onboarding_sessions` and `customers` (wallet balances!).
-        `alembic downgrade base` on a live database therefore destroys the wallet table. Never run it
-        on production; the financial-core phase should make 0002's downgrade non-destructive.
+        Their downgrades are now deliberate no-ops (like the baseline's), so even a full rollback keeps
+        every customer row and balance, and a later upgrade to head is lossless.
         """
         upgrade_to_head(self.engine)
+        with self.engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO customers (id, whatsapp_id, full_name, business_name, gst_number, address, wallet_balance) "
+                "VALUES ('c-keep', '919000000009', 'K', 'B', 'N/A', 'A', 4200)"
+            ))
         _downgrade(self.engine, "base")
-        tables = set(inspect(self.engine).get_table_names())
+        insp = inspect(self.engine)
+        tables = set(insp.get_table_names())
         baseline_tables = {"users", "images", "analyses", "audit_logs", "whatsapp_ingestions", "processing_logs"}
         self.assertTrue(baseline_tables <= tables, f"dropped: {sorted(baseline_tables - tables)}")
-        self.assertNotIn("customers", tables)           # the hazard above, pinned so a fix is noticed
-        self.assertNotIn("onboarding_sessions", tables)
+        self.assertIn("customers", tables)
+        self.assertIn("onboarding_sessions", tables)
+        self.assertIn("wallet_balance", {c["name"] for c in insp.get_columns("customers")})
+        with self.engine.connect() as conn:
+            self.assertEqual(conn.execute(text("SELECT wallet_balance FROM customers WHERE id = 'c-keep'")).scalar(), 4200)
+        upgrade_to_head(self.engine)
+        self.assertTrue(get_schema_status(self.engine).up_to_date)
+        with self.engine.connect() as conn:
+            self.assertEqual(conn.execute(text("SELECT wallet_balance FROM customers WHERE id = 'c-keep'")).scalar(), 4200)
+            ledger = conn.execute(text("SELECT sum(amount) FROM wallet_transactions WHERE customer_id = 'c-keep'")).scalar()
+            self.assertEqual(ledger, 4200)             # the ledger is rebuilt from the surviving balance
 
     def test_ledger_migration_backfills_an_opening_balance_per_customer(self):
         """0009 must make SUM(ledger) == wallet_balance for customers that existed before the ledger."""

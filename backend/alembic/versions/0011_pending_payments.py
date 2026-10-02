@@ -1,6 +1,6 @@
 """pending_payments: paid Razorpay payments with no usable payer phone, parked for manual review.
 
-Idempotent (skipped if the table exists). The downgrade drops the table.
+Idempotent (skipped if the table exists). The downgrade keeps the table (it holds unreviewed money).
 
 Revision ID: 0011_pending_payments
 Revises: 0010_processed_messages
@@ -42,5 +42,4 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    if _TABLE in set(sa.inspect(op.get_bind()).get_table_names()):
-        op.drop_table(_TABLE)
+    """Deliberate no-op: parked payments are real money still waiting for a person to credit them."""

@@ -79,11 +79,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Drop ONLY the two additive columns (no other table is touched)."""
-    columns = _existing_columns("customers")
+    """Deliberate no-op: ``wallet_balance`` holds customers' real money.
 
-    if "is_registered" in columns:
-        op.drop_column("customers", "is_registered")
-
-    if "wallet_balance" in columns:
-        op.drop_column("customers", "wallet_balance")
+    Dropping the column would destroy every balance and cannot be undone (the ledger, migration 0009,
+    is derived from it). The columns are harmless on an older schema, and ``upgrade`` is idempotent,
+    so keeping them makes a rollback and a later re-upgrade lossless.
+    """
