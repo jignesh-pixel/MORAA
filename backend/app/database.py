@@ -1,5 +1,6 @@
 """Database engine, session factory, and declarative base."""
 
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -112,6 +113,9 @@ def money_once_index_present() -> Optional[bool]:
 # --- Schema ownership: Alembic only -----------------------------------------
 
 
+_MIGRATE_LOCK = threading.Lock()
+
+
 @dataclass(frozen=True)
 class SchemaStatus:
     """Where the database is relative to the migrations shipped with this code."""
@@ -119,6 +123,7 @@ class SchemaStatus:
     current: Optional[str]      # revision recorded in the database (None: never migrated)
     head: str                   # newest revision in backend/alembic/versions
     has_app_tables: bool        # any application table exists (e.g. created by an older create_all)
+    current_known: bool = True  # False: the database is at a revision this build does not have (newer code ran there)
 
     @property
     def up_to_date(self) -> bool:
@@ -148,10 +153,17 @@ def get_schema_status(target_engine: Optional[Engine] = None) -> SchemaStatus:
     if "alembic_version" in tables:
         with eng.connect() as conn:
             current = MigrationContext.configure(conn).get_current_revision()
+    known = True
+    if current is not None:
+        try:
+            known = ScriptDirectory.from_config(alembic_config()).get_revision(current) is not None
+        except Exception:
+            known = False
     return SchemaStatus(
         current=current,
         head=heads[0],
         has_app_tables=bool(tables - {"alembic_version"}),
+        current_known=known,
     )
 
 
@@ -184,6 +196,19 @@ def ensure_schema_ready(target_engine: Optional[Engine] = None) -> SchemaStatus:
     if status.up_to_date:
         return status
 
+    if not status.current_known:
+        # The database was migrated by a NEWER build (e.g. after rolling the code back). "Run alembic
+        # upgrade head" would be impossible advice, and migrating blindly could damage data.
+        message = (
+            f"database is at revision {status.current}, which this build does not know "
+            f"(it expects {status.head}): it was migrated by a newer release. Deploy that release, "
+            "or restore a database backup taken before the newer migration."
+        )
+        if settings.IS_PRODUCTION:
+            raise RuntimeError(f"Refusing to start: {message}")
+        logger.error(f"Schema check: {message} Continuing in development.")
+        return status
+
     unmigrated = " (application tables exist but were never migrated)" if status.current is None and status.has_app_tables else ""
     state = f"database revision {status.current or 'none'}, code expects {status.head}{unmigrated}"
     if settings.IS_PRODUCTION:
@@ -191,7 +216,13 @@ def ensure_schema_ready(target_engine: Optional[Engine] = None) -> SchemaStatus:
 
     if eng.dialect.name == "sqlite":
         logger.warning(f"Schema behind head ({state}); running migrations on the local SQLite database.")
-        upgrade_to_head(eng)
+        try:
+            with _MIGRATE_LOCK:                      # one thread at a time: Alembic's context is process-global
+                upgrade_to_head(eng)
+        except Exception:
+            # Another process may have migrated the same SQLite file first (e.g. uvicorn --workers 2).
+            if not get_schema_status(eng).up_to_date:
+                raise
         status = get_schema_status(eng)
         if not status.up_to_date:
             raise RuntimeError(f"Migrations finished but the database is still at {status.current}.")

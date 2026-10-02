@@ -101,6 +101,7 @@ class PackRunTests(unittest.TestCase):
         for p in self.patches:
             p.stop()
         self.tmp.cleanup()
+        self.engine.dispose()
 
     def _state(self):
         s = self.Session()

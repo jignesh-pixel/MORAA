@@ -364,6 +364,7 @@ class PaidOrderSafetyTests(unittest.TestCase):
         for p in self.patches:
             p.stop()
         self.db.close()
+        self.engine.dispose()
         self.tmp.cleanup()
 
     def _order(self, status="pack_queued", product=PRODUCT_PACK_1, amount=500, age_minutes=0, mid="wamid.1"):

@@ -27,11 +27,10 @@ import tempfile
 import unittest
 import uuid
 from typing import Optional
-from urllib.parse import urlparse
 
 import pytest
 from sqlalchemy import create_engine, event, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.pool import StaticPool
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -48,17 +47,29 @@ def postgres_mode() -> bool:
     return os.environ.get("MORAA_TEST_DB", "sqlite").strip().lower() == "postgres"
 
 
+# libpq lets query parameters override or add connection targets, so a URL whose authority says
+# "localhost" can still connect elsewhere (postgresql://u:p@localhost/x?host=db.prod.example).
+_FORBIDDEN_QUERY_KEYS = ("host", "hostaddr", "service", "passfile", "sslrootcert")
+
+
 def assert_safe_test_url(url: str) -> None:
     """Refuse a database URL that could be a real deployment."""
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
-    if any(part in host for part in _FORBIDDEN_HOST_PARTS):
-        raise RuntimeError(f"Refusing to run tests against {host}: looks like a hosted production database.")
-    if host not in _LOOPBACK_HOSTS and os.environ.get("MORAA_ALLOW_REMOTE_TEST_DB") != "1":
-        raise RuntimeError(
-            f"Refusing to run tests against non-local host {host!r}. "
-            "Use a local/throw-away PostgreSQL, or set MORAA_ALLOW_REMOTE_TEST_DB=1 if you are sure."
-        )
+    parsed = make_url(url)
+    query_keys = {key.lower() for key in parsed.query}
+    bad_keys = sorted(query_keys & set(_FORBIDDEN_QUERY_KEYS))
+    if bad_keys:
+        raise RuntimeError(f"Refusing test database URL with connection-target override(s): {', '.join(bad_keys)}.")
+    hosts = [h.strip().strip("[]").lower().rstrip(".") for h in (parsed.host or "").split(",") if h.strip()]
+    if not hosts:
+        raise RuntimeError("Refusing test database URL without an explicit local host.")
+    for host in hosts:
+        if any(part in host for part in _FORBIDDEN_HOST_PARTS):
+            raise RuntimeError(f"Refusing to run tests against {host}: looks like a hosted production database.")
+        if host not in _LOOPBACK_HOSTS and os.environ.get("MORAA_ALLOW_REMOTE_TEST_DB") != "1":
+            raise RuntimeError(
+                f"Refusing to run tests against non-local host {host!r}. "
+                "Use a local/throw-away PostgreSQL, or set MORAA_ALLOW_REMOTE_TEST_DB=1 if you are sure."
+            )
 
 
 def _stop_local_server() -> None:

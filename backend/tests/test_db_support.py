@@ -62,6 +62,22 @@ class SafetyGuardTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 assert_safe_test_url("postgresql://u:p@db.abcd.supabase.co:5432/postgres")
 
+    def test_query_string_cannot_redirect_the_connection(self):
+        for url in (
+            "postgresql://u:p@localhost/x?host=db.prod.example",
+            "postgresql://u:p@localhost/x?hostaddr=10.1.1.1",
+            "postgresql://u:p@localhost/x?service=prod",
+            "postgresql://u:p@localhost/x?host=db.abcd.supabase.co",
+        ):
+            with self.assertRaises(RuntimeError, msg=url):
+                assert_safe_test_url(url)
+
+    def test_every_host_in_a_multi_host_url_is_checked(self):
+        with self.assertRaises(RuntimeError):
+            assert_safe_test_url("postgresql://u:p@localhost,db.example.internal/x")
+        with self.assertRaises(RuntimeError):
+            assert_safe_test_url("postgresql://u:p@/x")          # no host at all (unix socket / env default)
+
     def test_loopback_hosts_are_allowed(self):
         for host in ("localhost", "127.0.0.1", "[::1]"):
             assert_safe_test_url(f"postgresql://u:p@{host}:5432/moraa_test")

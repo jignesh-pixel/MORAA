@@ -140,7 +140,10 @@ class ModelMigrationParityTests(unittest.TestCase):
         flat = []
         for entry in raw:
             flat.extend(entry if isinstance(entry, list) else [entry])
-        drift = {(op[0], op[2], op[3]) for op in flat if op[0] != "modify_comment"}
+        drift = {
+            (op[0], op[2], op[3]) if op[0].startswith("modify_") else (op[0], repr(op[1:]))
+            for op in flat if op[0] != "modify_comment"
+        }
         self.assertEqual(
             drift, KNOWN_DRIFT,
             f"new: {sorted(drift - KNOWN_DRIFT)}  fixed (remove from KNOWN_DRIFT): {sorted(KNOWN_DRIFT - drift)}",
@@ -149,6 +152,50 @@ class ModelMigrationParityTests(unittest.TestCase):
 
 class EnsureSchemaReadyTests(unittest.TestCase):
     """The startup guard: Alembic head required in production, never create_all."""
+
+    def setUp(self):
+        # The dev-path tests must not depend on the runner's ENVIRONMENT.
+        self.enterContext(patch.object(settings, "ENVIRONMENT", "development"))
+
+    def test_database_newer_than_the_code_is_refused_in_production_with_a_clear_message(self):
+        engine = sqlite_engine()
+        try:
+            upgrade_to_head(engine)
+            with engine.begin() as conn:
+                conn.execute(text("UPDATE alembic_version SET version_num = '0099_from_the_future'"))
+            self.assertFalse(get_schema_status(engine).current_known)
+            with patch.object(settings, "ENVIRONMENT", "production"):
+                with self.assertRaises(RuntimeError) as ctx:
+                    ensure_schema_ready(engine)
+            self.assertIn("newer release", str(ctx.exception))
+            self.assertNotIn("alembic upgrade head", str(ctx.exception))
+        finally:
+            engine.dispose()
+
+    def test_database_newer_than_the_code_never_triggers_a_dev_migration(self):
+        engine = sqlite_engine()
+        try:
+            upgrade_to_head(engine)
+            with engine.begin() as conn:
+                conn.execute(text("UPDATE alembic_version SET version_num = '0099_from_the_future'"))
+            status = ensure_schema_ready(engine)          # logs an error, must not raise or migrate
+            self.assertEqual(status.current, "0099_from_the_future")
+        finally:
+            engine.dispose()
+
+    def test_startup_lifespan_checks_the_schema_and_never_creates_tables(self):
+        from fastapi.testclient import TestClient
+
+        import app.main as main_module
+        from app.database import SchemaStatus
+
+        self.assertFalse(hasattr(main_module, "init_db"))
+        ready = SchemaStatus(current="x", head="x", has_app_tables=True)
+        with patch.object(main_module, "ensure_schema_ready", return_value=ready) as check, \
+             patch.object(Base.metadata, "create_all", side_effect=AssertionError("create_all at startup")):
+            with TestClient(main_module.app):
+                pass
+        check.assert_called_once()
 
     def test_up_to_date_database_passes_in_production(self):
         engine = sqlite_engine()

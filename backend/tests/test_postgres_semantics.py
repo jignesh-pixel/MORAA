@@ -94,6 +94,20 @@ class UniqueClaimSemanticsTests(unittest.TestCase):
         db.add(AuditLog(action=CAPTURED, resource_id=resource_id, resource_type="razorpay_payment", status="success"))
         db.flush()
 
+    def _wait_until_a_session_is_blocked_on_a_lock(self, timeout=20.0):
+        """Poll pg_stat_activity until some backend is genuinely waiting for a lock."""
+        deadline = time.monotonic() + timeout
+        with self.engine.connect() as conn:
+            while time.monotonic() < deadline:
+                waiting = conn.execute(text(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname = current_database() AND wait_event_type = 'Lock'"
+                )).scalar()
+                if waiting:
+                    return
+                time.sleep(0.05)
+        self.fail("no session ever blocked on the unique-index lock")
+
     def _second_claimant(self, resource_id, outcome):
         started = time.monotonic()
         with self.Session() as db:
@@ -112,12 +126,11 @@ class UniqueClaimSemanticsTests(unittest.TestCase):
             self._claim(first, "pay_wait_commit")                  # first claim flushed, NOT committed
             second = threading.Thread(target=self._second_claimant, args=("pay_wait_commit", outcome))
             second.start()
-            time.sleep(1.5)
-            self.assertTrue(second.is_alive(), "second claimant must wait for the first transaction")
+            self._wait_until_a_session_is_blocked_on_a_lock()      # proven: it is waiting on the first claim
+            self.assertTrue(second.is_alive())
             first.commit()
             second.join(timeout=20)
-        self.assertEqual(outcome["result"], "duplicate")
-        self.assertGreaterEqual(outcome["seconds"], 1.4)
+        self.assertEqual(outcome.get("result"), "duplicate")
         with self.Session() as db:
             self.assertEqual(db.query(AuditLog).filter(AuditLog.resource_id == "pay_wait_commit").count(), 1)
 
@@ -127,11 +140,11 @@ class UniqueClaimSemanticsTests(unittest.TestCase):
             self._claim(first, "pay_wait_rollback")
             second = threading.Thread(target=self._second_claimant, args=("pay_wait_rollback", outcome))
             second.start()
-            time.sleep(1.5)
+            self._wait_until_a_session_is_blocked_on_a_lock()
             self.assertTrue(second.is_alive())
             first.rollback()                                       # first transaction aborts (e.g. credit failed)
             second.join(timeout=20)
-        self.assertEqual(outcome["result"], "claimed")
+        self.assertEqual(outcome.get("result"), "claimed")
         with self.Session() as db:
             self.assertEqual(db.query(AuditLog).filter(AuditLog.resource_id == "pay_wait_rollback").count(), 1)
 

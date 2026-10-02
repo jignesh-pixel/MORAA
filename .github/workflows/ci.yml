@@ -60,8 +60,9 @@ jobs:
         env:
           MORAA_TEST_DB: postgres
           TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/moraa_test
+        shell: bash   # bash -eo pipefail: a failing pytest must fail the step, not be hidden by tee/grep
         run: |
-          python -m pytest -q -rs | tee pg-test-output.txt
+          python -m pytest -q -rs 2>&1 | tee pg-test-output.txt
           if grep -q "PostgreSQL-only test" pg-test-output.txt; then
             echo "A PostgreSQL-only test was skipped in the PostgreSQL run"; exit 1
           fi
