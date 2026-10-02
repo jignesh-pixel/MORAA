@@ -41,4 +41,14 @@ NOT built, and why:
 - ARC-4 / ARC-5 structural refactors (move shared constants out of route files, one generation job for all products): they touch every
   test patch point and the money paths; scheduled last, together with MAINT-1, in the cleanup phase.
 
-## Compliance and cleanup - NOT STARTED
+## Compliance and cleanup - DEVELOPED in part (branch `phase-6-compliance`, includes the Scale review fixes); awaiting verification
+Built: consent before any personal data is collected (PRIV-2, OFF until the owner supplies the wording; migration 0018); data retention
+(DATA-7, OFF until approved) and customer erasure by "DELETE MY DATA" or `scripts/erase_customer.py` (PRIV-3); payment-receipt wording and
+IGST template/place of supply for inter-state buyers (PRIV-4, inactive until two settings are filled); Meta media id/host validation
+(SEC-11); optional explicit "ops " prefix (EXT-8); separate daily limit for team orders (COST-2); per-call cost log with daily spend alert
+and `scripts/cost_report.py` (COST-4, migration 0019); empty placeholder folders removed and the generated results file untracked (MAINT-3/4).
+Already satisfied when checked: DEP-6 (the Celery command in HOW_TO_RUN is valid), DEP-7 (every frontend service reads NEXT_PUBLIC_API_URL),
+MAINT-3 (the experiment scripts and outputs were already untracked and ignored; they stay on the owner's disk, and the Docker build ignores them).
+NOT done: MAINT-1/ARC-4/ARC-5 (large refactors of money paths: recommended after launch), MAINT-2 (frozen prompt route files), a real GST
+verification provider (EXT-8, owner decision), "only verified GSTINs on invoices" (needs the GST provider).
+

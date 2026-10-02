@@ -85,3 +85,36 @@ working immediately. A refresh token can be used once; using one twice logs that
 - The analyses list returns at most 100 items per call by default (use `limit` and `offset` to page).
 - Set `GEMINI_IMAGE_MODEL` explicitly in the production environment so a future default change can never alter image quality unannounced.
 - A refresh token used twice within 20 seconds is just refused (a double tap); used again later it logs that account out everywhere.
+
+## 10. Background jobs that survive a restart (outbox) and who runs the periodic jobs
+
+- Paid orders, invoice sends and ops-team forwards are first written to the `outbox_jobs` table. If the server is restarted or
+  crashes before one starts, the sweep (every 20 seconds, 90 seconds grace for orders) starts it. A job that fails is retried
+  with growing waits (30 s, 2 min, 10 min, 30 min, 1 h) and, after 6 tries, parked as `dead` and you get a WhatsApp alert
+  ("background job(s) gave up"). `/metrics` shows `moraa_outbox_jobs{status=...}`.
+- Several server processes may run at once: each periodic job (payment checks, stuck-order refunds, alerts, retention) has a
+  one-row lease in `scheduler_leases`, so only one process runs it. A process that shuts down gracefully gives its leases back;
+  after a crash the others take over within a few minutes.
+
+## 11. Privacy: consent, retention, erasure
+
+- Consent notice: `CONSENT_REQUIRED=true` with your wording in `CONSENT_NOTICE_TEXT` (see `docs/QUESTIONS_FOR_MORNING.md`). Who agreed
+  to which version, and when, is in `consent_records`. Raise `CONSENT_VERSION` when the wording changes.
+- Retention: `RETENTION_ENABLED=true` (only after the periods are approved) deletes customer photos 90 days after a finished order
+  and hides phone numbers in audit notes after 30 days, once a day. It never touches money records.
+- Erasure: a customer sends DELETE MY DATA and then CONFIRM DELETE. By hand: `python scripts/erase_customer.py --phone <number>` shows
+  what would be erased; add `--yes` to do it. Photos and personal details are removed; the wallet ledger, payments, refunds and invoices
+  stay for the legal period. A customer with money in the wallet or a team account is refused.
+
+## 12. Costs
+
+Every AI image call is recorded in `provider_calls`. Set `COST_PER_CALL_GEMINI_RUPEES` / `COST_PER_CALL_OPENAI_RUPEES` to see rupees,
+and `OPS_ALERT_DAILY_COST_RUPEES` to be warned on WhatsApp when a day passes your line. `python scripts/cost_report.py --days 7` lists
+the last week. Team orders have their own daily limit (`MAX_ADMIN_GENERATIONS_PER_DAY`, default 200).
+
+## 13. Provider protection and fairness (settings)
+
+`CIRCUIT_BREAKER_FAILURES` (5) and `CIRCUIT_BREAKER_COOLDOWN_SECONDS` (60): after 5 failures in a row a provider is skipped for a
+minute so orders fail fast and are refunded instead of waiting for timeouts. `IMAGE_PROVIDER_RPM` and `MAX_CONCURRENT_PROVIDER_CALLS`
+(both 0 = no limit) smooth bursts to the provider's quota; a single Studio Shot is served ahead of Pack images when the limit is
+reached. `MAX_INFLIGHT_ORDERS_PER_CUSTOMER` (3) limits paid orders one customer can have in progress at once.
