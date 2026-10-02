@@ -182,6 +182,10 @@ async def run_payment_link_reconcile_forever() -> None:
         if not settings.RAZORPAY_KEY_ID or not settings.RAZORPAY_KEY_SECRET:
             continue
         try:
+            from app.services.scheduler_lease import holds_lease
+
+            if not await holds_lease("razorpay_link_reconcile", interval * 2 + 30):
+                continue                          # another process owns this job right now (ARC-2)
             results = await reconcile_payment_links(SessionLocal)
             if results:
                 logger.info(f"Razorpay payment link reconcile sweep: {results}")

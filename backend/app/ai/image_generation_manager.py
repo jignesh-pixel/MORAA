@@ -23,6 +23,7 @@ from app.ai.providers.image_base import (
     BaseImageGenerationProvider,
     ImageGenerationResult,
 )
+from app.ai.provider_protection import breaker, bucket
 from app.ai.providers.gemini_image_provider import GeminiImageProvider
 from app.ai.providers.openai_image_provider import OpenAIImageProvider
 from app.ai.marketplaces.registry import get_marketplace_presentation
@@ -179,6 +180,16 @@ def _retry_delay_seconds(error_message: str, attempt: int) -> Optional[float]:
         # Jitter only our own backoff: never retry earlier than the provider said it would allow.
         delay = max(delay, asked)
     return delay
+
+
+def _is_provider_outage(error_message: str) -> bool:
+    """A failure that says the provider itself is unwell (timeout, 5xx, overload, rate or quota exhaustion)."""
+    if not error_message:
+        return False
+    lowered = error_message.lower()
+    if "timeout" in lowered or "timed out" in lowered or "connect" in lowered:
+        return True
+    return _is_recoverable_error(error_message) or _is_retryable_rate_limit(error_message)         or _is_quota_exhaustion(error_message)
 
 
 # ─── Non-recoverable patterns (never fallback) ─────────────────────────
@@ -431,8 +442,16 @@ class ImageGenerationManager:
         prompt and request sent are identical on every attempt.
         """
         retries = max(int(settings.IMAGE_RATE_LIMIT_RETRIES or 0), 0)
-        result = await self._call_provider_once(
-            provider, prompt, context, reference_image, reference_mime_type, request_id
+        if not breaker.allow(provider_name):
+            logger.warning(f"Image provider '{provider_name}' circuit is open; not calling it request_id={request_id}")
+            return ImageGenerationResult(
+                success=False,
+                error=f"Image provider temporarily unavailable: circuit open for '{provider_name}' (503 service unavailable)",
+                provider_name=provider_name,
+                processing_time=0.0,
+            )
+        result = await self._guarded_call(
+            provider, provider_name, prompt, context, reference_image, reference_mime_type, request_id
         )
         for attempt in range(retries):
             if result.success or not _is_retryable_rate_limit(result.error or ""):
@@ -448,9 +467,39 @@ class ImageGenerationManager:
                 f"in {delay:.1f}s request_id={request_id}"
             )
             await asyncio.sleep(delay)
-            result = await self._call_provider_once(
-                provider, prompt, context, reference_image, reference_mime_type, request_id
+            result = await self._guarded_call(
+                provider, provider_name, prompt, context, reference_image, reference_mime_type, request_id
             )
+        return result
+
+    async def _guarded_call(
+        self,
+        provider: BaseImageGenerationProvider,
+        provider_name: str,
+        prompt: str,
+        context: Dict[str, Any],
+        reference_image: Optional[bytes],
+        reference_mime_type: str,
+        request_id: str,
+    ) -> ImageGenerationResult:
+        """One call through the token bucket, with the outcome fed to the circuit breaker."""
+        if not await bucket.acquire(provider_name):
+            breaker.record_neutral(provider_name)
+            return ImageGenerationResult(
+                success=False,
+                error=f"Image provider busy: local rate limit for '{provider_name}' (429 too many requests, retry in 60s)",
+                provider_name=provider_name,
+                processing_time=0.0,
+            )
+        result = await self._call_provider_once(
+            provider, prompt, context, reference_image, reference_mime_type, request_id
+        )
+        if result.success:
+            breaker.record_success(provider_name)
+        elif _is_provider_outage(result.error or ""):
+            breaker.record_outage_failure(provider_name)
+        else:
+            breaker.record_neutral(provider_name)        # the request itself was refused: not the provider's health
         return result
 
     async def generate_image(

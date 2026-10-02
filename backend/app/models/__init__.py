@@ -24,6 +24,8 @@ from app.models.pending_payment import PendingPayment
 from app.models.razorpay_payment_link import RazorpayPaymentLink
 from app.models.generation_spend import GenerationSpend
 from app.models.revoked_token import RevokedToken
+from app.models.outbox_job import OutboxJob
+from app.models.scheduler_lease import SchedulerLease
 
 __all__ = [
     "WalletTransaction",

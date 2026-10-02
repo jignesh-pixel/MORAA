@@ -432,6 +432,15 @@ class Settings(BaseSettings):
     # A rate limit (429) or temporary overload (503) is retried this many times, with jittered waits, on
     # the same provider before the next provider is tried. Billing / daily-quota exhaustion is never retried.
     IMAGE_RATE_LIMIT_RETRIES: int = 2
+    # Circuit breaker per provider (EXT-6): this many outage-type failures in a row marks the provider down for the
+    # cool-down; 0 turns the breaker off. IMAGE_PROVIDER_RPM sizes a token bucket to the provider's quota (calls per
+    # minute, 0 = off) and a call that would wait longer than IMAGE_RATE_WAIT_MAX_SECONDS fails fast instead.
+    # Durable background jobs (ops forwards, invoice sends) are recorded in the database and retried (Q-5).
+    OUTBOX_ENABLED: bool = True
+    CIRCUIT_BREAKER_FAILURES: int = 5
+    CIRCUIT_BREAKER_COOLDOWN_SECONDS: float = 60.0
+    IMAGE_PROVIDER_RPM: int = 0
+    IMAGE_RATE_WAIT_MAX_SECONDS: float = 20.0
     IMAGE_RETRY_BACKOFF_BASE_SECONDS: float = 2.0
     IMAGE_RETRY_BACKOFF_CAP_SECONDS: float = 15.0
     # Whole Catalog Pack: styles still running after this long are dropped and the pack ships with the

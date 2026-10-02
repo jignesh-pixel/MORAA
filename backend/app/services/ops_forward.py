@@ -81,6 +81,37 @@ async def forward_to_ops(message: Dict[str, Any]) -> None:
         logger.error("[ops] inbound forward error: {}", e)
 
 
+async def forward_to_ops_checked(message: Dict[str, Any]) -> bool:
+    """Like ``forward_to_ops`` but reports failure (False) so the outbox retries it. Never raises."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                settings.OPS_INBOUND_URL,
+                json={"message": message},
+                headers={"x-ops-secret": settings.OPS_SECRET},
+            )
+        if r.status_code >= 300:
+            logger.error("[ops] inbound forward failed: {} {}", r.status_code, r.text[:300])
+            return False
+        return True
+    except Exception as e:
+        logger.error("[ops] inbound forward error: {}", e)
+        return False
+
+
+def _queue_forward(msg: Dict[str, Any], background_tasks: BackgroundTasks) -> None:
+    """Record the forward in the outbox (survives a restart) and give it a first try now; fall back to a plain
+    background task if the outbox is off or the database cannot record it."""
+    if settings.OUTBOX_ENABLED:
+        from app.services import outbox
+
+        if outbox.enqueue_detached("ops_forward", {"message": msg}, f"ops:{msg.get('id') or id(msg)}"):
+            outbox.ensure_default_handlers()
+            background_tasks.add_task(outbox.drain_once)
+            return
+    background_tasks.add_task(forward_to_ops, msg)
+
+
 def divert_ops_messages(entry: Dict[str, Any], background_tasks: BackgroundTasks) -> Dict[str, Any]:
     """Queue team ops messages for Next.js and return the entry without them.
 
@@ -108,7 +139,7 @@ def divert_ops_messages(entry: Dict[str, Any], background_tasks: BackgroundTasks
             keep = []
             for msg in msgs:
                 if msg.get("id", "") in diverted and _digits(msg.get("from")) in team and is_ops_message(msg):
-                    background_tasks.add_task(forward_to_ops, msg)
+                    _queue_forward(msg, background_tasks)
                     logger.info("[ops] diverted team message {} to ops", msg.get("id", ""))
                 else:
                     keep.append(msg)

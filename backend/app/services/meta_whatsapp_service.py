@@ -1280,6 +1280,10 @@ async def run_recovery_sweep_forever(stuck_after) -> None:
     while True:
         await asyncio.sleep(RECOVERY_SWEEP_INTERVAL_SECONDS)
         try:
+            from app.services.scheduler_lease import holds_lease
+
+            if not await holds_lease("order_recovery", RECOVERY_SWEEP_INTERVAL_SECONDS * 2 + 30):
+                continue                          # another process owns recovery right now (ARC-2)
             stuck = await recover_stuck_paid_orders(stuck_after)
             unrefunded = await recover_unrefunded_failed_orders(FAILED_REFUND_GRACE)
             released = await release_abandoned_choice_claims(CHOICE_CLAIM_GRACE)

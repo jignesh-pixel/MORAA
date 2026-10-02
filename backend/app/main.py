@@ -98,6 +98,12 @@ async def lifespan(app: FastAPI):
         from app.api.routes.meta_webhook import STUCK_WHITE_AFTER
         from app.services.meta_whatsapp_service import recover_stuck_paid_orders
 
+        from app.services.scheduler_lease import holds_lease
+
+        # Only the process that owns order recovery runs it, so a worker that restarts cannot refund an order that a
+        # sibling worker is still generating (ARC-2).
+        if not await holds_lease("order_recovery", 90):
+            raise RuntimeError("another process owns order recovery; skipped at startup")
         recovered = await recover_stuck_paid_orders(STUCK_WHITE_AFTER)
         if recovered:
             logger.bind(category="system").warning(f"Recovered {recovered} stuck paid order(s) at startup")
@@ -154,6 +160,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.bind(category="system").warning(f"Razorpay payment link reconcile sweep not started: {e}")
 
+    outbox_task = None
+    try:
+        from app.services.outbox import run_outbox_forever
+
+        outbox_task = asyncio.create_task(run_outbox_forever())
+    except Exception as e:
+        logger.bind(category="system").warning(f"Outbox worker not started: {e}")
+
     recovery_task = None
     try:
         from app.api.routes.meta_webhook import STUCK_WHITE_AFTER as _STUCK_AFTER
@@ -196,6 +210,8 @@ async def lifespan(app: FastAPI):
         link_reconcile_task.cancel()
     if recovery_task is not None:
         recovery_task.cancel()
+    if outbox_task is not None:
+        outbox_task.cancel()
     logger.bind(category="system").info(f"Shutting down {settings.APP_NAME}")
 
 

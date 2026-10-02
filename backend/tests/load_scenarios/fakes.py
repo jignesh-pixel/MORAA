@@ -175,6 +175,8 @@ def install_fake_providers(primary: FakeImageProvider, fallback: FakeImageProvid
 
     igm.ImageGenerationManager._init_providers = _init  # type: ignore[assignment]
     igm._spend_day, igm._spend_count = None, 0
+    igm.breaker.reset()
+    igm.bucket.reset()
 
 
 class LoopLagMonitor:

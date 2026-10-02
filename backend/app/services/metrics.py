@@ -113,6 +113,7 @@ registry.describe("moraa_provider_fallbacks_total", "Image calls served by the f
 registry.describe("moraa_generation_slots_in_use", "Paid AI image calls counted so far today (UTC)")
 registry.describe("moraa_generation_slots_cap", "Configured daily ceiling of paid AI image calls")
 registry.describe("moraa_orders", "Customer photo orders by status (last 24 hours)")
+registry.describe("moraa_outbox_jobs", "Durable background jobs by status (a growing dead count needs a person)")
 registry.describe("moraa_pending_payments", "Paid Razorpay payments waiting for a person to credit them")
 registry.describe("moraa_meta_send_total", "Messages sent to Meta by outcome")
 registry.describe("moraa_recovery_sweep_total", "Orders touched by the recovery sweep by action")
@@ -171,6 +172,16 @@ def collect_database_gauges(force: bool = False) -> None:
         for status, count in rows:
             registry.set_gauge("moraa_orders", count, {"status": status or "unknown"})
         registry.set_gauge("moraa_pending_payments", int(pending or 0))
+        try:                                   # the table is new: a database not yet upgraded must not break /metrics
+            from app.models.outbox_job import OutboxJob
+
+            with SessionLocal() as db:
+                outbox_rows = db.query(OutboxJob.status, func.count(OutboxJob.id)).group_by(OutboxJob.status).all()
+            registry.clear_gauge("moraa_outbox_jobs")
+            for status, count in outbox_rows:
+                registry.set_gauge("moraa_outbox_jobs", count, {"status": status})
+        except Exception:  # noqa: BLE001
+            pass
         registry.set_gauge("moraa_db_up", 1)
 
         from app.ai import image_generation_manager as igm

@@ -375,6 +375,20 @@ def _resolve_customer(db: Session, sender_id: str) -> Optional[Customer]:
     return find_customer_by_phone(db, sender_id)
 
 
+def _queue_invoice(background_tasks: BackgroundTasks, args: Dict[str, Any]) -> None:
+    """Send the invoice through the durable outbox (retried, survives a restart); plain background task if the outbox
+    is off or the database could not record it."""
+    if settings.OUTBOX_ENABLED:
+        from app.services import outbox
+
+        payload = {k: args[k] for k in ("recipient_id", "payment_id", "amount", "customer_name", "customer_snapshot")}
+        if outbox.enqueue_detached("payment_invoice", payload, f"inv:{args['payment_id']}"):
+            outbox.ensure_default_handlers()
+            background_tasks.add_task(outbox.drain_once)
+            return
+    background_tasks.add_task(dispatch_payment_invoice, **args)
+
+
 def _already_processed(db: Session, payment_reference: str) -> bool:
     if not payment_reference:
         return False
@@ -733,8 +747,7 @@ async def process_razorpay_event(
         # 2. PDF Invoice Dispatch -- in the background after the response:
         # ERPNext Sales Invoice PDF when ERPNEXT_INVOICE_ENABLED, otherwise
         # (or on any ERPNext failure) the same local ReportLab receipt.
-        background_tasks.add_task(
-            dispatch_payment_invoice,
+        invoice_args = dict(
             recipient_id=clean_sender,
             payment_id=payment_reference,
             amount=amount_paid,
@@ -748,6 +761,7 @@ async def process_razorpay_event(
             local_pdf_fn=generate_invoice_pdf,
             send_document_fn=send_document_to_whatsapp,
         )
+        _queue_invoice(background_tasks, invoice_args)
 
         logger.info(f"Sent confirmation and tips to {mask_phone(clean_sender)}; invoice queued")
     except Exception as e:

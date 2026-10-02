@@ -116,7 +116,18 @@ def evaluate_alerts(db: Session) -> List[Alert]:
                 f"refund them, but something is slowing orders down.",
             ))
 
-    for check in (failure_rate, spend, parked_payments, review_rows, stuck_orders):
+    def dead_jobs() -> None:
+        from app.models.outbox_job import DEAD, OutboxJob
+
+        count = db.query(func.count(OutboxJob.id)).filter(OutboxJob.status == DEAD).scalar()
+        if count:
+            alerts.append(Alert(
+                "outbox_dead",
+                f"Moraa alert: {count} background job(s) (an invoice or an ops-team message) gave up after repeated "
+                f"failures and need a look.",
+            ))
+
+    for check in (failure_rate, spend, parked_payments, review_rows, stuck_orders, dead_jobs):
         guarded(check)
     return alerts
 
@@ -182,6 +193,10 @@ async def run_alert_sweep_forever() -> None:
     while True:
         await asyncio.sleep(interval)
         try:
+            from app.services.scheduler_lease import holds_lease
+
+            if not await holds_lease("ops_alerts", interval * 2 + 30):
+                continue                          # another process owns the alerts right now (ARC-2)
             alerts = await run_io(run_alert_pass)
             if alerts:
                 with SessionLocal() as db:

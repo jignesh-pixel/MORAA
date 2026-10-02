@@ -615,6 +615,10 @@ async def run_reconcile_sweep_forever() -> None:
         if not settings.WHATSAPP_PAY_ENABLED:
             continue
         try:
+            from app.services.scheduler_lease import holds_lease
+
+            if not await holds_lease("whatsapp_pay_reconcile", interval * 2 + 30):
+                continue                          # another process owns this job right now (ARC-2)
             with SessionLocal() as db:
                 results = await reconcile_pending_orders(db, session_factory=SessionLocal)
             if results:
@@ -669,7 +673,32 @@ async def _send_receipt(db: Session, order: WhatsAppPaymentOrder) -> None:
             send_document_fn=send_document_to_whatsapp,
         )
         if settings.ERPNEXT_INVOICE_ENABLED:
-            task = asyncio.get_running_loop().create_task(job)
+            queued = False
+            if settings.OUTBOX_ENABLED:
+                from app.services import outbox
+
+                queued = outbox.enqueue_detached(
+                    "payment_invoice",
+                    {
+                        "recipient_id": order.whatsapp_id,
+                        "payment_id": order.pg_payment_id or order.reference_id,
+                        "amount": order.amount_rupees,
+                        "customer_name": getattr(customer, "full_name", None) or "Valued Customer",
+                        "customer_snapshot": {
+                            "full_name": getattr(customer, "full_name", None),
+                            "business_name": getattr(customer, "business_name", None),
+                            "gst_number": getattr(customer, "gst_number", None),
+                            "address": getattr(customer, "address", None),
+                        },
+                    },
+                    f"inv:{order.pg_payment_id or order.reference_id}",
+                )
+            if queued:                       # the durable job replaces the in-memory one
+                job.close()
+                outbox.ensure_default_handlers()
+                task = asyncio.get_running_loop().create_task(outbox.drain_once())
+            else:
+                task = asyncio.get_running_loop().create_task(job)
             _BACKGROUND_TASKS.add(task)
             task.add_done_callback(_BACKGROUND_TASKS.discard)
         else:
