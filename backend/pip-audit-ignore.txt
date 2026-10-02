@@ -38,24 +38,7 @@ PYSEC-2024-232  # fixed in: 3.4.0
 PYSEC-2024-233  # fixed in: 3.4.0
 PYSEC-2025-185  # fixed in: no fix released
 
-# python-multipart 0.0.18: web-tier; upgraded in the framework unit if tests stay green
-PYSEC-2026-1852  # fixed in: 0.0.22
-PYSEC-2026-3036  # fixed in: 0.0.30
-PYSEC-2026-3037  # fixed in: 0.0.30
-PYSEC-2026-3038  # fixed in: 0.0.26
-PYSEC-2026-3039  # fixed in: 0.0.27
-PYSEC-2026-3040  # fixed in: 0.0.31
-
-# starlette 0.41.3: web-tier; upgraded in the framework unit
-PYSEC-2026-161  # fixed in: 1.0.1
-PYSEC-2026-1941  # fixed in: 0.47.2
-PYSEC-2026-1942  # fixed in: 0.49.1
-PYSEC-2026-2280  # fixed in: 1.1.0
-PYSEC-2026-2281  # fixed in: 1.1.0
-PYSEC-2026-248  # fixed in: 1.3.0
-PYSEC-2026-249  # fixed in: 1.3.1
-
 # urllib3 2.7.0: transitive (razorpay/requests); minor upgrade queued for the dependency pass
-CVE-2026-97687  # fixed in: 2.8.0
-CVE-2026-97688  # fixed in: 2.8.0
-CVE-2026-97689  # fixed in: 2.8.0
+PYSEC-2026-4175  # fixed in: 2.8.0
+PYSEC-2026-4176  # fixed in: 2.8.0
+PYSEC-2026-4177  # fixed in: 2.8.0
