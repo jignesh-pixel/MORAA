@@ -26,6 +26,7 @@ BACKOFF_SECONDS = (30, 120, 600, 1800, 3600)          # wait before attempt 2, 3
 STALE_RUNNING_SECONDS = 600
 SWEEP_INTERVAL_SECONDS = 20
 DONE_KEEP_DAYS = 14
+JOB_TIMEOUT_SECONDS = 120.0
 
 Handler = Callable[[Dict[str, Any]], Awaitable[Any]]
 _handlers: Dict[str, Handler] = {}
@@ -51,16 +52,28 @@ def enqueue(db, kind: str, payload: Dict[str, Any], dedupe_key: str) -> bool:
         return False
 
 
-def enqueue_detached(kind: str, payload: Dict[str, Any], dedupe_key: str) -> bool:
-    """``enqueue`` in its own short session. Returns False (and logs) if the database could not record it."""
+QUEUED = "queued"
+DUPLICATE = "duplicate"
+UNAVAILABLE = "unavailable"
+
+
+def enqueue_status(kind: str, payload: Dict[str, Any], dedupe_key: str) -> str:
+    """``enqueue`` in its own short session, telling the three outcomes apart: ``queued`` (recorded now),
+    ``duplicate`` (the same work was already recorded, so a caller must NOT do it again) and ``unavailable`` (the
+    database could not record it, so the caller does the work directly as before)."""
     try:
         from app.database import SessionLocal
 
         with SessionLocal() as db:
-            return enqueue(db, kind, payload, dedupe_key)
+            return QUEUED if enqueue(db, kind, payload, dedupe_key) else DUPLICATE
     except Exception as e:  # noqa: BLE001
         logger.error(f"Outbox enqueue failed for {kind}: {type(e).__name__}: {e}")
-        return False
+        return UNAVAILABLE
+
+
+def enqueue_detached(kind: str, payload: Dict[str, Any], dedupe_key: str) -> bool:
+    """True only when the job was newly recorded."""
+    return enqueue_status(kind, payload, dedupe_key) == QUEUED
 
 
 def _claim_next() -> Optional[Dict[str, Any]]:
@@ -129,11 +142,17 @@ async def _execute(job: Dict[str, Any]) -> None:
         error = f"no handler registered for kind {job['kind']!r}"
     else:
         try:
-            result = await handler(job["payload"])
+            if job["kind"] in DETACHED_KINDS:
+                result = await handler(job["payload"])
+            else:
+                # One hung call must not stall the sweep that also starts unstarted paid orders.
+                result = await asyncio.wait_for(handler(job["payload"]), timeout=JOB_TIMEOUT_SECONDS)
             if result is False or result == "failed":
                 error = "handler reported failure"
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            error = f"timed out after {JOB_TIMEOUT_SECONDS:.0f}s"
         except Exception as e:  # noqa: BLE001
             error = f"{type(e).__name__}: {e}"
     try:
@@ -296,7 +315,12 @@ async def _handle_order_run(payload: Dict[str, Any]) -> Any:
     from app.services import meta_whatsapp_service as mws
 
     worker = mws.process_whatsapp_white_bg if payload.get("worker") == "white" else mws.process_whatsapp_catalog_pack
-    await worker(payload["ingestion_id"])
+    try:
+        await worker(payload["ingestion_id"])
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001 -- the worker records its own failures and refunds; never run it again here
+        logger.error(f"Order worker raised for {payload.get('ingestion_id')}: {type(e).__name__}: {e}")
     return True
 
 

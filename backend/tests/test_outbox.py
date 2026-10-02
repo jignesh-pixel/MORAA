@@ -118,6 +118,7 @@ class CallSiteTests(_Base):
         jobs = self.jobs()
         self.assertEqual(len(jobs), 1)
         self.assertEqual((jobs[0].kind, jobs[0].payload["message"]["id"]), ("ops_forward", "wamid.1"))
+        self.assertEqual(len(tasks.tasks), 1)               # the retry did NOT start a second forward
 
     def test_ops_forward_uses_the_plain_task_when_the_outbox_is_off(self):
         from fastapi import BackgroundTasks
@@ -136,13 +137,63 @@ class CallSiteTests(_Base):
 
         args = dict(recipient_id="919800000001", payment_id="pay_1", amount=500, customer_name="A",
                     customer_snapshot={"full_name": "A"}, local_pdf_fn=lambda: None, send_document_fn=lambda: None)
+        first, second = BackgroundTasks(), BackgroundTasks()
         with patch.object(settings, "OUTBOX_ENABLED", True):
-            payment_routes._queue_invoice(BackgroundTasks(), args)
-            payment_routes._queue_invoice(BackgroundTasks(), args)
+            asyncio.run(payment_routes._queue_invoice(first, args))
+            asyncio.run(payment_routes._queue_invoice(second, args))        # the same payment again
         jobs = self.jobs()
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0].payload["payment_id"], "pay_1")
         self.assertNotIn("local_pdf_fn", jobs[0].payload)
+        self.assertEqual((len(first.tasks), len(second.tasks)), (1, 0))      # no second invoice is sent
+
+    def test_if_the_outbox_cannot_record_the_work_it_is_done_directly(self):
+        from fastapi import BackgroundTasks
+
+        from app.api.routes import payment_routes
+
+        args = dict(recipient_id="919800000001", payment_id="pay_2", amount=500, customer_name="A",
+                    customer_snapshot={}, local_pdf_fn=lambda: None, send_document_fn=lambda: None)
+        tasks = BackgroundTasks()
+        with patch.object(settings, "OUTBOX_ENABLED", True), \
+             patch.object(outbox, "enqueue_status", return_value=outbox.UNAVAILABLE):
+            asyncio.run(payment_routes._queue_invoice(tasks, args))
+        self.assertEqual(tasks.tasks[0].func, payment_routes.dispatch_payment_invoice)
+
+
+class SafetyNetTests(_Base):
+    def test_a_hung_job_times_out_instead_of_stalling_the_sweep(self):
+        async def hang(_payload):
+            await asyncio.sleep(30)
+
+        outbox.register_handler("k", hang)
+        outbox.enqueue_detached("k", {}, "a")
+        with patch.object(outbox, "JOB_TIMEOUT_SECONDS", 0.1):
+            asyncio.run(outbox.drain_once())
+        job = self.jobs()[0]
+        self.assertEqual(job.status, PENDING)
+        self.assertIn("timed out", job.last_error)
+
+    def test_an_order_worker_that_raises_is_never_run_a_second_time(self):
+        from app.services import meta_whatsapp_service as mws
+
+        worker = AsyncMock(side_effect=RuntimeError("boom"))
+        with patch.object(mws, "process_whatsapp_catalog_pack", worker):
+            job_id = outbox.enqueue_order_run("pack", "ing-9")
+            asyncio.run(outbox.run_job_now(job_id))
+        self.assertEqual(self.jobs()[0].status, DONE)
+        worker.assert_awaited_once()
+
+    def test_a_failed_local_invoice_send_is_reported_as_a_failure(self):
+        from app.services import billing_service
+
+        async def run():
+            return await billing_service.dispatch_payment_invoice(
+                recipient_id="919800000001", payment_id="pay_ABCD", amount=500, customer_name="A",
+                customer_snapshot={}, local_pdf_fn=lambda **k: b"%PDF", send_document_fn=AsyncMock(return_value=False))
+
+        with patch.object(settings, "ERPNEXT_INVOICE_ENABLED", False):
+            self.assertEqual(asyncio.run(run()), "failed")
 
 
 if __name__ == "__main__":
@@ -186,15 +237,6 @@ class OrderRunTests(_Base):
         self.assertEqual(asyncio.run(sweep()), 1)
         white.assert_awaited_once_with("ing-2")
         self.assertEqual(self.jobs()[0].status, DONE)
-
-    def test_a_worker_that_crashes_before_starting_is_retried(self):
-        from app.services import meta_whatsapp_service as mws
-
-        with patch.object(mws, "process_whatsapp_catalog_pack", AsyncMock(side_effect=RuntimeError("boom"))):
-            job_id = outbox.enqueue_order_run("pack", "ing-3")
-            asyncio.run(outbox.run_job_now(job_id))
-        job = self.jobs()[0]
-        self.assertEqual((job.status, job.attempts), (PENDING, 1))
 
     def test_the_webhook_records_the_order_when_the_outbox_is_on_and_runs_it_directly_otherwise(self):
         from fastapi import BackgroundTasks

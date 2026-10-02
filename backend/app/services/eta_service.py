@@ -67,5 +67,6 @@ def ack_suffix(kind: str, orders_ahead: int, parallel_orders: Optional[int], def
     seconds = estimate_seconds(kind, orders_ahead, parallel_orders)
     if seconds is None:
         return default
-    waiting = f" There are {orders_ahead} orders ahead of yours." if orders_ahead >= 3 else ""
+    waiting = (f" There are {orders_ahead} orders ahead of yours."
+               if orders_ahead >= 3 and parallel_orders else "")      # only when orders really queue for a slot
     return f"Usually ready in {phrase(seconds)}.{waiting}"

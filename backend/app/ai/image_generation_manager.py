@@ -187,10 +187,13 @@ def _is_provider_outage(error_message: str) -> bool:
     """A failure that says the provider itself is unwell (timeout, 5xx, overload, rate or quota exhaustion)."""
     if not error_message:
         return False
+    if _is_non_recoverable_error(error_message):
+        return False                           # the request was refused (blocked prompt, bad request): not an outage
     lowered = error_message.lower()
     if "timeout" in lowered or "timed out" in lowered or "connect" in lowered:
         return True
-    return _is_recoverable_error(error_message) or _is_retryable_rate_limit(error_message)         or _is_quota_exhaustion(error_message)
+    return (_is_recoverable_error(error_message) or _is_retryable_rate_limit(error_message)
+            or _is_quota_exhaustion(error_message))
 
 
 # ─── Non-recoverable patterns (never fallback) ─────────────────────────
@@ -440,7 +443,8 @@ class ImageGenerationManager:
 
         Billing or daily-quota exhaustion, bad requests and timeouts are returned at once: waiting cannot fix
         them. The retries are on the SAME slot of the daily spend counter (one order = one slot), and the
-        prompt and request sent are identical on every attempt.
+        prompt and request sent are identical on every attempt. The circuit breaker is told ONE outcome per call
+        chain (not one per retry), and is always told something, even when the call is cancelled or raises.
         """
         retries = max(int(settings.IMAGE_RATE_LIMIT_RETRIES or 0), 0)
         if not breaker.allow(provider_name):
@@ -450,27 +454,43 @@ class ImageGenerationManager:
                 error=f"Image provider temporarily unavailable: circuit open for '{provider_name}' (503 service unavailable)",
                 provider_name=provider_name,
                 processing_time=0.0,
+                metadata={"circuit_open": True},
             )
-        result = await self._guarded_call(
-            provider, provider_name, prompt, context, reference_image, reference_mime_type, request_id
-        )
-        for attempt in range(retries):
-            if result.success or not _is_retryable_rate_limit(result.error or ""):
-                break
-            delay = _retry_delay_seconds(result.error or "", attempt)
-            if delay is None:
-                logger.warning(
-                    f"Image provider '{provider_name}' asked for a long wait; moving on request_id={request_id}"
-                )
-                break
-            logger.warning(
-                f"Image provider '{provider_name}' rate limited; retry {attempt + 1}/{retries} "
-                f"in {delay:.1f}s request_id={request_id}"
-            )
-            await asyncio.sleep(delay)
+        try:
             result = await self._guarded_call(
                 provider, provider_name, prompt, context, reference_image, reference_mime_type, request_id
             )
+            for attempt in range(retries):
+                if result.success or not _is_retryable_rate_limit(result.error or ""):
+                    break
+                delay = _retry_delay_seconds(result.error or "", attempt)
+                if delay is None:
+                    logger.warning(
+                        f"Image provider '{provider_name}' asked for a long wait; moving on request_id={request_id}"
+                    )
+                    break
+                logger.warning(
+                    f"Image provider '{provider_name}' rate limited; retry {attempt + 1}/{retries} "
+                    f"in {delay:.1f}s request_id={request_id}"
+                )
+                await asyncio.sleep(delay)
+                result = await self._guarded_call(
+                    provider, provider_name, prompt, context, reference_image, reference_mime_type, request_id
+                )
+        except asyncio.CancelledError:
+            breaker.record_neutral(provider_name)          # cancelled (pack deadline, shutdown): says nothing about health
+            raise
+        except Exception:
+            breaker.record_outage_failure(provider_name)   # the provider call itself blew up
+            raise
+        if result.success:
+            breaker.record_success(provider_name)
+        elif (result.metadata or {}).get("local_limit"):
+            breaker.record_neutral(provider_name)          # our own token bucket said no: not the provider's fault
+        elif _is_provider_outage(result.error or ""):
+            breaker.record_outage_failure(provider_name)
+        else:
+            breaker.record_neutral(provider_name)          # the request itself was refused: not the provider's health
         return result
 
     async def _guarded_call(
@@ -483,26 +503,19 @@ class ImageGenerationManager:
         reference_mime_type: str,
         request_id: str,
     ) -> ImageGenerationResult:
-        """One call through the token bucket, with the outcome fed to the circuit breaker."""
+        """One call through the token bucket and the priority gate."""
         if not await bucket.acquire(provider_name):
-            breaker.record_neutral(provider_name)
             return ImageGenerationResult(
                 success=False,
                 error=f"Image provider busy: local rate limit for '{provider_name}' (429 too many requests, retry in 60s)",
                 provider_name=provider_name,
                 processing_time=0.0,
+                metadata={"local_limit": True},
             )
         async with gate_for_current_loop().slot(generation_priority.get()):
-            result = await self._call_provider_once(
+            return await self._call_provider_once(
                 provider, prompt, context, reference_image, reference_mime_type, request_id
             )
-        if result.success:
-            breaker.record_success(provider_name)
-        elif _is_provider_outage(result.error or ""):
-            breaker.record_outage_failure(provider_name)
-        else:
-            breaker.record_neutral(provider_name)        # the request itself was refused: not the provider's health
-        return result
 
     async def generate_image(
         self,

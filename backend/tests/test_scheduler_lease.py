@@ -49,3 +49,18 @@ class LeaseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReleaseTests(LeaseTests):
+    def test_releasing_lets_another_process_take_over_at_once(self):
+        self.assertTrue(asyncio.run(scheduler_lease.holds_lease("job", 600)))
+        asyncio.run(scheduler_lease.release_leases())
+        with patch.object(scheduler_lease, "HOLDER", "next-process"):
+            self.assertTrue(asyncio.run(scheduler_lease.holds_lease("job", 600)))
+
+    def test_releasing_only_removes_this_processs_leases(self):
+        with patch.object(scheduler_lease, "HOLDER", "other"):
+            self.assertTrue(asyncio.run(scheduler_lease.holds_lease("theirs", 600)))
+        asyncio.run(scheduler_lease.release_leases())
+        with SessionLocal() as db:
+            self.assertEqual([r.name for r in db.query(SchedulerLease).all()], ["theirs"])

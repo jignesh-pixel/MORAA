@@ -42,7 +42,7 @@ async def upload_image(
     try:
         file_data = await read_capped(file)
     except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=str(e))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     file_size = len(file_data)
     filename = file.filename or "untitled"
     mime_type = file.content_type or "image/jpeg"

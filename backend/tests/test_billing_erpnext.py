@@ -198,7 +198,7 @@ class BillingDispatchTests(_ERPTestBase):
 
     def test_send_failure_of_erpnext_pdf_falls_back(self):
         outcome, local, send, _ = self._dispatch(erp_result=(PDF, "ACC-SINV-0001"), send_ok=False)
-        self.assertEqual(outcome, "local")
+        self.assertEqual(outcome, "failed")          # WhatsApp refused both sends: reported, so the outbox retries
         self.assertEqual(send.await_count, 2)
 
     def test_disabled_never_calls_erpnext(self):

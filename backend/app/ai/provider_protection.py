@@ -29,7 +29,7 @@ class CircuitBreaker:
         self._lock = threading.Lock()
         self._failures: Dict[str, int] = {}
         self._opened_at: Dict[str, float] = {}
-        self._probing: Dict[str, bool] = {}
+        self._probing: Dict[str, float] = {}      # provider -> when its probe started
 
     @staticmethod
     def _threshold() -> int:
@@ -50,9 +50,10 @@ class CircuitBreaker:
                 return True
             if now - opened < self._cooldown():
                 return False
-            if self._probing.get(name):
-                return False                    # a probe is already in flight
-            self._probing[name] = True
+            started = self._probing.get(name)
+            if started is not None and now - started < self._cooldown():
+                return False                    # a probe is already in flight (one that never reported expires)
+            self._probing[name] = now
             return True
 
     def record_success(self, name: str) -> None:

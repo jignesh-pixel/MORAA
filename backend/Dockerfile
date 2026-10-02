@@ -34,4 +34,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
 
 # --timeout-graceful-shutdown: on a deploy the server stops taking new work but lets orders already running (a Catalog
 # Pack can take a few minutes) finish; anything still unfinished is refunded by the recovery sweep.
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${WEB_CONCURRENCY} --timeout-graceful-shutdown 120"]
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${WEB_CONCURRENCY} --timeout-graceful-shutdown 120 --proxy-headers --forwarded-allow-ips='*'"]

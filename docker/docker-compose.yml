@@ -1,5 +1,5 @@
 # Moraa GemVision production stack (DEP-1).  Run from the docker/ folder:
-#     cp .env.example .env      (then fill in the values)
+#     cp env.example .env      (then fill in the values)
 #     docker compose up -d --build
 #
 # Services: migrate (one-off database upgrade) -> api (the web server) behind caddy (HTTPS).
@@ -22,7 +22,7 @@ services:
       migrate:
         condition: service_completed_successfully
     restart: unless-stopped
-    stop_grace_period: 150s            # lets orders in progress finish on a deploy (matches uvicorn's 120 s)
+    stop_grace_period: 240s            # lets orders in progress finish on a deploy (uvicorn waits up to 120 s, then the app up to 100 s more)
     volumes:
       - moraa-data:/data               # customer photos and generated files (move to object storage later)
     expose:
