@@ -1,10 +1,32 @@
 """Logging configuration using loguru for structured logs."""
 
 import sys
+from contextvars import ContextVar
 
 from loguru import logger
 
 from app.config import settings
+
+# The id of the request being handled, carried through every log line it causes, including the background jobs
+# the request starts (they run in the same context), so a paid order can be traced back to its webhook (OBS-6).
+_request_id: ContextVar[str] = ContextVar("moraa_request_id", default="-")
+
+
+def set_request_id(value: str) -> None:
+    """Set the request id for everything logged from here on in this request / job."""
+    _request_id.set(value or "-")
+
+
+def get_request_id() -> str:
+    return _request_id.get()
+
+
+def _add_request_id(record) -> None:
+    record["extra"].setdefault("request_id", _request_id.get())
+
+
+# Runs for every log call, so "{extra[request_id]}" is always available to the formats below.
+logger.configure(patcher=_add_request_id)
 
 
 def safe_log(value: object, limit: int = 300) -> str:
@@ -37,15 +59,28 @@ def setup_logging() -> None:
     # Remove default handler
     logger.bind(category="system").remove()
 
-    # Console handler
-    logger.add(
-        sys.stdout,
-        format=settings.LOG_FORMAT,
-        level=settings.LOG_LEVEL,
-        colorize=True,
-        backtrace=True,
-        diagnose=settings.DEBUG,
-    )
+    # Console handler. LOG_JSON=true writes one JSON object per line (for a log collector in production);
+    # otherwise the readable coloured format. Both carry the request id.
+    if settings.LOG_JSON:
+        logger.add(
+            sys.stdout,
+            level=settings.LOG_LEVEL,
+            serialize=True,
+            format="{message}",
+            colorize=False,
+            backtrace=False,
+            diagnose=False,
+            enqueue=True,
+        )
+    else:
+        logger.add(
+            sys.stdout,
+            format=settings.LOG_FORMAT,
+            level=settings.LOG_LEVEL,
+            colorize=True,
+            backtrace=True,
+            diagnose=settings.DEBUG,
+        )
 
     # File handler - error logs (LOG_PATH is absolute: backend/logs by default)
     log_dir = settings.LOG_PATH
@@ -69,7 +104,7 @@ def setup_logging() -> None:
     # File handler - all logs
     logger.add(
         log_dir / "app_{time:YYYY-MM-DD}.log",
-        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}",
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {extra[request_id]} | {name}:{function}:{line} | {message}",
         level="INFO",
         rotation="1 day",
         retention="7 days",

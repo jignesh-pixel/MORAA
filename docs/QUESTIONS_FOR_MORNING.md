@@ -20,3 +20,10 @@ Nothing here stops other work; I moved on to the next part every time.
 
 ## Answered
 (none yet)
+
+## Added during the Operations phase
+- RECHARGE_PAYMENT_URL is not set in the production .env: please set it to your own payment link (then it can become mandatory).
+- ADMIN_USERNAMES: which login name(s) should be administrators? Until set, the admin-only endpoints stay open to any logged-in user.
+- Please pin GEMINI_IMAGE_MODEL in the production .env (so image quality can't change by surprise).
+- Sentry: do you want error reporting? If yes, create a Sentry project and give the DSN to your developer (needs `pip install sentry-sdk`).
+- Which WhatsApp number(s) should receive operations alerts (OPS_ALERT_WHATSAPP_NUMBERS)? Alerts to your own number only arrive inside WhatsApp's 24-hour window unless a message template is approved by Meta.

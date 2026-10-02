@@ -31,7 +31,7 @@ from fastapi.responses import PlainTextResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import require_auth
+from app.api.dependencies import require_admin
 from app.config import settings
 from app.database import get_db
 from app.models.audit_log import AuditLog
@@ -920,6 +920,10 @@ async def _handle_product_choice(
             db.commit()
             raise
 
+    # Ties the webhook request (the id on every line of this request AND of the background job it starts) to the
+    # order, so a paid order can be followed from the customer's tap to its delivery (OBS-6).
+    logger.info(f"Order queued: ingestion_id={ingestion_id} product={product} free_access={free_access or 'no'}")
+
     if product == PRODUCT_WHITE_BG:
         if free_access == "trial":
             cost_note = ", complimentary trial credit"
@@ -1256,7 +1260,7 @@ async def receive_webhook(
 def retry_delivery(
     ingestion_id: str,
     background_tasks: BackgroundTasks,
-    current_user: Any = Depends(require_auth),
+    current_user: Any = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """Retry a failed WhatsApp ingestion.
@@ -1417,7 +1421,7 @@ async def webhook_health() -> Dict[str, Any]:
 )
 def get_generation_failure_rate(
     window_hours: int = 24,
-    current_user: Any = Depends(require_auth),
+    current_user: Any = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     report = compute_generation_failure_rate(db, window_hours=window_hours)

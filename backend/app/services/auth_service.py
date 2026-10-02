@@ -1,11 +1,13 @@
 """Authentication service for user management."""
 
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.models.revoked_token import RevokedToken
 from app.models.user import User
 from app.repositories.base import BaseRepository
 from app.schemas.auth import LoginResponse, SignupRequest, TokenResponse, UserResponse
@@ -19,6 +21,7 @@ from app.utils.security import (
 from app.utils.logger import logger
 
 # Hash of a throw-away password, verified when the username is unknown (see login).
+REUSE_GRACE_SECONDS = 20
 _DUMMY_PASSWORD_HASH = hash_password("not-a-real-password")
 
 
@@ -35,6 +38,13 @@ class AuthService:
         existing_email = self.repo.find_first(email=request.email)
         if existing_email:
             raise ValueError("Email already registered")
+
+        # Administrators are matched case-insensitively, so nobody may register a name that differs from an
+        # administrator's only by letter case.
+        from app.api.dependencies import _admin_usernames
+
+        if request.username.strip().lower() in _admin_usernames():
+            raise ValueError("Username already taken")
 
         # Check if username already exists
         existing_username = self.repo.find_first(username=request.username)
@@ -88,6 +98,31 @@ class AuthService:
         user = self.repo.get(user_id)
         if not user or not user.is_active:
             raise ValueError("User not found or inactive")
+        if self._issued_before_cutoff(user, payload):
+            raise ValueError("Invalid or expired refresh token")
+
+        # Single-use refresh tokens (SEC-4): a token that was already used is a sign a copy exists elsewhere.
+        # Refuse it and refuse every token issued to this user so far; the owner simply logs in again.
+        jti = str(payload.get("jti") or "")
+        used = self.db.get(RevokedToken, jti) if jti else None
+        if used is not None:
+            # A refused request that was merely retried (double tap, network retry) a moment after the first use is
+            # not theft: refuse it, but do not log the owner out everywhere. A token the owner logged out with is
+            # simply refused.
+            used_at = used.revoked_at
+            if used_at is not None and used_at.tzinfo is None:
+                used_at = used_at.replace(tzinfo=timezone.utc)
+            recent = used_at is not None and (datetime.now(timezone.utc) - used_at).total_seconds() <= REUSE_GRACE_SECONDS
+            if recent:
+                raise ValueError("Refresh token already used")
+            user.tokens_valid_after = datetime.now(timezone.utc) + timedelta(seconds=1)
+            self.db.commit()
+            logger.bind(category="auth").warning(
+                f"Refresh token reuse detected for user {user.username}: all earlier tokens revoked"
+            )
+            raise ValueError("Refresh token already used")
+        if jti:
+            self._revoke_jti(jti, user.id, payload)
 
         # Generate new tokens
         access_token = create_access_token(
@@ -105,7 +140,7 @@ class AuthService:
         )
 
     def get_current_user(self, token: str) -> Optional[User]:
-        """Get current user from access token."""
+        """Get current user from access token (None for an unknown, deactivated or logged-out-everywhere user)."""
         from app.utils.security import verify_token
 
         payload = verify_token(token, expected_type="access")
@@ -116,7 +151,50 @@ class AuthService:
         if not user_id:
             return None
 
-        return self.repo.get(user_id)
+        user = self.repo.get(user_id)
+        if user is None or not user.is_active:
+            return None          # a deactivated account's still-valid tokens stop working at once
+        if self._issued_before_cutoff(user, payload):
+            return None
+        return user
+
+    @staticmethod
+    def _issued_before_cutoff(user: User, payload: dict) -> bool:
+        cutoff = user.tokens_valid_after
+        if cutoff is None:
+            return False
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=timezone.utc)
+        # Token timestamps (iat) are whole seconds, so compare at whole-second resolution: a token issued in
+        # the cut-off's own second after the cut-off must not be refused.
+        return int(payload.get("iat") or 0) < int(cutoff.timestamp())
+
+    def _revoke_jti(self, jti: str, user_id: str, payload: dict) -> None:
+        expires = payload.get("exp")
+        try:
+            # Housekeeping: rows for tokens that have expired anyway can never matter again.
+            self.db.query(RevokedToken).filter(RevokedToken.expires_at < datetime.now(timezone.utc)).delete(
+                synchronize_session=False
+            )
+            self.db.add(RevokedToken(
+                jti=jti[:64], user_id=user_id,
+                expires_at=datetime.fromtimestamp(float(expires), tz=timezone.utc) if expires else None,
+            ))
+            self.db.commit()
+        except IntegrityError:
+            self.db.rollback()
+            raise ValueError("Refresh token already used")
+
+    def logout(self, refresh_token: str) -> None:
+        """Revoke a refresh token so it can never be used again (the access token simply expires)."""
+        payload = decode_token(refresh_token)
+        if payload is None or payload.get("type") != "refresh" or not payload.get("jti") or not payload.get("sub"):
+            return
+        if self.db.get(RevokedToken, str(payload["jti"])) is None:
+            try:
+                self._revoke_jti(str(payload["jti"]), str(payload["sub"]), payload)
+            except ValueError:
+                pass
 
     def get_user_profile(self, user_id: str) -> Optional[UserResponse]:
         """Get user profile by ID."""

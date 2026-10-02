@@ -188,7 +188,9 @@ class PackRunTests(unittest.TestCase):
         ok, provider = self._real_generation(cap=6)
         self.assertTrue(ok)
         self.assertEqual(provider.await_count, 6)
-        self.assertEqual(igm._spend_count, 6)
+        from app.services import spend_counter
+        shared = spend_counter.used(igm.current_spend_day())      # the shared DB counter when it answers (PostgreSQL)
+        self.assertEqual(igm._spend_count if shared is None else shared, 6)
         self.assertEqual(self._state(), ("delivered", 0, 0))
 
     def test_cap_too_small_blocks_whole_pack_before_any_call_and_refunds_once(self):

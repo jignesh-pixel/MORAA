@@ -36,7 +36,7 @@ _POOL_KWARGS = (
 # Create engine
 engine = create_engine(
     settings.DATABASE_URL,
-    echo=settings.DEBUG,
+    echo=settings.SQL_ECHO,
     connect_args={"check_same_thread": False} if settings.IS_SQLITE else {},
     pool_pre_ping=True,
     **_POOL_KWARGS,

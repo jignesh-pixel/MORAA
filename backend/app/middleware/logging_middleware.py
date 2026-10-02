@@ -6,7 +6,8 @@ import uuid
 from fastapi import FastAPI, Request
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from app.utils.logger import logger, safe_log
+from app.services import metrics
+from app.utils.logger import logger, safe_log, set_request_id
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
@@ -17,6 +18,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         # Generate request ID
         request_id = str(uuid.uuid4())[:8]
         request.state.request_id = request_id
+        set_request_id(request_id)      # every log line this request (and its background jobs) causes carries it
 
         # Capture start time
         start_time = time.time()
@@ -34,6 +36,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
             # Calculate duration
             duration_ms = (time.time() - start_time) * 1000
+            metrics.record_http(request.method, response.status_code, duration_ms / 1000)
 
             # Log response
             api_log.info(
@@ -47,6 +50,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
         except Exception as e:
             duration_ms = (time.time() - start_time) * 1000
+            metrics.record_http(request.method, 500, duration_ms / 1000)
             api_log.error(
                 "✗ [{}] {} {} → ERROR ({:.1f}ms): {}",
                 request_id, request.method, path, duration_ms, str(e),

@@ -23,6 +23,7 @@ from app.models.processed_message import ProcessedMessage
 from app.models.pending_payment import PendingPayment
 from app.models.razorpay_payment_link import RazorpayPaymentLink
 from app.models.generation_spend import GenerationSpend
+from app.models.revoked_token import RevokedToken
 
 __all__ = [
     "WalletTransaction",

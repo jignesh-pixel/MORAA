@@ -44,6 +44,10 @@ async def lifespan(app: FastAPI):
     logger.bind(category="system").info(f"Config: environment={settings.ENVIRONMENT} "
         f"env_file={ENV_FILE or 'none'} debug={settings.DEBUG}")
 
+    from app.services.error_tracking import init_error_tracking
+
+    init_error_tracking()
+
     # Initialize database
     # The schema is owned by Alembic: verify it, never create_all at startup.
     schema = ensure_schema_ready()
@@ -134,6 +138,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.bind(category="system").warning(f"WhatsApp Pay reconcile sweep not started: {e}")
 
+    alert_task = None
+    try:
+        from app.services.alert_service import run_alert_sweep_forever
+
+        alert_task = asyncio.create_task(run_alert_sweep_forever())
+    except Exception as e:
+        logger.bind(category="system").warning(f"Operations alert sweep not started: {e}")
+
     link_reconcile_task = None
     try:
         from app.services.razorpay_link_reconcile import run_payment_link_reconcile_forever
@@ -178,6 +190,8 @@ async def lifespan(app: FastAPI):
         await close_openai_client()
     except Exception as e:  # noqa: BLE001 -- shutdown must never fail on this
         logger.bind(category="system").warning(f"Provider client close skipped: {e}")
+    if alert_task is not None:
+        alert_task.cancel()
     if link_reconcile_task is not None:
         link_reconcile_task.cancel()
     if recovery_task is not None:
@@ -258,6 +272,6 @@ if __name__ == "__main__":
         "app.main:app",
         host=settings.HOST,
         port=settings.PORT,
-        reload=settings.DEBUG,
+        reload=settings.DEV_RELOAD,
         log_level=settings.LOG_LEVEL.lower(),
     )

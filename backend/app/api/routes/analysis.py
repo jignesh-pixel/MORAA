@@ -234,13 +234,15 @@ def get_analysis(
     description="Get a list of all completed analyses.",
 )
 def list_analyses(
+    limit: int = Query(100, ge=1, le=500, description="Page size (default 100, maximum 500)"),
+    offset: int = Query(0, ge=0, description="How many analyses to skip (for the next page)"),
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user),
 ):
-    """Get all completed analyses."""
+    """Get completed analyses, newest first, one page at a time."""
     service = AnalysisService(db)
     user_id = current_user.id if current_user else None
-    return service.get_analysis_history(user_id=user_id)
+    return service.get_analysis_history(user_id=user_id, limit=limit, offset=offset)
 
 
 @router.post(

@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from app.config import settings
+from app.services import metrics
 from app.utils.executors import run_io
 from app.utils.logger import logger, mask_phone
 # ─── Constants ────────────────────────────────────────────────────────────
@@ -501,6 +502,7 @@ async def _post_message_payload(
                 err = _meta_error_details(response)
                 if error_out is not None:
                     error_out.update(err)
+                metrics.registry.inc("moraa_meta_send_total", {"outcome": f"http_{response.status_code // 100}xx"})
                 logger.error(
                     f"Meta send {label} failed: status={err.get('status')} code={err.get('code')} "
                     f"subcode={err.get('subcode')} message={err.get('message')!r} "
@@ -518,16 +520,19 @@ async def _post_message_payload(
                 f"Meta {label} sent: recipient={mask_phone(payload.get('to', ''))} "
                 f"message_id={messages[0].get('id', '')}"
             )
+            metrics.registry.inc("moraa_meta_send_total", {"outcome": "ok"})
             return True
 
     except httpx.TimeoutException:
         if error_out is not None:
             error_out["timeout"] = True
+        metrics.registry.inc("moraa_meta_send_total", {"outcome": "timeout"})
         logger.error(f"Meta send {label} timed out")
         return False
     except Exception as e:
         if error_out is not None:
             error_out["message"] = str(e)
+        metrics.registry.inc("moraa_meta_send_total", {"outcome": "error"})
         logger.error(f"Meta send {label} failed: {e}")
         return False
 
@@ -1009,7 +1014,20 @@ def _refund_failed_ingestion(db, ingestion) -> None:
             pass
 
 
+_FAILURE_RATE_CHECK_INTERVAL_SECONDS = 60.0
+_last_failure_rate_check = 0.0
+
+
 def _check_failure_rate(db) -> None:
+    # The check is a 24-hour GROUP BY over the orders table: at most once a minute per process, not once per
+    # failed order (the alert sweep in alert_service also checks it on a schedule).
+    global _last_failure_rate_check
+    import time as _time
+
+    now = _time.monotonic()
+    if now - _last_failure_rate_check < _FAILURE_RATE_CHECK_INTERVAL_SECONDS:
+        return
+    _last_failure_rate_check = now
     try:
         from app.services.generation_metrics import alert_if_failure_rate_exceeded
 
@@ -1268,6 +1286,9 @@ async def run_recovery_sweep_forever(stuck_after) -> None:
             from app.services.message_dedupe import purge_old_processed_messages
 
             await asyncio.to_thread(purge_old_processed_messages)
+            for action, count in (("stuck_refunded", stuck), ("unrefunded_refunded", unrefunded), ("claims_released", released)):
+                if count:
+                    metrics.registry.inc("moraa_recovery_sweep_total", {"action": action}, count)
             if stuck or unrefunded or released:
                 logger.warning(f"Recovery sweep: stuck={stuck} unrefunded={unrefunded} released={released}")
         except asyncio.CancelledError:

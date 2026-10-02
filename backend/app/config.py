@@ -51,6 +51,7 @@ def _resolve_env_file() -> Optional[str]:
 ENV_FILE: Optional[str] = _resolve_env_file()
 
 # Production JWT signing keys shorter than this are refused at boot.
+_BUILTIN_RECHARGE_PAYMENT_URL = "https://rzp.io/rzp/FbuLh9je"
 _MIN_SECRET_KEY_LENGTH = 32
 _MIN_SECRET_KEY_DISTINCT_CHARS = 10
 
@@ -73,9 +74,12 @@ class Settings(BaseSettings):
     APP_DESCRIPTION: str = "AI-Powered Jewellery Image Analysis Platform"
     # "production" refuses to boot on unsafe config (see _enforce_safe_runtime).
     ENVIRONMENT: Literal["development", "production"] = "development"
-    # DEBUG only controls developer conveniences (SQL echo, auto-reload,
-    # verbose tracebacks). It never relaxes a security check.
+    # DEBUG only controls verbose tracebacks in logs. It never relaxes a security check.
     DEBUG: bool = False
+    # Separate, explicit developer switches (they used to ride on DEBUG, so one flag changed three unrelated
+    # things): print every SQL statement, and restart the server when code changes.
+    SQL_ECHO: bool = False
+    DEV_RELOAD: bool = False
     # Development-only escape hatch: accept Meta/Razorpay webhooks that carry
     # no signature when the matching secret is unset. Refused in production.
     ALLOW_UNSIGNED_WEBHOOKS: bool = False
@@ -83,7 +87,8 @@ class Settings(BaseSettings):
     # Server
     HOST: str = "127.0.0.1"
     PORT: int = 8000
-    WORKERS: int = 4
+    # (WORKERS was removed: nothing read it, so a value in .env gave a false sense of running several workers.
+    # The number of worker processes is set where the server is started, e.g. WEB_CONCURRENCY with gunicorn.)
 
     # Database
     DATABASE_URL: str = "sqlite:///./data/moraa_gemvision.db"
@@ -155,13 +160,15 @@ class Settings(BaseSettings):
     FALLBACK_AI_PROVIDER: str = "local_vision"
 
     # --- API Keys for AI Providers ---
+    # (GEMINI_API_KEY used to be declared twice, the second time from os.getenv; one declaration is enough:
+    # pydantic reads it from the environment / .env itself.)
     GEMINI_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
     ANTHROPIC_API_KEY: str = ""
 
-    # Google Gemini (Primary AI)
-    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = "gemini-2.5-flash"
+    # Google Gemini (Primary AI). The previous default, gemini-2.5-flash, answers 404 "no longer available to
+    # new users"; Google's own error names gemini-3.6-flash as the replacement.
+    GEMINI_MODEL: str = "gemini-3.6-flash"
 
     # --- Model Settings ---
     # Model name for OpenAI Vision API (e.g. "gpt-4o", "gpt-4o-mini")
@@ -181,7 +188,7 @@ class Settings(BaseSettings):
     # which delivers significantly better reference-image fidelity than the
     # deprecated "gemini-2.5-flash-image" (Nano Banana v1). Must support
     # image output via generate_content with response_modalities=["IMAGE"].
-    GEMINI_IMAGE_MODEL: str = "gemini-2.5-flash-image"
+    GEMINI_IMAGE_MODEL: str = "gemini-3.1-flash-image"
 
     # Model name for OpenAI image generation. Default "gpt-image-1" is the
     # ChatGPT image model — it supports reference-image editing
@@ -322,7 +329,6 @@ class Settings(BaseSettings):
     ERPNEXT_MODE_OF_PAYMENT: str = ""
     ERPNEXT_PRINT_FORMAT: str = "Standard"
     ERPNEXT_PRICES_INCLUDE_TAX: bool = True
-    ERPNEXT_TIMEOUT_SECONDS: float = 8.0
     # Upper bound for the whole background invoice job (all ERPNext calls).
     ERPNEXT_JOB_TIMEOUT_SECONDS: float = 60.0
 
@@ -336,26 +342,10 @@ class Settings(BaseSettings):
     # so an unconfigured deployment can never credit a wallet.
     RAZORPAY_WEBHOOK_SECRET: str = ""
 
-    # --- WhatsApp Onboarding Gate (new customer onboarding) ---
-    # When False (DEFAULT) the WhatsApp pipeline behaves EXACTLY as before:
-    # inbound text messages are logged and ignored, and the image →
-    # style-selection → generation flow is untouched.
-    # When True, text messages from unregistered WhatsApp users are routed
-    # through app/services/onboarding_service.py (welcome → registration →
-    # recharge CTA). Registered users always bypass onboarding.
-    ENABLE_ONBOARDING_GATE: bool = False
-
-    # Gemini text model used ONLY to extract structured registration fields
-    # from free-form WhatsApp registration messages. This parser never
-    # generates conversational replies — it returns strict JSON only.
-    ONBOARDING_PARSER_MODEL: str = "gemini-1.5-flash"
-
-    # Cost safety net for the onboarding parser above (audit: paid Gemini
-    # call per registration message, no cap). Only matters once
-    # ENABLE_ONBOARDING_GATE is turned on -- defaults are generous so
-    # nothing changes for existing behavior until someone lowers them.
-    ONBOARDING_PARSER_MAX_CALLS_PER_DAY: int = 500
-    ONBOARDING_PARSER_QUOTA_COOLDOWN_SECONDS: int = 300
+    # (ENABLE_ONBOARDING_GATE was removed: no code read it. Registration and the welcome flow always run; a
+    # switch that appeared to turn them off did nothing.)
+    # (ONBOARDING_PARSER_MODEL / _MAX_CALLS_PER_DAY / _QUOTA_COOLDOWN_SECONDS were removed: nothing read them, so
+    # they suggested a cost cap on the onboarding parser that did not exist.)
 
     # --- Wallet gate (Scenarios 2, 3 and 4) ---
     # The wallet-balance gate in app/api/routes/meta_webhook.py is always
@@ -383,7 +373,7 @@ class Settings(BaseSettings):
     # ('recharge_500' / "💳 Recharge to use") that the onboarding flow already
     # uses. No payment gateway SDK or credential is required by this code —
     # the button only opens the PSP-hosted page.
-    RECHARGE_PAYMENT_URL: str = "https://rzp.io/rzp/FbuLh9je"
+    RECHARGE_PAYMENT_URL: str = _BUILTIN_RECHARGE_PAYMENT_URL
 
     # Zero-cost WhatsApp test mode. Must be a Settings field: pydantic-settings
     # reads backend/.env into this object only -- it never exports .env into
@@ -395,6 +385,22 @@ class Settings(BaseSettings):
     GENERATION_ENABLED: bool = True
     # Daily ceiling on ImageGenerationManager.generate_image() calls.
     MAX_GENERATIONS_PER_DAY: int = 100000
+
+    # --- Administrators ---
+    # Usernames (comma-separated) that are administrators, in addition to users flagged is_admin in the database.
+    # While NO administrator exists anywhere (this empty and no flagged user), admin-only endpoints stay open to
+    # any logged-in user, as they were before, and log a warning: set this to lock them down.
+    ADMIN_USERNAMES: str = ""
+
+    # --- Operations (health, metrics, error tracking, alerts) ---
+    # Sentry error tracking is off unless a DSN is set (and the sentry-sdk package installed).
+    SENTRY_DSN: str = ""
+    # Operations alerts go to these WhatsApp numbers (comma-separated, international format). Empty = log only.
+    OPS_ALERT_WHATSAPP_NUMBERS: str = ""
+    OPS_ALERT_COOLDOWN_MINUTES: int = 60
+    OPS_ALERT_SWEEP_INTERVAL_SECONDS: int = 300
+    # Alert when this share of today's generation ceiling is used.
+    OPS_ALERT_SPEND_WARN_FRACTION: float = 0.8
 
     # --- Meta (WhatsApp) request retries (app/services/meta_whatsapp_service.py) ---
     # 429 / 5xx answers and connection failures are retried this many times with jittered waits. A timed-out
@@ -463,9 +469,12 @@ class Settings(BaseSettings):
     LOG_FORMAT: str = (
         "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
         "<level>{level: <8}</level> | "
+        "<magenta>{extra[request_id]}</magenta> | "
         "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
         "<level>{message}</level>"
     )
+    # One JSON object per line on the console (for a log collector) instead of the readable format.
+    LOG_JSON: bool = False
 
     # --- Celery / Task Queue ---
     CELERY_BROKER_URL: str = "redis://localhost:6379/0"
@@ -516,6 +525,18 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "Refusing to start with ENVIRONMENT=production: "
                     + "; ".join(problems)
+                )
+            # Things worth fixing but not worth refusing to start over (changing them blindly could break a
+            # working production setup): say so loudly in the log.
+            if self.RECHARGE_PAYMENT_URL == _BUILTIN_RECHARGE_PAYMENT_URL:
+                _config_logger.warning(
+                    "RECHARGE_PAYMENT_URL is not set: the built-in static payment link from the source code is "
+                    "used as the fallback. Set RECHARGE_PAYMENT_URL to your own link in the environment."
+                )
+            if self.CELERY_TASK_ALWAYS_EAGER:
+                _config_logger.warning(
+                    "CELERY_TASK_ALWAYS_EAGER is true in production: analysis tasks run inside the web process. "
+                    "Set it to false and run a real worker with a broker."
                 )
         elif self.ALLOW_UNSIGNED_WEBHOOKS:
             _config_logger.warning(

@@ -28,7 +28,7 @@ from app.ai.providers.openai_image_provider import OpenAIImageProvider
 from app.ai.marketplaces.registry import get_marketplace_presentation
 from app.ai.product_fidelity import REFERENCE_PRIORITY_BLOCK, evaluate_fidelity
 from app.config import settings
-from app.services import spend_counter
+from app.services import metrics, spend_counter
 from app.utils.executors import run_io
 from app.utils.logger import logger
 
@@ -564,6 +564,9 @@ class ImageGenerationManager:
                 )
 
                 if result.success:
+                    metrics.record_provider(provider_name, "success")
+                    if is_fallback:
+                        metrics.registry.inc("moraa_provider_fallbacks_total", {"provider": provider_name})
                     result.provider_name = provider_name
                     result.fallback_used = is_fallback
                     result.fallback_reason = fallback_reason
@@ -605,6 +608,7 @@ class ImageGenerationManager:
                 error_msg = result.error or ""
                 last_error = error_msg
                 provider_used = provider_name
+                metrics.record_provider(provider_name, _classify_error(error_msg) if error_msg else "failed")
 
                 # Quota/billing exhaustion and non-recoverable errors halt the
                 # chain immediately after ONE attempt — no fallback, no retries.
@@ -633,6 +637,7 @@ class ImageGenerationManager:
                 last_error = error_msg
                 provider_used = provider_name
                 fallback_reason = f"{provider_name}_exception"
+                metrics.record_provider(provider_name, "exception")
                 logger.warning(f"Provider '{provider_name}' exception: {error_msg}")
 
         # All providers failed — return an honest failure so callers (and the

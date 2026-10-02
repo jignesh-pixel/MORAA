@@ -81,3 +81,14 @@ def refresh_token(request: RefreshTokenRequest, db: Session = Depends(get_db)):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(e),
         )
+
+
+@router.post(
+    "/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Log out",
+    description="Revoke a refresh token so it can never be used again. Always succeeds.",
+)
+def logout(request: RefreshTokenRequest, db: Session = Depends(get_db)):
+    """Revoke the given refresh token (the short-lived access token simply expires)."""
+    AuthService(db).logout(request.refresh_token)
