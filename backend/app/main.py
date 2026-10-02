@@ -97,6 +97,15 @@ async def lifespan(app: FastAPI):
         recovered = await recover_stuck_paid_orders(STUCK_WHITE_AFTER)
         if recovered:
             logger.bind(category="system").warning(f"Recovered {recovered} stuck paid order(s) at startup")
+        from app.services.meta_whatsapp_service import (
+            FAILED_REFUND_GRACE,
+            CHOICE_CLAIM_GRACE,
+            recover_unrefunded_failed_orders,
+            release_abandoned_choice_claims,
+        )
+
+        await recover_unrefunded_failed_orders(FAILED_REFUND_GRACE)
+        await release_abandoned_choice_claims(CHOICE_CLAIM_GRACE)
     except Exception as e:
         logger.bind(category="system").warning(f"Stuck paid order recovery skipped: {e}")
 
@@ -125,11 +134,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.bind(category="system").warning(f"WhatsApp Pay reconcile sweep not started: {e}")
 
+    recovery_task = None
+    try:
+        from app.api.routes.meta_webhook import STUCK_WHITE_AFTER as _STUCK_AFTER
+        from app.services.meta_whatsapp_service import run_recovery_sweep_forever
+
+        recovery_task = asyncio.create_task(run_recovery_sweep_forever(_STUCK_AFTER))
+    except Exception as e:
+        logger.bind(category="system").warning(f"Paid-order recovery sweep not started: {e}")
+
     yield
 
     # Shutdown
     if reconcile_task is not None:
         reconcile_task.cancel()
+    if recovery_task is not None:
+        recovery_task.cancel()
     logger.bind(category="system").info(f"Shutting down {settings.APP_NAME}")
 
 

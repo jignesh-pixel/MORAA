@@ -1216,10 +1216,53 @@ async def retry_delivery(
             "message": f"Cannot retry ingestion in status '{ingestion.status}'",
         }
 
-    # Reset status so the catalog pack will be re-processed.
-    ingestion.status = "stored"
-    ingestion.error_message = None
+    # A retry re-runs a billable generation WITHOUT charging again, so it is only allowed while the
+    # customer's payment is still held by this order: never after the money went back to the wallet,
+    # and never for an order that no product was chosen (and so nothing charged) for.
+    from app.models.wallet_transaction import KIND_REFUND_ORDER
+
+    refunded = (
+        db.query(AuditLog.id)
+        .filter(AuditLog.action == _mws.REFUND_AUDIT_ACTION, AuditLog.resource_id == ingestion.id)
+        .first()
+        is not None
+        or db.query(WalletTransaction.id)
+        .filter(WalletTransaction.ingestion_id == ingestion.id, WalletTransaction.kind == KIND_REFUND_ORDER)
+        .first()
+        is not None
+    )
+    if refunded:
+        return {
+            "status": "error",
+            "message": "This order was already refunded to the customer's wallet; ask them to send the photo again.",
+        }
+    if not ingestion.product_code and not ingestion.amount_charged:
+        return {"status": "error", "message": "No product was chosen and nothing was charged for this photo, so there is nothing to retry."}
+
+    # Reset status atomically so two simultaneous retries cannot both dispatch a worker.
+    reset = (
+        db.query(WhatsAppIngestion)
+        .filter(
+            WhatsAppIngestion.id == ingestion.id,
+            WhatsAppIngestion.status == ingestion.status,
+        )
+        .update({WhatsAppIngestion.status: "stored", WhatsAppIngestion.error_message: None}, synchronize_session=False)
+    )
     db.commit()
+    if reset != 1:
+        return {"status": "error", "message": "The order changed while retrying; check its status and try again."}
+    # A refund may have been committed between the check above and the reset: if so, undo the reset.
+    if (
+        db.query(AuditLog.id)
+        .filter(AuditLog.action == _mws.REFUND_AUDIT_ACTION, AuditLog.resource_id == ingestion_id)
+        .first()
+        is not None
+    ):
+        db.query(WhatsAppIngestion).filter(WhatsAppIngestion.id == ingestion_id).update(
+            {WhatsAppIngestion.status: "failed"}, synchronize_session=False)
+        db.commit()
+        return {"status": "error", "message": "This order was refunded while retrying; ask the customer to resend the photo."}
+    db.refresh(ingestion)
 
     # Dispatch by the STORED product chosen with the reply button.
     # NULL / PACK_1 -> Pack 1 catalog worker, exactly as before.

@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import io
 import json
+from datetime import datetime, timedelta, timezone
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -850,8 +851,9 @@ def _refund_failed_ingestion(db, ingestion) -> None:
         from sqlalchemy.exc import IntegrityError
 
         from app.models.audit_log import AuditLog
-        from app.models.wallet_transaction import KIND_REFUND_ORDER
-        from app.services.wallet_service import credit_wallet, price_per_image
+        from app.models.customer import Customer
+        from app.models.wallet_transaction import KIND_DEBIT_ORDER, KIND_REFUND_ORDER, WalletTransaction
+        from app.services.wallet_service import credit_wallet
 
         already = (
             db.query(AuditLog.id)
@@ -866,17 +868,26 @@ def _refund_failed_ingestion(db, ingestion) -> None:
 
         from app.services.wallet_service import find_customer_by_phone
 
-        cust = find_customer_by_phone(db, ingestion.external_user_id)
+        # Refund exactly what the ledger says was debited, to the wallet it was debited from. Orders
+        # charged before the ledger existed have no debit row: they fall back to amount_charged and
+        # the phone lookup. An order with NO recorded charge is never refunded (nothing was taken).
+        debit = (
+            db.query(WalletTransaction.customer_id, WalletTransaction.amount)
+            .filter(WalletTransaction.ingestion_id == ingestion_id, WalletTransaction.kind == KIND_DEBIT_ORDER)
+            .first()
+        )
+        if debit is not None:
+            price = -int(debit.amount)
+            cust = db.get(Customer, debit.customer_id)
+        else:
+            charged = getattr(ingestion, "amount_charged", None)
+            price = int(charged) if charged else 0
+            cust = find_customer_by_phone(db, ingestion.external_user_id) if price > 0 else None
+        if price <= 0:
+            logger.info(f"Refund not applicable, no recorded charge: ingestion_id={ingestion_id}")
+            return
         if cust is None:
             logger.error(f"Refund skipped, customer not found: ingestion_id={ingestion_id}")
-            return
-
-        # Refund what was actually debited for this order. Legacy rows
-        # (amount_charged NULL, written before migration 0004) keep the
-        # Pack 1 price -- exactly the previous behaviour.
-        charged = getattr(ingestion, "amount_charged", None)
-        price = int(charged) if charged is not None else price_per_image()
-        if price <= 0:
             return
 
         # 1. Claim: a concurrent duplicate fails here (on PostgreSQL it waits
@@ -988,9 +999,181 @@ async def _notify_failed_order(db, ingestion, product_label: str) -> None:
         logger.error(f"Failed-order notice not sent: ingestion_id={ingestion.id} error={notify_error}")
 
 
+def _advance_status(db, ingestion_id: str, expected: str, new: str) -> bool:
+    """Move an order forward only if nobody else (the recovery sweep) changed it meanwhile.
+
+    A False result means the order was already failed and refunded by recovery; the caller must stop
+    and not deliver. Never raises."""
+    from app.models.whatsapp_ingestion import WhatsAppIngestion
+
+    try:
+        moved = (
+            db.query(WhatsAppIngestion)
+            .filter(WhatsAppIngestion.id == ingestion_id, WhatsAppIngestion.status == expected)
+            .update({WhatsAppIngestion.status: new}, synchronize_session=False)
+        )
+        db.commit()
+        db.expire_all()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Status change {expected}->{new} failed: ingestion_id={ingestion_id} error={e}")
+        return False
+    if moved != 1:
+        logger.error(
+            f"Order {ingestion_id} was changed by recovery while its worker ran "
+            f"(expected '{expected}', wanted '{new}'); worker stops."
+        )
+        return False
+    return True
+
+
 # Paid orders whose worker can no longer be running once they are this old
 # (queued/processing rows left behind by a process restart).
-STUCK_PAID_STATUSES = ("white_queued", "pack_queued", "processing", "generated")
+STUCK_PAID_STATUSES = ("white_queued", "pack_queued", "processing", "generated", "stored")
+# 'generated' means images may already be on their way to the customer: give delivery three times as long.
+GENERATED_PATIENCE = 3
+
+
+async def recover_unrefunded_failed_orders(older_than) -> int:
+    """Refund orders that were marked failed/delivery_failed but whose refund never completed.
+
+    ``_fail_ingestion`` commits the terminal status and THEN refunds; a crash or a database error in
+    between used to leave the money held forever. The refund is idempotent (audit claim + ledger
+    uniqueness), so re-running it for every such order is safe. Never raises."""
+    from datetime import datetime, timezone
+
+    from sqlalchemy import exists
+
+    from app.database import SessionLocal
+    from app.models.audit_log import AuditLog
+    from app.models.whatsapp_ingestion import PRODUCT_WHITE_BG, WhatsAppIngestion
+
+    recovered = 0
+    db = SessionLocal()
+    try:
+        cutoff = datetime.now(timezone.utc) - older_than
+        rows = (
+            db.query(WhatsAppIngestion)
+            .filter(
+                WhatsAppIngestion.status.in_(("failed", "delivery_failed")),
+                WhatsAppIngestion.amount_charged > 0,
+                WhatsAppIngestion.updated_at < cutoff,
+                ~exists().where(
+                    AuditLog.action == REFUND_AUDIT_ACTION, AuditLog.resource_id == WhatsAppIngestion.id
+                ),
+            )
+            .order_by(WhatsAppIngestion.updated_at)
+            .limit(50)
+            .all()
+        )
+        for row in rows:
+            row_id, product_code = row.id, row.product_code
+            # Re-check right before paying out: the rows were loaded earlier, and a retry may have restarted
+            # this order since. A guarded no-op UPDATE only matches while the order is still failed.
+            still_failed = (
+                db.query(WhatsAppIngestion)
+                .filter(
+                    WhatsAppIngestion.id == row_id,
+                    WhatsAppIngestion.status.in_(("failed", "delivery_failed")),
+                )
+                .update({WhatsAppIngestion.status: WhatsAppIngestion.status}, synchronize_session=False)
+            )
+            db.commit()
+            if still_failed != 1:
+                continue
+            logger.error(f"Failed order still holds the customer's money, refunding: ingestion_id={row_id}")
+            refunded_before = _refunded_amount(db, row)
+            _refund_failed_ingestion(db, row)
+            refunded_after = _refunded_amount(db, row)
+            if refunded_after > 0 and refunded_before == 0:       # only the process that moved the money tells the customer
+                label = "Clean Studio Shot" if product_code == PRODUCT_WHITE_BG else "Full Catalog Pack"
+                await _notify_failed_order(db, row, label)
+                recovered += 1
+            elif refunded_after == 0:
+                # Could not refund (e.g. wallet row missing): move it to the back of the queue, stay quiet.
+                db.query(WhatsAppIngestion).filter(WhatsAppIngestion.id == row_id).update(
+                    {WhatsAppIngestion.updated_at: datetime.now(timezone.utc)}, synchronize_session=False)
+                db.commit()
+                logger.error(f"Refund still not possible: ingestion_id={row_id}; needs manual review")
+    except Exception as e:
+        logger.error(f"Unrefunded failed order recovery failed: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        db.close()
+    return recovered
+
+
+async def release_abandoned_choice_claims(older_than) -> int:
+    """Put orders left in ``choice_claimed`` (process died right after the tap) back to
+    ``awaiting_choice`` so the customer can tap again. Only when NO debit exists for the order; the
+    debit and the status change commit together, so a debited order is never in this state."""
+    from datetime import datetime, timezone
+
+    from sqlalchemy import exists
+
+    from app.database import SessionLocal
+    from app.models.wallet_transaction import KIND_DEBIT_ORDER, WalletTransaction
+    from app.models.whatsapp_ingestion import WhatsAppIngestion
+
+    released = 0
+    db = SessionLocal()
+    try:
+        cutoff = datetime.now(timezone.utc) - older_than
+        released = (
+            db.query(WhatsAppIngestion)
+            .filter(
+                WhatsAppIngestion.status == "choice_claimed",
+                WhatsAppIngestion.updated_at < cutoff,
+                ~exists().where(
+                    WalletTransaction.ingestion_id == WhatsAppIngestion.id,
+                    WalletTransaction.kind == KIND_DEBIT_ORDER,
+                ),
+            )
+            .update(
+                {WhatsAppIngestion.status: "awaiting_choice", WhatsAppIngestion.product_code: None},
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        if released:
+            logger.warning(f"Released {released} abandoned product-choice claim(s)")
+    except Exception as e:
+        logger.error(f"Abandoned choice release failed: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        db.close()
+    return int(released or 0)
+
+
+RECOVERY_SWEEP_INTERVAL_SECONDS = 180
+FAILED_REFUND_GRACE = timedelta(minutes=2)       # let the live failure path finish its own refund first
+CHOICE_CLAIM_GRACE = timedelta(minutes=5)
+
+
+async def run_recovery_sweep_forever(stuck_after) -> None:
+    """Periodic recovery (started from the app lifespan). Until the scheduler of the scale phase
+    exists this runs in the single API process; every step is idempotent, so a second instance is
+    harmless. Never raises except on cancel."""
+    import asyncio
+
+    while True:
+        await asyncio.sleep(RECOVERY_SWEEP_INTERVAL_SECONDS)
+        try:
+            stuck = await recover_stuck_paid_orders(stuck_after)
+            unrefunded = await recover_unrefunded_failed_orders(FAILED_REFUND_GRACE)
+            released = await release_abandoned_choice_claims(CHOICE_CLAIM_GRACE)
+            if stuck or unrefunded or released:
+                logger.warning(f"Recovery sweep: stuck={stuck} unrefunded={unrefunded} released={released}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Recovery sweep iteration failed: {e}")
 
 
 async def recover_stuck_paid_orders(older_than) -> int:
@@ -1004,6 +1187,8 @@ async def recover_stuck_paid_orders(older_than) -> int:
     """
     from datetime import datetime, timezone
 
+    from sqlalchemy import or_
+
     from app.database import SessionLocal
     from app.models.whatsapp_ingestion import PRODUCT_WHITE_BG, WhatsAppIngestion
 
@@ -1011,17 +1196,22 @@ async def recover_stuck_paid_orders(older_than) -> int:
     db = SessionLocal()
     try:
         cutoff = datetime.now(timezone.utc) - older_than
+        generated_cutoff = datetime.now(timezone.utc) - older_than * GENERATED_PATIENCE
         rows = (
             db.query(WhatsAppIngestion)
             .filter(
                 WhatsAppIngestion.status.in_(STUCK_PAID_STATUSES),
                 WhatsAppIngestion.amount_charged > 0,
                 WhatsAppIngestion.updated_at < cutoff,
+                or_(
+                    WhatsAppIngestion.status != "generated",
+                    WhatsAppIngestion.updated_at < generated_cutoff,
+                ),
             )
             .all()
         )
         for row in rows:
-            message = f"Recovered at startup: order stuck in '{row.status}'"
+            message = f"Recovered by the sweep: order stuck in '{row.status}'"
             claimed = (
                 db.query(WhatsAppIngestion)
                 .filter(
@@ -1279,8 +1469,8 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         if not generated_data_urls:
             return await _fail("All catalog style generations failed")
 
-        ingestion.status = "generated"
-        db.commit()
+        if not _advance_status(db, ingestion_id, "processing", "generated"):
+            return False
 
         media_ids: List[str] = []
         for data_url in generated_data_urls:
@@ -1319,7 +1509,8 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         if sent_count < total_images:
             # Partial delivery: the customer already received real value, so
             # this is not refunded -- just kept distinct from full success.
-            ingestion.status = "delivered_partial"
+            if not _advance_status(db, ingestion_id, "generated", "delivered_partial"):
+                return True       # recovery changed the order; the images are already with the customer
             ingestion.error_message = f"Delivered {sent_count}/{total_images} images"
             db.commit()
             logger.warning(
@@ -1338,7 +1529,8 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
             await ent.record_trial_success(db, ingestion)  # images were delivered
             return True
 
-        ingestion.status = "delivered"
+        if not _advance_status(db, ingestion_id, "generated", "delivered"):
+            return True       # images are already with the customer; do not overwrite a swept status
         ingestion.error_message = None
         db.commit()
 
@@ -1581,8 +1773,8 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
                 }),
             )
         )
-        ingestion.status = "generated"
-        db.commit()
+        if not _advance_status(db, ingestion_id, "processing", "generated"):
+            return False
 
         media_id = await upload_media_to_meta(generated_bytes)
         if not media_id:
@@ -1609,7 +1801,8 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
         if not sent:
             return await _fail("Meta message send failed", delivery=True)
 
-        ingestion.status = "delivered"
+        if not _advance_status(db, ingestion_id, "generated", "delivered"):
+            return True
         ingestion.error_message = None
         db.commit()
         logger.info(
