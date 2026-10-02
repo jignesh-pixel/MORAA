@@ -396,6 +396,12 @@ class Settings(BaseSettings):
     # Daily ceiling on ImageGenerationManager.generate_image() calls.
     MAX_GENERATIONS_PER_DAY: int = 100000
 
+    # --- Database connection pool (PostgreSQL; app/database.py) ---
+    DB_POOL_SIZE: int = 10
+    DB_MAX_OVERFLOW: int = 10
+    DB_POOL_TIMEOUT_SECONDS: float = 5.0
+    DB_POOL_RECYCLE_SECONDS: int = 1800
+
     # --- Image provider timeouts and retries (app/ai/*) ---
     # Client-side limits, so a slow or hung provider can never hold a paid order forever.
     GEMINI_IMAGE_TIMEOUT_SECONDS: float = 90.0

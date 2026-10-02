@@ -674,7 +674,13 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
         )
         return None
 
-    # Fetch, validate and AI pre-check once per photo -- before any charge.
+    # Fetch, validate and AI pre-check once per photo -- before any charge. Take what the rest of this
+    # function needs out of the ORM objects and end the transaction first: the download and AI pre-check
+    # below take seconds, and a connection held that long is what exhausts the pool under photo bursts (PERF-1).
+    new_ingestion_id = ingestion.id
+    customer_wallet_id = customer.whatsapp_id
+    db.commit()
+
     media_url = await get_media_url(media_id)
     download_result: Optional[Tuple[bytes, str]] = await download_media(media_url) if media_url else None
     if not download_result:
@@ -720,17 +726,19 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
 
     # Re-read the balance at send time: download + AI pre-check can take
     # ~10 s, and a payment or another order may have committed meanwhile.
+    current_balance = get_balance(db, customer_wallet_id)
+    db.commit()           # the Meta send below must not hold a connection
     sent = await send_product_selection_buttons(
         recipient_id=sender,
-        ingestion_id=ingestion.id,
+        ingestion_id=new_ingestion_id,
         white_price=white_price,
         pack_price=pack_price,
-        balance=get_balance(db, customer.whatsapp_id),
+        balance=current_balance,
         reply_to_message_id=message_id,
     )
     if not sent:
-        logger.error(f"Product selection buttons NOT sent: ingestion_id={ingestion.id}")
-    return ingestion.id
+        logger.error(f"Product selection buttons NOT sent: ingestion_id={new_ingestion_id}")
+    return new_ingestion_id
 
 
 async def _handle_product_choice(

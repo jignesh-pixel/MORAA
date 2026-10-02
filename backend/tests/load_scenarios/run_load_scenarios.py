@@ -1052,7 +1052,15 @@ def run_pool_children() -> Dict[str, Any]:
     return {
         "pool_config": "SQLAlchemy defaults used by app/database.py: pool_size=5, max_overflow=10 (15 connections); pool_timeout shortened 30 s -> 3 s so the probe finishes (behaviour is identical, stalls are 10x shorter than production)",
         "rows": rows, "verdict": verdict(not bad and ok_small),
-        "verdict_reason": "each in-flight pack worker keeps its Session/connection checked out across the whole provider wait (no commit between the Image lookup and the post-generation commit); the 16th concurrent order blocks the event loop inside pool.checkout",
+        "verdict_reason": (
+            "workers end their transaction before every provider / Meta wait, so connections go back to the pool; "
+            + "; ".join(
+                f"{r.get('orders')} orders: "
+                + ("ERROR" if r.get("error") else f"{r.get('tasks_raised_pool_timeout', 0)} pool timeouts, "
+                   f"loop stalled {r.get('loop_stalled_total_s')}s, {r.get('packs_delivered')} delivered")
+                for r in rows
+            )
+        ),
     }
 
 

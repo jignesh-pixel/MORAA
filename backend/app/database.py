@@ -18,12 +18,28 @@ if settings.IS_SQLITE:
     db_path = Path(settings.DATABASE_URL.replace("sqlite:///", ""))
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
+# Connection pool (PostgreSQL only; SQLite keeps SQLAlchemy's own defaults). Explicit so the numbers are a
+# decision, not an accident: workers hold a connection only for short statements (never across a provider
+# or Meta wait), so this many are plenty. A request that cannot get one fails after DB_POOL_TIMEOUT_SECONDS
+# (default 5) instead of the SQLAlchemy default of 30 s, because a synchronous checkout blocks the event loop.
+_POOL_KWARGS = (
+    {}
+    if settings.IS_SQLITE
+    else {
+        "pool_size": max(int(settings.DB_POOL_SIZE), 1),
+        "max_overflow": max(int(settings.DB_MAX_OVERFLOW), 0),
+        "pool_timeout": max(float(settings.DB_POOL_TIMEOUT_SECONDS), 0.1),
+        "pool_recycle": max(int(settings.DB_POOL_RECYCLE_SECONDS), 0) or -1,
+    }
+)
+
 # Create engine
 engine = create_engine(
     settings.DATABASE_URL,
     echo=settings.DEBUG,
     connect_args={"check_same_thread": False} if settings.IS_SQLITE else {},
     pool_pre_ping=True,
+    **_POOL_KWARGS,
     # Exception messages otherwise embed every bound value (customer names,
     # phone numbers, GSTINs, addresses) and those messages are logged.
     hide_parameters=True,

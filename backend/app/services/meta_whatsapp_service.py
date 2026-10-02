@@ -987,6 +987,24 @@ def _refunded_amount(db, ingestion) -> int:
         return 0
 
 
+def _release_db(db) -> None:
+    """End the open transaction so its connection goes back to the pool BEFORE a long network wait (PERF-1).
+
+    A Session keeps its connection from its first query until commit/rollback; a worker that then waits
+    15-40 s for a provider or Meta would hold it for the whole wait, and about 15 such orders exhaust the pool
+    and freeze the event loop. Committing here is safe: everything read so far is already in local variables or
+    reloads on next use, and nothing half-written is pending at these call sites.
+    """
+    try:
+        db.commit()
+    except Exception as e:  # noqa: BLE001 -- releasing must never break an order
+        logger.error(f"Could not end the transaction before a network wait: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
 async def _notify_failed_order(db, ingestion, product_label: str) -> None:
     """Tell the customer a paid order failed, using the Clean Studio Shot
     failure wording. States a refund only when a refund row exists. Never raises."""
@@ -996,14 +1014,12 @@ async def _notify_failed_order(db, ingestion, product_label: str) -> None:
         text += f"₹{refunded} has been refunded to your wallet."
     elif not ingestion.amount_charged:
         text += "You were not charged."
+    ingestion_id, recipient_id, quote_id = ingestion.id, ingestion.external_user_id, ingestion.external_message_id
+    _release_db(db)
     try:
-        await send_whatsapp_text(
-            ingestion.external_user_id,
-            text.strip(),
-            reply_to_message_id=ingestion.external_message_id,
-        )
+        await send_whatsapp_text(recipient_id, text.strip(), reply_to_message_id=quote_id)
     except Exception as notify_error:
-        logger.error(f"Failed-order notice not sent: ingestion_id={ingestion.id} error={notify_error}")
+        logger.error(f"Failed-order notice not sent: ingestion_id={ingestion_id} error={notify_error}")
 
 
 def _advance_status(db, ingestion_id: str, expected: str, new: str) -> bool:
@@ -1495,6 +1511,14 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
             f"dry_run={DRY_RUN_IMAGE_MODE}"
         )
 
+        # Everything the long waits below need, read once; then the connection goes back to the pool
+        # for the whole 15-40 s of generation (PERF-1).
+        reference_mime = ingestion.mime_type or "image/jpeg"
+        order_request_id = ingestion.request_id
+        recipient_id = ingestion.external_user_id
+        quote_id = ingestion.external_message_id
+        _release_db(db)
+
         gather_results = await _gather_styles_with_deadline(
             [
                 _generate_single_pack_style(
@@ -1502,8 +1526,8 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
                     style_title=style_title,
                     prompt=prompt,
                     reference_image_bytes=reference_image_bytes,
-                    reference_mime_type=ingestion.mime_type or "image/jpeg",
-                    request_id=ingestion.request_id,
+                    reference_mime_type=reference_mime,
+                    request_id=order_request_id,
                     spend_reserved=spend_reserved,
                 )
                 for style_title, prompt in style_jobs
@@ -1539,15 +1563,16 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
 
         from app.services.wallet_service import find_customer_by_phone, get_balance
 
-        cust = find_customer_by_phone(db, ingestion.external_user_id)
+        cust = find_customer_by_phone(db, recipient_id)
         rem_bal = get_balance(db, cust.whatsapp_id) if cust else 0
         balance_text = f"₹{rem_bal:,}"
+        _release_db(db)
 
         sent_count = await send_catalog_pack_images_to_whatsapp(
-            recipient_id=ingestion.external_user_id,
+            recipient_id=recipient_id,
             image_urls=media_ids,
             balance_text=balance_text,
-            reply_to_message_id=ingestion.external_message_id,
+            reply_to_message_id=quote_id,
         )
         # Completion is measured against the styles this pack was meant to
         # produce, not just the images that happened to be generated.
@@ -1565,14 +1590,14 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
             db.commit()
             logger.warning(
                 f"Catalog pack partially delivered: ingestion_id={ingestion_id} "
-                f"sent={sent_count}/{total_images} recipient={mask_phone(ingestion.external_user_id)}"
+                f"sent={sent_count}/{total_images} recipient={mask_phone(recipient_id)}"
             )
             try:
                 await send_whatsapp_text(
-                    ingestion.external_user_id,
+                    recipient_id,
                     f"Note: {sent_count} of {total_images} images in your Full Catalog Pack "
                     "could be created this time.",
-                    reply_to_message_id=ingestion.external_message_id,
+                    reply_to_message_id=quote_id,
                 )
             except Exception as notify_error:
                 logger.error(f"Partial-pack notice not sent: ingestion_id={ingestion_id} error={notify_error}")
@@ -1762,6 +1787,9 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
         if not reference_image_bytes:
             return await _fail("Image file is empty")
         reference_mime_type = ingestion.mime_type or "image/jpeg"
+        order_request_id = ingestion.request_id
+        recipient_id = ingestion.external_user_id
+        quote_id = ingestion.external_message_id
 
         provider_name, model_used, fallback_used = "dry_run", "none", False
         if DRY_RUN_IMAGE_MODE:
@@ -1780,10 +1808,11 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
             from app.services import entitlement_service as ent
             from app.services.wallet_service import find_customer_by_phone as _find_cust
 
-            admin_order = ent.is_admin(_find_cust(db, ingestion.external_user_id))
+            admin_order = ent.is_admin(_find_cust(db, recipient_id))
+            _release_db(db)           # no connection held during the 15-40 s provider wait (PERF-1)
             result = await ImageGenerationManager().generate_image(
                 prompt=build_ecommerce_shot_prompt(),
-                context={"request_id": ingestion.request_id, "aspect_ratio": "1:1"},
+                context={"request_id": order_request_id, "aspect_ratio": "1:1"},
                 reference_image=reference_image_bytes,
                 reference_mime_type=reference_mime_type,
                 **({"spend_reserved": True} if admin_order else {}),
@@ -1835,18 +1864,19 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
         else:
             from app.services.wallet_service import find_customer_by_phone, get_balance
 
-            cust = find_customer_by_phone(db, ingestion.external_user_id)
+            cust = find_customer_by_phone(db, recipient_id)
             rem_bal = get_balance(db, cust.whatsapp_id) if cust else 0
             caption = (
                 "Here's your Clean Studio Shot ✨\n"
                 f"Remaining balance: ₹{rem_bal:,}"
             )
+        _release_db(db)
 
         sent = await send_image_to_whatsapp(
-            recipient_id=ingestion.external_user_id,
+            recipient_id=recipient_id,
             media_id=media_id,
             caption=caption,
-            reply_to_message_id=ingestion.external_message_id,
+            reply_to_message_id=quote_id,
         )
         if not sent:
             return await _fail("Meta message send failed", delivery=True)
