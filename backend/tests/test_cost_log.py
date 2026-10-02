@@ -74,8 +74,12 @@ class ManagerWritesTheLogTests(_Base):
         provider.generate_image = AsyncMock(return_value=ImageGenerationResult(
             success=True, provider_name="gemini", model_used="gm", processing_time=2.5))
         m = igm.ImageGenerationManager()
+        async def run():
+            await m._attempt_with_retries(provider, "gemini", "p", {}, None, "image/jpeg", "req-9")
+            await asyncio.gather(*list(igm._log_tasks))          # the row is written in the background
+
         with patch.object(settings, "COST_PER_CALL_GEMINI_RUPEES", 1.5):
-            asyncio.run(m._attempt_with_retries(provider, "gemini", "p", {}, None, "image/jpeg", "req-9"))
+            asyncio.run(run())
         row = self.rows()[0]
         self.assertEqual((row.provider, row.model, row.outcome, row.est_cost_paise, row.request_id),
                          ("gemini", "gm", "success", 150, "req-9"))

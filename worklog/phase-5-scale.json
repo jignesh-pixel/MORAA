@@ -1,0 +1,107 @@
+{
+  "project": "MORAA GemVision",
+  "phase": "Phase 5 Scale Architecture",
+  "why": "A paid order started only as an in-memory background job, so every deploy or crash stranded paid orders until a later sweep refunded them. Every periodic job ran in every server process, a provider outage kept burning calls, nothing capped how much one customer could queue, the processing message always promised 20 to 30 seconds, and there was no way to run the server except by hand. A shop that grows past one phone and one laptop needs these fixed before it needs more customers.",
+  "approach": "Paid orders, invoices and ops messages are written to a database 'outbox' first and picked up again after a restart; periodic jobs have a one-row lease so only one process runs each; providers have a circuit breaker, a rate smoother and a priority gate; a customer can have at most three paid orders in progress; the processing message uses measured times; middleware was made cheaper; uploads are size-checked as they stream; and Docker files describe how to run the stack. Everything is behind settings and needs no new service such as Redis.",
+  "decisions": [
+    {
+      "decision": "Use a database outbox (not Redis and Celery) to make paid orders survive restarts.",
+      "why": "The database already exists and already holds the order state; the outbox is a table plus a sweep. It removes the 'lost on restart' risk now without the owner choosing and paying for a new service.",
+      "alternatives": [
+        { "option": "Celery with Redis", "why_not": "Needs a hosting and Redis decision the owner has not made; kept as a later step if one server cannot cope." },
+        { "option": "Keep in-memory background tasks and rely on the recovery sweep", "why_not": "Orders are refunded after 10 minutes instead of being served." }
+      ],
+      "tasks": "1.1"
+    },
+    {
+      "decision": "Run the order directly as before AND record it in the outbox first; the sweep only rescues orders nobody started after 90 seconds.",
+      "why": "Customers see no change in speed, the server's shutdown still waits for orders in progress, and a crash can no longer lose an order.",
+      "alternatives": [
+        { "option": "Let only the sweep run orders", "why_not": "Adds up to 20 seconds of delay to every order." }
+      ],
+      "tasks": "1.1"
+    },
+    {
+      "decision": "A per-provider circuit breaker with one probe after a cool-down, counting one failure per order (not per retry), and never counting refused prompts.",
+      "why": "During an outage this makes orders fail fast and refund instead of waiting for several timeouts, while a blocked prompt (the customer's photo) is not the provider's fault.",
+      "alternatives": [
+        { "option": "Count every failed attempt", "why_not": "Two ordinary rate-limited orders would open the circuit." },
+        { "option": "No breaker, rely on timeouts", "why_not": "Every order waits through the full timeout during an outage." }
+      ],
+      "tasks": "2.1"
+    },
+    {
+      "decision": "Do not build photo-burst grouping (UX-1), object storage (DEP-3) or the full Celery queue yet.",
+      "why": "Each needs a decision only the owner can make (how a batch is priced, which storage provider, whether to pay for Redis). They are recorded in docs/QUESTIONS_FOR_MORNING.md.",
+      "alternatives": [
+        { "option": "Choose for the owner", "why_not": "Changes pricing and costs without their say." }
+      ],
+      "tasks": "4.1, 4.2"
+    }
+  ],
+  "errors": [
+    {
+      "error": "Reviewer: circuit breaker could stay open forever if the probe call was cancelled",
+      "cause": "The probe slot was only freed by a success, a failure or a neutral report; a cancelled probe reported nothing.",
+      "fix": "Every call chain now always reports an outcome (even on cancel or exception), and a probe that never reports expires after the cool-down.",
+      "task": "2.1"
+    },
+    {
+      "error": "Reviewer: a re-delivered payment could send its invoice twice",
+      "cause": "'Could not queue' and 'already queued' both looked like failure, so the code fell back to sending directly.",
+      "fix": "The outbox now says queued, duplicate or unavailable; a duplicate does nothing.",
+      "task": "1.2"
+    },
+    {
+      "error": "TimeoutError: QueuePool limit of size 5 overflow 10 reached (load scenario k)",
+      "cause": "The new queue-depth lookup used a second database connection while the request still held its own.",
+      "fix": "End the request's transaction before the lookup.",
+      "task": "3.1"
+    },
+    {
+      "error": "Reviewer: in Docker every internet visitor shared one rate-limit bucket",
+      "cause": "uvicorn did not trust the proxy's forwarded address, so all traffic looked like it came from the proxy.",
+      "fix": "Start uvicorn with --proxy-headers and trust the private proxy network.",
+      "task": "5.1"
+    }
+  ],
+  "domains": [
+    {
+      "name": "Durable work",
+      "goal": "Nothing paid is lost to a restart.",
+      "tasks": [
+        { "title": "A paid order is recorded in the database before anything else can fail, and started again if the server dies first", "status": "done", "files": ["backend/app/services/outbox.py", "backend/app/models/outbox_job.py", "backend/alembic/versions/0016_outbox_jobs.py", "backend/app/api/routes/meta_webhook.py"], "verify": "On a test copy: place a test order and kill the server within 5 seconds, restart: the order is delivered (not refunded) within about two minutes. Automated tests cover it; no live run." },
+        { "title": "Invoices and ops-team messages are retried with growing waits and parked as dead with an alert after six failures", "status": "done", "files": ["backend/app/services/outbox.py", "backend/app/services/alert_service.py"], "verify": "Tests in tests/test_outbox.py. In production /metrics shows moraa_outbox_jobs." },
+        { "title": "Only one server process runs each periodic job (payment checks, refunds of stuck orders, alerts)", "status": "done", "files": ["backend/app/services/scheduler_lease.py", "backend/alembic/versions/0017_scheduler_leases.py"], "verify": "Tests in tests/test_scheduler_lease.py. Not exercised with two real processes." },
+        { "title": "A photo cut off mid-processing is closed and the customer asked to resend (nothing was charged)", "status": "done", "files": ["backend/app/services/meta_whatsapp_service.py"], "verify": "Tests in tests/test_money_recovery.py." }
+      ]
+    },
+    {
+      "name": "Providers and fairness",
+      "tasks": [
+        { "title": "A failing provider is skipped for a minute (circuit breaker) and calls can be smoothed to the provider's quota", "status": "done", "files": ["backend/app/ai/provider_protection.py", "backend/app/ai/image_generation_manager.py"], "verify": "Tests in tests/test_provider_protection.py. IMAGE_PROVIDER_RPM stays 0 (off) until you tell us the quota." },
+        { "title": "A single Studio Shot is served ahead of Pack images, and a customer can have at most 3 paid orders in progress", "status": "done", "files": ["backend/app/ai/concurrency_gate.py", "backend/app/api/routes/meta_webhook.py"], "verify": "Send four photos quickly and tap Pack on each: the fourth reply says 'You already have 3 orders being prepared, nothing was charged'." }
+      ]
+    },
+    {
+      "name": "Customer experience and edges",
+      "tasks": [
+        { "title": "The processing message uses the measured time of recent orders instead of a fixed '20-30 seconds'", "status": "done", "files": ["backend/app/services/eta_service.py"], "verify": "After three delivered orders the message reads 'Usually ready in about N minutes'. Until then it keeps the original wording." },
+        { "title": "Cheaper request handling, size-checked uploads, API docs off in production, admin-only status endpoint", "status": "done", "files": ["backend/app/middleware/", "backend/app/utils/upload_limits.py", "backend/app/main.py"], "verify": "Upload a file bigger than 10 MB: refused with a clear message. With ENVIRONMENT=production /docs answers 404." }
+      ]
+    },
+    {
+      "name": "Not built (owner decisions)",
+      "tasks": [
+        { "title": "Group a burst of photos into one confirmation (UX-1)", "status": "blocked", "blocked_by": "How a batch is priced and confirmed: see docs/QUESTIONS_FOR_MORNING.md" },
+        { "title": "Move customer photos to object storage and sign image links (DEP-3, SEC-7)", "status": "blocked", "blocked_by": "The owner's choice of storage provider and an account." }
+      ]
+    },
+    {
+      "name": "Deployment files",
+      "tasks": [
+        { "title": "Dockerfile, compose file and HTTPS proxy config with graceful shutdown", "status": "in_progress", "files": ["backend/Dockerfile", "docker/docker-compose.yml", "docker/Caddyfile"], "verify": "Written but never built: this machine has no Docker. The first docker compose up on a real server is the real test." }
+      ]
+    }
+  ]
+}

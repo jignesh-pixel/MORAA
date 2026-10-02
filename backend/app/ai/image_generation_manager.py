@@ -403,6 +403,27 @@ def reserve_generation_slots(count: int) -> Optional[str]:
     return _spend_blocked(count)
 
 
+_log_tasks: "set[asyncio.Task]" = set()
+
+
+def _log_call_in_background(*args: Any) -> None:
+    """Write the cost-log row on the I/O pool WITHOUT waiting for it: the finished image must not be held in memory
+    while the write queues behind other work, and the log must never delay or affect an order (COST-4)."""
+
+    async def _write() -> None:
+        try:
+            await run_io(provider_call_log.record, *args)
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        task = asyncio.ensure_future(_write())
+    except RuntimeError:
+        return
+    _log_tasks.add(task)
+    task.add_done_callback(_log_tasks.discard)
+
+
 class ImageGenerationManager:
     """Orchestrates image generation with automatic provider failover."""
 
@@ -568,13 +589,10 @@ class ImageGenerationManager:
             result = await self._call_provider_once(
                 provider, prompt, context, reference_image, reference_mime_type, request_id
             )
-        try:
-            await run_io(
-                provider_call_log.record, provider_name, getattr(result, "model_used", None), bool(result.success),
-                float(getattr(result, "processing_time", 0.0) or 0.0), result.error, request_id,
-            )
-        except Exception:  # noqa: BLE001 -- the cost log must never affect an order
-            pass
+        _log_call_in_background(
+            provider_name, getattr(result, "model_used", None), bool(result.success),
+            float(getattr(result, "processing_time", 0.0) or 0.0), result.error, request_id,
+        )
         return result
 
     async def generate_image(

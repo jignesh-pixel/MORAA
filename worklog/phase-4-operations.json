@@ -1,0 +1,94 @@
+{
+  "project": "MORAA GemVision",
+  "phase": "Phase 4 Operations",
+  "why": "Until now nobody could tell whether the live system was healthy: request logs were empty, the health page always said healthy, errors went unseen, there was no backup you could restore, and any logged-in user could use administrator-only endpoints. A shop that takes customers' money needs to find out about a problem before the customer does, recover from a bad day, and control who can do what.",
+  "approach": "Health pages that really check the database and schema, a metrics page for a dashboard, WhatsApp alerts to the owner for the five things that need a person, error reporting that strips personal data, a request id on every log line, indexes for the slow queries, administrator and token controls on logins, and scripts for backup, restore drill and a safe release.",
+  "decisions": [
+    {
+      "decision": "Hand-roll a small Prometheus-format metrics page instead of adding a metrics library.",
+      "why": "No new dependency to download or audit; the needed numbers are a few counters and gauges.",
+      "alternatives": [
+        { "option": "prometheus-client library", "why_not": "A new package for a very small need; downloads were avoided." }
+      ],
+      "tasks": "1.2"
+    },
+    {
+      "decision": "Send operations alerts to the owner's WhatsApp, one message per problem with a cooldown stored in the database.",
+      "why": "The owner already watches WhatsApp. A database cooldown survives restarts and is shared by every process.",
+      "alternatives": [
+        { "option": "Email only", "why_not": "Slower to notice; no email service is set up." },
+        { "option": "In-memory cooldown", "why_not": "A restart would repeat every alert." }
+      ],
+      "tasks": "1.3"
+    },
+    {
+      "decision": "Refresh tokens are single-use; using one twice (outside a short double-tap window) logs the account out everywhere.",
+      "why": "A reused token means a copy exists somewhere else; revoking everything makes a stolen token useless.",
+      "alternatives": [
+        { "option": "Reusable refresh tokens until they expire", "why_not": "A stolen token works for weeks." }
+      ],
+      "tasks": "3.2"
+    },
+    {
+      "decision": "Until an administrator is configured, the admin-only endpoints stay open to any logged-in user (with a log warning).",
+      "why": "Turning the check on with nobody configured would lock the owner out of the retry endpoint. Configuring ADMIN_USERNAMES turns it on.",
+      "alternatives": [
+        { "option": "Deny everyone until configured", "why_not": "Could lock the owner out of a live fix." }
+      ],
+      "tasks": "3.1"
+    }
+  ],
+  "errors": [
+    {
+      "error": "Token issued in the same second as the logout cut-off was refused",
+      "cause": "Token timestamps are whole seconds but the cut-off had fractions, so a brand-new token compared as older.",
+      "fix": "Compare at whole-second resolution.",
+      "task": "3.2"
+    },
+    {
+      "error": "Reviewer: restore drill script could be pointed at the live database",
+      "cause": "Only a Supabase host name was blocked; pg_restore --clean drops tables.",
+      "fix": "The target must not equal the application's own database and its name must contain scratch, test or restore.",
+      "task": "4.2"
+    },
+    {
+      "error": "Reviewer: signing up as a different-case copy of an administrator's name could gain admin rights",
+      "cause": "ADMIN_USERNAMES was matched case-insensitively but sign-up was case-sensitive.",
+      "fix": "Sign-up refuses any name whose lowercase form is an administrator's.",
+      "task": "3.1"
+    }
+  ],
+  "domains": [
+    {
+      "name": "Visibility",
+      "goal": "Know the system's health without reading code.",
+      "tasks": [
+        { "title": "/health/ready answers 503 with a reason when the database, schema version or upload folder is wrong", "status": "done", "files": ["backend/app/api/routes/health.py"], "verify": "Stop the database and open /health/ready from the server: it says not ready and names the database. /health/live still says alive." },
+        { "title": "/metrics shows orders by status, daily image use, provider outcomes, pending payments and database state", "status": "done", "files": ["backend/app/services/metrics.py"], "verify": "Open /metrics from the server after a few orders: moraa_orders and moraa_provider_calls_total have numbers." },
+        { "title": "The owner gets one WhatsApp message per problem (failure rate, limit nearly used, parked payments, review items, stuck orders)", "status": "done", "files": ["backend/app/services/alert_service.py"], "verify": "Set OPS_ALERT_WHATSAPP_NUMBERS and create a parked test payment: one message arrives within 5 minutes and not another for an hour. Untested against live WhatsApp." },
+        { "title": "Every log line of a request and of the background job it starts carries the same short request id; error reports (optional) carry no personal data", "status": "done", "files": ["backend/app/utils/logger.py", "backend/app/services/error_tracking.py"], "verify": "Send a test photo and search the logs for its request id: tap, charge and delivery lines all share it. Sentry itself was not connected." }
+      ]
+    },
+    {
+      "name": "Database",
+      "tasks": [
+        { "title": "Indexes for the slow lookups (migration 0014) and paging for the analyses list", "status": "done", "files": ["backend/alembic/versions/0014_hot_path_indexes.py"], "verify": "Applied only to test databases. After production is upgraded, /api/analyses answers quickly with 10,000 rows." }
+      ]
+    },
+    {
+      "name": "Logins and administrators",
+      "tasks": [
+        { "title": "Only administrators can use the retry and failure-rate endpoints; a deactivated account stops working at once", "status": "done", "files": ["backend/app/api/dependencies.py", "backend/alembic/versions/0015_auth_hardening.py"], "verify": "Set ADMIN_USERNAMES, call the retry endpoint as an ordinary user: 403." },
+        { "title": "Refresh tokens are single-use, there is a logout, and reuse revokes the account's older tokens", "status": "done", "files": ["backend/app/services/auth_service.py", "backend/app/models/revoked_token.py"], "verify": "Log in, refresh once (works), refresh again 30 seconds later with the old token (refused and all sessions end)." }
+      ]
+    },
+    {
+      "name": "Backup and release",
+      "tasks": [
+        { "title": "A backup script (pg_dump) and a restore drill that proves wallet balances equal their ledgers", "status": "in_progress", "files": ["backend/scripts/db_backup.py", "backend/scripts/db_restore_check.py"], "verify": "Not yet run end to end: this machine has no PostgreSQL client tools. Run both on a machine that has pg_dump and write the date in docs/OPERATIONS_RUNBOOK.md." },
+        { "title": "A release script upgrades the database and refuses to continue unless the result is right", "status": "done", "files": ["backend/scripts/release.py"], "verify": "python scripts/release.py --check-only prints what it would do and changes nothing." },
+        { "title": "Unused and risky settings removed or warned about (for example eager Celery in production)", "status": "done", "files": ["backend/app/config.py"], "verify": "Start with ENVIRONMENT=production and the default payment link: a warning names the setting." }
+      ]
+    }
+  ]
+}

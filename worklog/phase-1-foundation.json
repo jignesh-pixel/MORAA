@@ -1,0 +1,268 @@
+{
+  "project": "MORAA GemVision",
+  "phase": "Phase 1 Foundation",
+  "why": "The backend was built quickly as a prototype and had never been checked on the database it really runs on (PostgreSQL), had no automatic test run, created its database tables in two competing ways, and ran on library versions with known security problems. Money and customer orders depend on all of this. Without a verified foundation, every later fix (wallet ledger, queues, scaling) could break silently. This phase makes the foundation checkable by one command, so a finished phase can be proven and stay locked.",
+  "approach": "Tests now run against a real PostgreSQL as well as SQLite, GitHub runs them on every change, the database layout is built only by Alembic migrations, the web framework and its security-sensitive libraries were upgraded, and a single 'phase gate' command re-checks everything (tests, image-prompt quality, security advisories, load results, a live boot, read-only production check, staging pooler write test) and writes a report.",
+  "decisions": [
+    {
+      "decision": "Run the PostgreSQL tests on a throw-away local server installed through pip (pgserver), one private schema per test.",
+      "why": "SQLite has no row locks, so money races were never truly tested. pgserver needs no Docker or admin rights on Windows and gives each test an isolated schema.",
+      "alternatives": [
+        {
+          "option": "Docker PostgreSQL only",
+          "why_not": "Not available on this machine; would block local verification."
+        },
+        {
+          "option": "Test against the hosted Supabase database",
+          "why_not": "Would risk real customer data; a guard now refuses it."
+        }
+      ],
+      "tasks": "1.1"
+    },
+    {
+      "decision": "The database layout is built only by Alembic migrations; the app refuses to start in production if the database revision is behind or unknown.",
+      "why": "Two ways of creating tables had already caused drift. One owner of the schema removes that class of bug.",
+      "alternatives": [
+        {
+          "option": "Keep create_all on startup",
+          "why_not": "Hides missing migrations and drifts from production."
+        }
+      ],
+      "tasks": "1.2"
+    },
+    {
+      "decision": "Use a constraints file and pinned requirements instead of a pip-compile lock.",
+      "why": "Simpler to review and works with the existing setup; installs are still reproducible.",
+      "alternatives": [
+        {
+          "option": "pip-compile lockfile",
+          "why_not": "Adds a tool and a generated file for no extra safety at this size."
+        }
+      ],
+      "tasks": "1.3"
+    },
+    {
+      "decision": "Upgrade to FastAPI 0.133.1 and Starlette 1.7.0 now, but defer the Pillow 12 upgrade.",
+      "why": "The framework upgrade closes known advisories. Pillow decides image output, so upgrading it needs a before/after image check and the owner's decision.",
+      "alternatives": [
+        {
+          "option": "Upgrade Pillow now",
+          "why_not": "Could silently change generated image quality."
+        }
+      ],
+      "tasks": "1.3, 1.5"
+    },
+    {
+      "decision": "Delete backend/alembic/__init__.py.",
+      "why": "It made Python treat the local folder as the Alembic library, so migrations could not be imported.",
+      "tasks": "1.2"
+    },
+    {
+      "decision": "Lock image quality with a hash snapshot of all 60 prompt variants.",
+      "why": "Prompts decide image quality; any accidental change now fails the gate with no paid calls.",
+      "tasks": "1.5"
+    },
+    {
+      "decision": "Treat the pooler 'backend changes' observation as informational only.",
+      "why": "An idle pooler can legitimately hand one client the same server connection, so the check was too strict to be a real pass/fail.",
+      "tasks": "1.6"
+    },
+    {
+      "decision": "A phase counts as locked only if the gate says LOCKED and GitHub CI is green on the same commit.",
+      "why": "Local checks and Linux checks catch different problems; both are needed.",
+      "tasks": "1.5"
+    },
+    {
+      "decision": "Gate says LOCKED only if every required step ran and passed; skipping one makes it NOT LOCKED.",
+      "why": "A review showed --skip could previously still print LOCKED.",
+      "tasks": "1.7"
+    }
+  ],
+  "errors": [
+    {
+      "error": "ImportError: cannot import name 'command' from 'alembic'",
+      "cause": "An empty backend/alembic/__init__.py shadowed the Alembic library.",
+      "fix": "Deleted the file.",
+      "task": "1.2"
+    },
+    {
+      "error": "CI PostgreSQL step reported green although tests failed",
+      "cause": "Output was piped through tee/grep without pipefail.",
+      "fix": "Run the step with shell: bash and fail on skipped PostgreSQL tests.",
+      "task": "1.4"
+    },
+    {
+      "error": "Test database guard bypassed with ?host= in the URL",
+      "cause": "The guard looked at the host text, not the parsed URL.",
+      "fix": "Parse with make_url, reject host/hostaddr/service/passfile keys, check every comma-separated host; tests added.",
+      "task": "1.1"
+    },
+    {
+      "error": "Database newer than code was treated as 'behind'",
+      "cause": "Only 'not at head' was checked.",
+      "fix": "Added a 'known revision' flag and a clear refusal message.",
+      "task": "1.2"
+    },
+    {
+      "error": "Concurrency tests exhausted the connection pool before the barrier released",
+      "cause": "100 threads each took a connection before waiting.",
+      "fix": "Wait at the barrier first, then take a connection.",
+      "task": "1.1"
+    },
+    {
+      "error": "pip: FastAPI 0.133.1 did not move Starlette",
+      "cause": "Dependency range allowed the old Starlette.",
+      "fix": "Pinned starlette==1.7.0 explicitly.",
+      "task": "1.3"
+    },
+    {
+      "error": "Live probe showed no responses",
+      "cause": "Server output pipe was never read and filled up.",
+      "fix": "Log to a file instead.",
+      "task": "1.5"
+    },
+    {
+      "error": "Pooler check reported FAIL on a healthy staging database",
+      "cause": "My check assumed backends must change between transactions.",
+      "fix": "Made it informational.",
+      "task": "1.6"
+    },
+    {
+      "error": "A commit swept in the owner's pre-staged files",
+      "cause": "Commit without an explicit path list.",
+      "fix": "Soft-reset and recommitted by explicit pathspec; all later commits use pathspecs.",
+      "task": "1.4"
+    },
+    {
+      "error": "PostgreSQL gate step failed twice once, then passed 703 tests on re-run",
+      "cause": "Intermittent under machine load; the failing tests were never captured. A static review found short pool/barrier/lock-wait timeouts and silent thread deaths in the concurrency tests.",
+      "fix": "Pool timeout 15s to 120s, barriers 20-30s to 120s, lock-wait query narrowed, thread errors collected and asserted, schema drop gets a lock timeout. Gate also now fails if a required step is skipped. Two later full PostgreSQL runs and one gate run passed; cannot prove the flake is gone, only that it did not recur.",
+      "task": "1.7"
+    }
+  ],
+  "domains": [
+    {
+      "name": "Test foundation",
+      "goal": "Money paths are tested on the database type used in production.",
+      "tasks": [
+        {
+          "title": "Tests can run on a real PostgreSQL, isolated per test, and refuse to touch the hosted database",
+          "status": "done",
+          "files": [
+            "backend/tests/db_support.py",
+            "backend/tests/test_db_support.py",
+            "backend/tests/test_postgres_semantics.py"
+          ],
+          "verify": "From backend, run: set MORAA_TEST_DB=postgres then python -m pytest -q. Expect all tests to pass with none skipped as PostgreSQL-only."
+        }
+      ]
+    },
+    {
+      "name": "Database schema",
+      "goal": "One owner of the table layout.",
+      "tasks": [
+        {
+          "title": "Tables are created only by migrations, and production refuses to start on a wrong revision",
+          "status": "done",
+          "files": [
+            "backend/app/database.py",
+            "backend/app/main.py",
+            "backend/alembic/env.py",
+            "backend/tests/test_migrations.py"
+          ],
+          "verify": "Run the migration tests; expect all to pass. Starting the app against a database one revision behind in production mode must stop with a clear message."
+        }
+      ]
+    },
+    {
+      "name": "Dependencies and CI",
+      "goal": "Known-vulnerable libraries upgraded; every change is tested automatically.",
+      "tasks": [
+        {
+          "title": "Framework libraries upgraded and pinned",
+          "status": "done",
+          "files": [
+            "backend/requirements.txt",
+            "backend/constraints.txt",
+            "backend/requirements-dev.txt",
+            "backend/pyproject.toml",
+            "backend/pip-audit-ignore.txt"
+          ],
+          "verify": "pip-audit with the ignore list shows no new advisories. Remaining 27 accepted advisories are listed in pip-audit-ignore.txt (mostly Pillow, pending your decision)."
+        },
+        {
+          "title": "GitHub runs lint, SQLite tests, PostgreSQL tests and frontend type-check on every change",
+          "status": "done",
+          "files": [
+            ".github/workflows/ci.yml"
+          ],
+          "verify": "Open the pull request on GitHub: both backend and frontend checks show green."
+        }
+      ]
+    },
+    {
+      "name": "Phase gate (locking)",
+      "goal": "One command proves a phase is intact and records it.",
+      "tasks": [
+        {
+          "title": "Phase gate command, prompt-quality snapshot, load verdict lock, live probes and tests of the gate itself",
+          "status": "done",
+          "files": [
+            "backend/scripts/phase_gate.py",
+            "backend/scripts/prompt_snapshot.py",
+            "backend/scripts/live_probe.py",
+            "backend/scripts/boot_probe.py",
+            "backend/tests/test_phase_gate.py",
+            "backend/tests/test_prompt_snapshot.py",
+            "backend/tests/snapshots/prompt_hashes.json",
+            "backend/tests/load_scenarios/expected_verdicts.json"
+          ],
+          "verify": "Run: python scripts/phase_gate.py --phase \"Phase 1\". The report in docs/phase-gates must say LOCKED; a deliberately broken step must say NOT LOCKED (covered by test_phase_gate.py)."
+        }
+      ]
+    },
+    {
+      "name": "Real-environment checks",
+      "goal": "Behaviour confirmed on the real database and pooler, safely.",
+      "tasks": [
+        {
+          "title": "Read-only startup check against the production database passes without any write",
+          "status": "done",
+          "files": [
+            "backend/scripts/supabase_readonly_check.py"
+          ],
+          "verify": "Run the script; expect all checks OK and no secret printed."
+        },
+        {
+          "title": "Staging pooler write test: 100 simultaneous debits, 20 simultaneous refunds, migrations, all pass",
+          "status": "done",
+          "files": [
+            "backend/scripts/pooler_write_check.py"
+          ],
+          "verify": "With STAGING_DATABASE_URL set in your shell, run the script; expect 'ALL POOLER CHECKS PASSED'. Rotate the staging password first because it was pasted in chat."
+        }
+      ]
+    },
+    {
+      "name": "Lock verification",
+      "goal": "Phase 1 is proven stable, not just passing once.",
+      "tasks": [
+        {
+          "title": "Full phase gate reports LOCKED (one clean run; intermittent PostgreSQL failure hardened, not reproduced)",
+          "status": "done",
+          "files": [
+            "docs/phase-gates/phase-1-2026-10-02.md",
+            "backend/tests/test_postgres_semantics.py",
+            "backend/tests/test_refund_once.py",
+            "backend/tests/db_support.py"
+          ],
+          "verify": "Run python scripts/phase_gate.py --phase \"Phase 1\" --live-readonly from backend. Expect 'GATE: LOCKED'. Run it a few times; any NOT LOCKED report now names the failing tests."
+        },
+        {
+          "title": "GitHub CI confirmed green on the same commit as the final gate report, then tag phase-1-verified",
+          "status": "todo"
+        }
+      ]
+    }
+  ]
+}
