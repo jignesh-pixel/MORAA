@@ -10,6 +10,7 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -23,7 +24,9 @@ from app.services.meta_whatsapp_service import (
     send_document_to_whatsapp,
     send_whatsapp_text,
 )
+from app.models.whatsapp_payment_order import WhatsAppPaymentOrder
 from app.models.wallet_transaction import KIND_CREDIT_PAYMENT, KIND_DEBIT_DISPUTE, KIND_DEBIT_REFUND
+from app.services.pending_payment_service import mark_pending_credited, record_pending_payment
 from app.services.wallet_service import (
     CLAWBACK_OUTCOME_DUPLICATE,
     CLAWBACK_OUTCOME_NO_PAYMENT,
@@ -34,7 +37,7 @@ from app.services.wallet_service import (
     record_ledger,
 )
 from app.utils.logger import logger, mask_phone
-from app.utils.phone import normalize_phone
+from app.utils.phone import is_plausible_phone, normalize_phone
 router = APIRouter(prefix="/api/payments", tags=["Payments"])
 
 SIGNATURE_HEADER = "X-Razorpay-Signature"
@@ -52,6 +55,10 @@ MAX_CREDIT_ATTEMPTS = 8
 AUDIT_RESOURCE_TYPE = "razorpay_payment"
 # A payment, refund or dispute that needs a person's attention (wrong currency, unknown payment, dispute opened).
 AUDIT_ACTION_PAYMENT_REVIEW = "razorpay_payment_review"
+
+# WhatsApp Pay order states in which the WhatsApp Pay path credits (its sweep re-checks "sent" and "pending"
+# orders) or already credited the money. "created" / "dispatch_failed" orders are never swept, so they are not here.
+WHATSAPP_PAY_ACTIVE_STATES = frozenset({"sent", "pending", "captured"})
 
 # A refund that finished, or a dispute that was lost, takes the money back out of the wallet.
 MONEY_BACK_EVENTS = ("refund.processed", "payment.dispute.lost")
@@ -336,6 +343,31 @@ def _handle_money_back_event(db: Session, payload: Dict[str, Any], event: str) -
     return {"status": "clawed_back" if not result["shortfall"] else "clawed_back_partial"}
 
 
+def _whatsapp_pay_will_credit() -> bool:
+    """True while the WhatsApp Pay path (and its reconcile sweep) is on, so it can credit its own payments."""
+    return bool(settings.WHATSAPP_PAY_ENABLED) and int(settings.WHATSAPP_PAY_RECONCILE_INTERVAL_SECONDS or 0) > 0
+
+
+def _whatsapp_pay_order_state(db: Session, payment_id: str, payload: Dict[str, Any]) -> Optional[str]:
+    """Status of the WhatsApp Pay order this Razorpay payment belongs to (None = not a WhatsApp Pay payment).
+
+    Matched exactly, by the Razorpay payment id or order id recorded on the order. Never raises.
+    """
+    try:
+        order_id = _as_id(_nested_get(payload, "payload", "payment", "entity", "order_id"))
+        match = WhatsAppPaymentOrder.pg_payment_id == payment_id
+        if order_id:
+            match = or_(match, WhatsAppPaymentOrder.pg_order_id == order_id)
+        row = db.query(WhatsAppPaymentOrder.status, WhatsAppPaymentOrder.credited).filter(match).first()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"WhatsApp Pay order lookup failed for payment {payment_id}: {e}")
+        return None
+    if row is None:
+        return None
+    return "captured" if row[1] else (row[0] or "created")
+
+
 def _resolve_customer(db: Session, sender_id: str) -> Optional[Customer]:
     if not sender_id:
         return None
@@ -558,12 +590,37 @@ async def razorpay_webhook(
         )
         _record_payment_review(db, payment_reference, "currency_not_inr", {"currency": currency, "event": event})
         return {"status": "unsupported_currency"}
-    if not sender_id:
+    wa_pay_state = _whatsapp_pay_order_state(db, payment_reference, payload)
+    if wa_pay_state is not None and (wa_pay_state == "captured" or _whatsapp_pay_will_credit()):
+        # This payment belongs to a WhatsApp Pay order: that path credits the amount that was ORDERED,
+        # once Meta confirms it (its sweep re-checks "sent"/"pending" orders). Crediting it here too would use
+        # a different amount for the same money. When that path is off, or the order is in a state it will
+        # not credit, this path credits (or parks) the payment itself, so the payer is never left unpaid.
+        if wa_pay_state in WHATSAPP_PAY_ACTIVE_STATES:
+            logger.info(f"Payment {payment_reference} belongs to a WhatsApp Pay order; left to that path.")
+            return {"status": "whatsapp_pay_order"}
+        if _already_processed(db, payment_reference):
+            return {"status": "already_processed"}
+        logger.error(
+            f"ALERT Razorpay payment {payment_reference} belongs to a WhatsApp Pay order in state '{wa_pay_state}' "
+            "that will not be credited; parked for manual review."
+        )
+        record_pending_payment(
+            db, payment_id=payment_reference, amount_rupees=amount_paid, currency=currency, event=event,
+            payer_hint=sender_id, reason="whatsapp_pay_not_credited",
+        )
+        return {"status": "whatsapp_pay_order_review"}
+    if not sender_id or not is_plausible_phone(sender_id):
         # Razorpay sends several events per payment; another event that did
         # carry the phone may already have credited it.
         if _already_processed(db, payment_reference):
             return {"status": "already_processed"}
+        # No phone, or only a Razorpay id like "cust_...": never credit a wallet nobody can use.
         _record_unmatched_payment(db, payment_reference, amount_paid, event)
+        record_pending_payment(
+            db, payment_id=payment_reference, amount_rupees=amount_paid, currency=currency, event=event,
+            payer_hint=sender_id, reason="missing_phone" if not sender_id else "not_a_phone_number",
+        )
         return {"status": "missing_phone"}
 
     if _already_processed(db, payment_reference):
@@ -615,6 +672,7 @@ async def razorpay_webhook(
                 customer_name = customer.full_name
         # Close any earlier "not credited" alerts for this payment in the same
         # transaction, so nobody credits it a second time by hand.
+        mark_pending_credited(db, payment_reference, clean_sender)
         db.query(AuditLog).filter(
             AuditLog.action.in_((AUDIT_ACTION_PAYMENT_UNMATCHED, AUDIT_ACTION_PAYMENT_CREDIT_FAILED)),
             AuditLog.resource_id == payment_reference,

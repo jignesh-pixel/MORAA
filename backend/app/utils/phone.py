@@ -32,6 +32,14 @@ def normalize_phone(raw: object) -> str:
     return digits
 
 
+def is_plausible_phone(raw: object) -> bool:
+    """True when the value looks like a real phone number (8 to 15 digits, no letters), per E.164."""
+    text = str(raw or "").strip()
+    if not text or re.search(r"[A-Za-z]", text):
+        return False
+    return 8 <= len(normalize_phone(text)) <= 15
+
+
 def same_phone(a: object, b: object) -> bool:
     """True when two values are the same number after normalisation."""
     na, nb = normalize_phone(a), normalize_phone(b)
