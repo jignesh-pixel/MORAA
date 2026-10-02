@@ -96,7 +96,7 @@ async def generate_prompts(
             )
 
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail="Analysis exists but did not complete successfully. Please re-run analysis.",
         )
 
@@ -136,7 +136,7 @@ async def generate_prompts(
             f"image={request.image_id} analysis={analysis.id}"
         )
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail=result.get("error", "Prompt generation failed"),
         )
 
