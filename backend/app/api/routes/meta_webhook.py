@@ -28,6 +28,7 @@ import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.responses import PlainTextResponse
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -587,6 +588,10 @@ CAPACITY_MESSAGE = (
     "We can't generate new images right now, so nothing was charged. "
     "Your photo is saved, so you can tap your choice again once generation is available 🙏"
 )
+INFLIGHT_MESSAGE = (
+    "You already have {n} orders being prepared, so nothing was charged. "
+    "Please wait for one to arrive, then tap your choice on this photo again 🙏"
+)
 UNREADABLE_IMAGE_MESSAGE = (
     "Sorry, we couldn't read this photo. Please send a clear JPG, PNG or WebP photo of the earring."
 )
@@ -808,6 +813,30 @@ async def _handle_product_choice(
             )
             db.commit()
             await send_whatsapp_text(sender, CAPACITY_MESSAGE, reply_to_message_id=quote_id)
+            return None
+
+    # At most N paid orders per customer in progress at once (Q-6), decided BEFORE any money moves. Team (ADMIN)
+    # orders are exempt.
+    cap = int(getattr(settings, "MAX_INFLIGHT_ORDERS_PER_CUSTOMER", 0) or 0)
+    if cap > 0 and not (customer is not None and ent.is_admin(customer)):
+        from app.services.meta_whatsapp_service import STUCK_PAID_STATUSES
+
+        in_flight = db.query(func.count(WhatsAppIngestion.id)).filter(
+            WhatsAppIngestion.external_user_id == ingestion.external_user_id,
+            WhatsAppIngestion.status.in_(STUCK_PAID_STATUSES),
+            WhatsAppIngestion.id != ingestion_id,
+        ).scalar() or 0
+        if in_flight >= cap:
+            logger.info(f"Order {ingestion_id} declined before charging: {in_flight} orders already in progress")
+            db.query(WhatsAppIngestion).filter(
+                WhatsAppIngestion.id == ingestion_id,
+                WhatsAppIngestion.status == "choice_claimed",
+            ).update(
+                {WhatsAppIngestion.status: "awaiting_choice", WhatsAppIngestion.product_code: None},
+                synchronize_session=False,
+            )
+            db.commit()
+            await send_whatsapp_text(sender, INFLIGHT_MESSAGE.format(n=in_flight), reply_to_message_id=quote_id)
             return None
 
     # Tiered access (entitlement_service): ADMIN is free; a TRIAL customer

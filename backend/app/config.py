@@ -437,6 +437,10 @@ class Settings(BaseSettings):
     # minute, 0 = off) and a call that would wait longer than IMAGE_RATE_WAIT_MAX_SECONDS fails fast instead.
     # Durable background jobs (ops forwards, invoice sends) are recorded in the database and retried (Q-5).
     OUTBOX_ENABLED: bool = True
+    # How many paid provider calls may run at once in this process (0 = no limit) and how many paid orders one
+    # customer may have in progress (0 = no limit). Size the first to the provider quota (Q-6).
+    MAX_CONCURRENT_PROVIDER_CALLS: int = 0
+    MAX_INFLIGHT_ORDERS_PER_CUSTOMER: int = 3
     CIRCUIT_BREAKER_FAILURES: int = 5
     CIRCUIT_BREAKER_COOLDOWN_SECONDS: float = 60.0
     IMAGE_PROVIDER_RPM: int = 0

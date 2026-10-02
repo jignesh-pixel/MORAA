@@ -1900,6 +1900,9 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
     from app.models.whatsapp_ingestion import PRODUCT_WHITE_BG, WhatsAppIngestion
     from app.services.ecommerce_shot_prompt import build_ecommerce_shot_prompt
 
+    from app.ai.concurrency_gate import PRIORITY_SINGLE, generation_priority
+
+    generation_priority.set(PRIORITY_SINGLE)       # a single shot is served ahead of Pack calls when providers are busy
     db = SessionLocal()
     ingestion = None
 

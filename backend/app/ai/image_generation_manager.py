@@ -23,6 +23,7 @@ from app.ai.providers.image_base import (
     BaseImageGenerationProvider,
     ImageGenerationResult,
 )
+from app.ai.concurrency_gate import gate_for_current_loop, generation_priority
 from app.ai.provider_protection import breaker, bucket
 from app.ai.providers.gemini_image_provider import GeminiImageProvider
 from app.ai.providers.openai_image_provider import OpenAIImageProvider
@@ -491,9 +492,10 @@ class ImageGenerationManager:
                 provider_name=provider_name,
                 processing_time=0.0,
             )
-        result = await self._call_provider_once(
-            provider, prompt, context, reference_image, reference_mime_type, request_id
-        )
+        async with gate_for_current_loop().slot(generation_priority.get()):
+            result = await self._call_provider_once(
+                provider, prompt, context, reference_image, reference_mime_type, request_id
+            )
         if result.success:
             breaker.record_success(provider_name)
         elif _is_provider_outage(result.error or ""):
