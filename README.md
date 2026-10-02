@@ -12,8 +12,6 @@ MORAA GemVision is a full-stack application that uses AI to analyze jewellery im
 moraa-gemvision/
 ├── frontend/          # Next.js 16 + React 19 web application
 ├── backend/           # FastAPI REST API with Celery task queue
-├── ai-engine/         # AI analysis engine (coming soon)
-├── shared/            # Shared type definitions (coming soon)
 ├── docs/              # Project documentation (coming soon)
 └── docker/            # Docker / Compose configuration (coming soon)
 ```

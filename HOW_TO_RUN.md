@@ -61,8 +61,6 @@ This gives you the following top-level structure:
 moraa-gemvision/
 ├── frontend/          # Next.js 16 web application
 ├── backend/           # FastAPI REST API
-├── ai-engine/         # (coming soon)
-├── shared/            # (coming soon)
 ├── docs/              # (coming soon)
 ├── docker/            # (coming soon)
 ├── package.json       # Root package (minimal)
@@ -779,8 +777,6 @@ moraa-gemvision/
 │   ├── requirements.txt
 │   └── README.md
 │
-├── ai-engine/                     # Standalone AI engine (coming soon)
-├── shared/                        # Shared types (coming soon)
 ├── docs/                          # Documentation (coming soon)
 ├── docker/                        # Docker config (coming soon)
 ├── HOW_TO_RUN.md                  # ← You are here
