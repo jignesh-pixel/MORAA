@@ -113,7 +113,22 @@ def trial_credits_available(db, customer: Any, product_code: str, exclude_ingest
     (so two quick taps cannot spend the same last credit)."""
     if not trial_can_use(customer, product_code):
         return False
+    from app.models.customer import Customer
     from app.models.whatsapp_ingestion import WhatsAppIngestion
+
+    # Lock this customer's row until the caller commits the order status. Two taps for the same
+    # customer now run one after the other: the second waits here, then counts the first order as
+    # pending, so the last credit can be given to only one of them (PostgreSQL; SQLite has one writer).
+    # The remaining credits are re-read AFTER the lock, so a concurrent delivery is also counted.
+    row = (
+        db.query(Customer.trial_credits_total, Customer.trial_credits_used)
+        .filter(Customer.id == customer.id)
+        .with_for_update()
+        .first()
+    )
+    remaining = trial_remaining(customer)
+    if row is not None:
+        remaining = max(int(row[0] or 0) - int(row[1] or 0), 0)
 
     query = db.query(WhatsAppIngestion.product_code).filter(
         WhatsAppIngestion.external_user_id == customer.whatsapp_id,
@@ -123,7 +138,7 @@ def trial_credits_available(db, customer: Any, product_code: str, exclude_ingest
     if exclude_ingestion_id:
         query = query.filter(WhatsAppIngestion.id != exclude_ingestion_id)
     pending = sum(credit_cost(code or "") for (code,) in query.all())
-    return trial_remaining(customer) - pending >= credit_cost(product_code)
+    return remaining - pending >= credit_cost(product_code)
 
 
 async def record_trial_success(db, ingestion: Any) -> None:
