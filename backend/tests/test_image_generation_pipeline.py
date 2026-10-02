@@ -418,7 +418,9 @@ class TestFallbackBehaviour(unittest.TestCase):
             primary_calls.append(True)
             return ImageGenerationResult(
                 success=False,
-                error="429 Resource exhausted: quota exceeded for this project",
+                # Real exhaustion (credit / billing gone). A plain 429 or a per-minute limit is NOT this any
+                # more: it is retried and then falls back (EXT-2, see tests/test_provider_hardening.py).
+                error="429 insufficient_quota: You exceeded your current quota, please check your plan and billing details",
                 provider_name="openai",
                 processing_time=0.2,
             )

@@ -12,10 +12,11 @@ Requires ``GEMINI_API_KEY`` environment variable in the backend .env.
 import asyncio
 import base64
 import time
-from typing import Any, Dict, Optional
+import weakref
+from typing import Any, Dict, Optional, Tuple
 
 from app.ai.providers.image_base import BaseImageGenerationProvider, ImageGenerationResult
-from app.ai.product_fidelity import REFERENCE_IMAGE_ANCHOR
+from app.ai.product_fidelity import REFERENCE_IMAGE_ANCHOR
 from app.config import settings
 from app.utils.logger import logger
 
@@ -28,7 +29,42 @@ from app.utils.logger import logger
 # image as the exact product to photograph instead of re-drawing the piece
 # from the text description. The image part follows the anchor immediately,
 # and the scene prompt trails after it as "what to change" context.
-# REFERENCE_IMAGE_ANCHOR imported from app.ai.product_fidelity
+# REFERENCE_IMAGE_ANCHOR imported from app.ai.product_fidelity
+
+
+# One SDK client per event loop, reused for every call (PERF-4): a new client per call meant a new TLS
+# handshake each time. The async client belongs to the loop it was created on, hence the per-loop cache
+# (the application has one loop per process; tests and tools may create several).
+_CLIENTS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Tuple[str, Any]]" = weakref.WeakKeyDictionary()
+
+
+def _get_client(genai: Any, types: Any) -> Any:
+    """The shared Gemini client for the running loop, created on first use with the request timeout."""
+    loop = asyncio.get_running_loop()
+    key = settings.GEMINI_API_KEY
+    cached = _CLIENTS.get(loop)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    timeout_ms = int(float(settings.GEMINI_IMAGE_TIMEOUT_SECONDS or 0) * 1000)
+    client = genai.Client(
+        api_key=key,
+        http_options=types.HttpOptions(timeout=timeout_ms) if timeout_ms > 0 else None,
+    )
+    _CLIENTS[loop] = (key, client)
+    return client
+
+
+async def close_gemini_client() -> None:
+    """Close the running loop's shared client (called at application shutdown)."""
+    try:
+        cached = _CLIENTS.pop(asyncio.get_running_loop(), None)
+    except RuntimeError:
+        return
+    if cached is not None:
+        try:
+            await cached[1].aio.aclose()
+        except Exception as e:  # noqa: BLE001 -- shutdown must never fail on this
+            logger.warning(f"Gemini client close failed: {e}")
 
 
 class GeminiImageProvider(BaseImageGenerationProvider):
@@ -98,7 +134,7 @@ class GeminiImageProvider(BaseImageGenerationProvider):
             )
 
         try:
-            client = genai.Client(api_key=settings.GEMINI_API_KEY)
+            client = _get_client(genai, types)
 
             model_name = settings.GEMINI_IMAGE_MODEL or "gemini-3.1-flash-image"
 
@@ -136,13 +172,15 @@ class GeminiImageProvider(BaseImageGenerationProvider):
             else:
                 contents = prompt
 
-            # Run synchronous generate_content in a thread to avoid blocking
-            response = await asyncio.to_thread(
-                client.models.generate_content,
+            # Native async call (no worker thread, so the shared 6-thread pool can never be filled up by a
+            # Pack), under the client timeout set in _get_client plus a hard deadline as a backstop.
+            timeout = float(settings.GEMINI_IMAGE_TIMEOUT_SECONDS or 0)
+            call = client.aio.models.generate_content(
                 model=model_name,
                 contents=contents,
                 config=config,
             )
+            response = await (asyncio.wait_for(call, timeout=timeout + 10) if timeout > 0 else call)
 
             # ── Process the response ────────────────────────────────────
             if response.candidates:
@@ -189,6 +227,11 @@ class GeminiImageProvider(BaseImageGenerationProvider):
 
         except Exception as e:
             error_msg = str(e)
+            if isinstance(e, asyncio.TimeoutError) and not error_msg:
+                error_msg = (
+                    f"Gemini image request timeout: deadline exceeded after "
+                    f"{float(settings.GEMINI_IMAGE_TIMEOUT_SECONDS or 0) + 10:.0f}s"
+                )
             processing_time = time.time() - start_time
 
             # Classify the error for fallback decision

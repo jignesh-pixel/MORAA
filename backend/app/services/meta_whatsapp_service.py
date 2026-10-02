@@ -1325,6 +1325,44 @@ async def _generate_single_pack_style(
         return None
 
 
+async def _gather_styles_with_deadline(
+    coros: List[Any], deadline_seconds: float, ingestion_id: str
+) -> List[Optional[str]]:
+    """Run every style at once and wait at most ``deadline_seconds`` for the whole pack (EXT-1).
+
+    Like ``asyncio.gather`` (same order, a failed style is ``None``), but a style still running at the
+    deadline is cancelled and counted as failed, so one stuck style can no longer hold the whole paid pack:
+    the styles that finished are delivered. A deadline of 0 or less means no deadline.
+    """
+    tasks = [asyncio.ensure_future(c) for c in coros]
+    if not tasks:
+        return []
+    try:
+        _, pending = await asyncio.wait(tasks, timeout=deadline_seconds if deadline_seconds > 0 else None)
+    except BaseException:
+        # The worker itself was cancelled (e.g. shutdown): like asyncio.gather, take the styles down with it
+        # instead of leaving paid provider calls running with nobody to collect them.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    if pending:
+        logger.error(
+            f"Catalog pack deadline of {deadline_seconds:.0f}s reached: {len(pending)} of {len(tasks)} "
+            f"style(s) dropped ingestion_id={ingestion_id}"
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+    results: List[Optional[str]] = []
+    for task in tasks:
+        if task.cancelled() or task.exception() is not None:
+            results.append(None)
+        else:
+            results.append(task.result())
+    return results
+
+
 # Statuses from which the Pack worker may start: queued by the product tap, or
 # reset to "stored" by the retry endpoint. Same shape as WHITE_BG_RUNNABLE_STATUSES.
 PACK_RUNNABLE_STATUSES = ("pack_queued", "stored")
@@ -1457,8 +1495,8 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
             f"dry_run={DRY_RUN_IMAGE_MODE}"
         )
 
-        gather_results = await asyncio.gather(
-            *[
+        gather_results = await _gather_styles_with_deadline(
+            [
                 _generate_single_pack_style(
                     ingestion_id=ingestion_id,
                     style_title=style_title,
@@ -1469,7 +1507,9 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
                     spend_reserved=spend_reserved,
                 )
                 for style_title, prompt in style_jobs
-            ]
+            ],
+            float(settings.PACK_GENERATION_DEADLINE_SECONDS or 0),
+            ingestion_id,
         )
 
         generated_data_urls: List[str] = [

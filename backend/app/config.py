@@ -396,6 +396,24 @@ class Settings(BaseSettings):
     # Daily ceiling on ImageGenerationManager.generate_image() calls.
     MAX_GENERATIONS_PER_DAY: int = 100000
 
+    # --- Image provider timeouts and retries (app/ai/*) ---
+    # Client-side limits, so a slow or hung provider can never hold a paid order forever.
+    GEMINI_IMAGE_TIMEOUT_SECONDS: float = 90.0
+    OPENAI_IMAGE_TIMEOUT_SECONDS: float = 120.0       # the OpenAI default is 600 s, longer than the stuck-order limit
+    OPENAI_IMAGE_CONNECT_TIMEOUT_SECONDS: float = 10.0
+    # Hard deadline the manager puts on ONE provider attempt (a backstop above the client timeouts).
+    IMAGE_PROVIDER_TIMEOUT_SECONDS: float = 130.0
+    # A rate limit (429) or temporary overload (503) is retried this many times, with jittered waits, on
+    # the same provider before the next provider is tried. Billing / daily-quota exhaustion is never retried.
+    IMAGE_RATE_LIMIT_RETRIES: int = 2
+    IMAGE_RETRY_BACKOFF_BASE_SECONDS: float = 2.0
+    IMAGE_RETRY_BACKOFF_CAP_SECONDS: float = 15.0
+    # Whole Catalog Pack: styles still running after this long are dropped and the pack ships with the
+    # styles that finished (a pack whose styles all fail is failed and refunded as before).
+    # Sized for the worst case of one style (a rate-limited primary with retries, then a slow fallback, about
+    # 350 s) and kept under the 10-minute stuck-order limit.
+    PACK_GENERATION_DEADLINE_SECONDS: float = 420.0
+
     # Styles generated per WhatsApp Earring Catalog Pack (6 styles exist).
     # None = all styles (production: the full 6-shot E-Com Pack 1).
     # Set a number (e.g. 1) only as a temporary testing throttle.

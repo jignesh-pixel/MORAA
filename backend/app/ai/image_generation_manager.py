@@ -13,6 +13,8 @@ The manager provides a single ``generate_image()`` entry point that:
 """
 
 import asyncio
+import random
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -89,13 +91,91 @@ _QUOTA_EXHAUSTION_PATTERNS = [
     "billing",
 ]
 
+# Markers that the money or the DAY's quota is gone: nothing a retry or the other provider could fix.
+_HARD_EXHAUSTION_MARKERS = (
+    "credit_balance_exhausted",
+    "insufficient_quota",
+    "billing_not_active",
+    "billing hard limit",
+    "billing_hard_limit",
+    "prepayment",
+    "per day",
+    "perday",
+    "requests per day",
+    "daily",
+    "limit: 0",
+)
+# Markers that the limit is per minute / per second: it clears within seconds, so a retry is right.
+_RATE_LIMIT_MARKERS = (
+    "per minute",
+    "perminute",
+    "per second",
+    "persecond",
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "retry in",
+    "retrydelay",
+    "retry_delay",
+    "retry-after",
+    "overloaded",
+    "service unavailable",
+    "unavailable",
+    "503",
+    "429",
+)
+
 
 def _is_quota_exhaustion(error_message: str) -> bool:
-    """Check if an error is quota/billing exhaustion (halt, no fallback)."""
+    """Check if an error is billing / daily-quota exhaustion (halt, no retry, no fallback).
+
+    A Gemini 429 ``RESOURCE_EXHAUSTED`` is NOT automatically this: the same wording ("check your plan and
+    billing details") is used for a per-minute limit that clears in seconds. Only hard markers (credit gone,
+    billing inactive, per-day quota, ``limit: 0``) halt; a message that names a per-minute / rate limit does
+    not, and is retried and then falls back instead (EXT-2).
+    """
     if not error_message:
         return False
     error_lower = error_message.lower()
+    if any(marker in error_lower for marker in _HARD_EXHAUSTION_MARKERS):
+        return True
+    if any(marker in error_lower for marker in _RATE_LIMIT_MARKERS):
+        return False
     return any(pattern in error_lower for pattern in _QUOTA_EXHAUSTION_PATTERNS)
+
+
+def _is_retryable_rate_limit(error_message: str) -> bool:
+    """A rate limit (429) or temporary overload (503) worth retrying on the same provider after a short wait."""
+    if not error_message or _is_quota_exhaustion(error_message):
+        return False
+    error_lower = error_message.lower()
+    return any(marker in error_lower for marker in _RATE_LIMIT_MARKERS) or any(
+        pattern in error_lower for pattern in ("resource exhausted", "resource_exhausted")
+    )
+
+
+_RETRY_HINT_RE = re.compile(r"(?:retry in|retrydelay['\": ]+|retry-after['\": ]+)\s*([0-9]+(?:\.[0-9]+)?)\s*s?", re.I)
+
+
+def _retry_delay_seconds(error_message: str, attempt: int) -> Optional[float]:
+    """Seconds to wait before retry number ``attempt`` (0-based), or None when waiting is not worth it.
+
+    Exponential backoff with +-50% jitter (so a burst of failed calls does not retry in lockstep). If the
+    provider says how long to wait and that is longer than the cap, retrying here would stall the order, so
+    None is returned and the caller moves on to the next provider.
+    """
+    base = max(float(settings.IMAGE_RETRY_BACKOFF_BASE_SECONDS), 0.0)
+    cap = max(float(settings.IMAGE_RETRY_BACKOFF_CAP_SECONDS), 0.0)
+    backoff = min(base * (2 ** attempt), cap)
+    delay = backoff * random.uniform(0.5, 1.5) if backoff else 0.0
+    hint = _RETRY_HINT_RE.search(error_message or "")
+    if hint:
+        asked = float(hint.group(1))
+        if asked > cap:
+            return None
+        # Jitter only our own backoff: never retry earlier than the provider said it would allow.
+        delay = max(delay, asked)
+    return delay
 
 
 # ─── Non-recoverable patterns (never fallback) ─────────────────────────
@@ -232,6 +312,76 @@ class ImageGenerationManager:
 
         return chain or ["openai", "gemini"]
 
+    async def _call_provider_once(
+        self,
+        provider: BaseImageGenerationProvider,
+        prompt: str,
+        context: Dict[str, Any],
+        reference_image: Optional[bytes],
+        reference_mime_type: str,
+        request_id: str,
+    ) -> ImageGenerationResult:
+        """One provider call under a hard deadline: a hung call becomes an honest, recoverable failure."""
+        timeout = float(settings.IMAGE_PROVIDER_TIMEOUT_SECONDS or 0)
+        if reference_image is not None:
+            call = provider.generate_image(
+                prompt, context, reference_image=reference_image, reference_mime_type=reference_mime_type
+            )
+        else:
+            call = provider.generate_image(prompt, context)
+        if timeout <= 0:
+            return await call
+        started = time.time()
+        try:
+            return await asyncio.wait_for(call, timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.error(f"ImageGenerationManager: provider call timed out after {timeout:.0f}s request_id={request_id}")
+            return ImageGenerationResult(
+                success=False,
+                error=f"Image provider timeout: deadline exceeded after {timeout:.0f}s",
+                provider_name=getattr(provider, "provider_name", "unknown"),
+                processing_time=time.time() - started,
+            )
+
+    async def _attempt_with_retries(
+        self,
+        provider: BaseImageGenerationProvider,
+        provider_name: str,
+        prompt: str,
+        context: Dict[str, Any],
+        reference_image: Optional[bytes],
+        reference_mime_type: str,
+        request_id: str,
+    ) -> ImageGenerationResult:
+        """Call one provider; retry a rate limit (429) / overload (503) with jittered waits (EXT-2).
+
+        Billing or daily-quota exhaustion, bad requests and timeouts are returned at once: waiting cannot fix
+        them. The retries are on the SAME slot of the daily spend counter (one order = one slot), and the
+        prompt and request sent are identical on every attempt.
+        """
+        retries = max(int(settings.IMAGE_RATE_LIMIT_RETRIES or 0), 0)
+        result = await self._call_provider_once(
+            provider, prompt, context, reference_image, reference_mime_type, request_id
+        )
+        for attempt in range(retries):
+            if result.success or not _is_retryable_rate_limit(result.error or ""):
+                break
+            delay = _retry_delay_seconds(result.error or "", attempt)
+            if delay is None:
+                logger.warning(
+                    f"Image provider '{provider_name}' asked for a long wait; moving on request_id={request_id}"
+                )
+                break
+            logger.warning(
+                f"Image provider '{provider_name}' rate limited; retry {attempt + 1}/{retries} "
+                f"in {delay:.1f}s request_id={request_id}"
+            )
+            await asyncio.sleep(delay)
+            result = await self._call_provider_once(
+                provider, prompt, context, reference_image, reference_mime_type, request_id
+            )
+        return result
+
     async def generate_image(
         self,
         prompt: str,
@@ -299,15 +449,15 @@ class ImageGenerationManager:
             provider_has_ref = has_reference and provider.supports_reference_image()
 
             try:
-                if provider_has_ref:
-                    result = await provider.generate_image(
-                        effective_prompt,
-                        context,
-                        reference_image=reference_image,
-                        reference_mime_type=reference_mime_type,
-                    )
-                else:
-                    result = await provider.generate_image(effective_prompt, context)
+                result = await self._attempt_with_retries(
+                    provider,
+                    provider_name,
+                    effective_prompt,
+                    context,
+                    reference_image if provider_has_ref else None,
+                    reference_mime_type,
+                    request_id,
+                )
 
                 if result.success:
                     result.provider_name = provider_name

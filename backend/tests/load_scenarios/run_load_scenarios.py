@@ -306,8 +306,11 @@ async def scenario_c() -> Dict[str, Any]:
         }
 
     res["c1_async_provider_100x8"] = await manager_fanout(100, 8, thread_mode=False)
-    res["c2_thread_provider_100x8_like_GeminiImageProvider"] = await manager_fanout(100, 8, thread_mode=True)
-    t = res["c2_thread_provider_100x8_like_GeminiImageProvider"]
+    # The real GeminiImageProvider is native async now (no asyncio.to_thread, PERF-3), proved by
+    # tests/test_provider_hardening.py::GeminiNativeAsyncTests, so it behaves like the async provider. c2 still
+    # runs the OLD thread-backed model, kept only as a reference for what the default executor would cost.
+    res["c2_thread_provider_100x8_legacy_model_for_reference"] = await manager_fanout(100, 8, thread_mode=True)
+    t = res["c2_thread_provider_100x8_legacy_model_for_reference"]
     t["default_executor_max_workers"] = min(32, (t["cpu_count"] or 1) + 4)
     t["slowdown_vs_unbounded"] = round(t["wall_s"] / max(res["c1_async_provider_100x8"]["wall_s"], 1e-6), 1)
 
@@ -337,18 +340,20 @@ async def scenario_c() -> Dict[str, Any]:
         settings.MAX_GENERATIONS_PER_DAY = old_cap
         igm._spend_day, igm._spend_count = None, 0
 
-    c1, c2, c3 = res["c1_async_provider_100x8"], res["c2_thread_provider_100x8_like_GeminiImageProvider"], res["c3_real_pack_path_100_orders"]
+    c1, c2, c3 = res["c1_async_provider_100x8"], res["c2_thread_provider_100x8_legacy_model_for_reference"], res["c3_real_pack_path_100_orders"]
     c4 = res["c4_spend_cap_100_calls_30_packs"]
     functional = (
         c1["success"] == 800 and c2["success"] == 800 and rec["all_reconciled"]
         and rec["statuses"].get("delivered") == 100 and c4["reconcile"]["all_reconciled"]
     )
-    throughput_ok = c2["slowdown_vs_unbounded"] < 3
+    # The real providers are native async (no worker threads), so the async model (c1) is the one that must
+    # stay close to the unbounded ideal: 800 calls all overlapping.
+    throughput_ok = c1["wall_s"] < 3 * c1["ideal_unbounded_wall_s"]
     res["verdict"] = "FAIL" if not functional else ("WARN" if not throughput_ok else "PASS")
     res["verdict_reason"] = (
-        f"functional={'ok' if functional else 'broken'}; thread-backed provider (Gemini path) needed "
-        f"{c2['wall_s']}s vs {c1['wall_s']}s unbounded ({c2['slowdown_vs_unbounded']}x) because asyncio.to_thread "
-        f"uses the default executor ({c2['default_executor_max_workers']} threads)"
+        f"functional={'ok' if functional else 'broken'}; 800 async provider calls took {c1['wall_s']}s "
+        f"(unbounded ideal {c1['ideal_unbounded_wall_s']}s); the OLD thread-backed model, kept for reference, "
+        f"took {c2['wall_s']}s ({c2['slowdown_vs_unbounded']}x) on the default executor ({c2['default_executor_max_workers']} threads)"
     )
     return res
 
@@ -423,6 +428,21 @@ async def rate_limit_probe() -> Dict[str, Any]:
 
 
 async def scenario_e() -> Dict[str, Any]:
+    # The harness runs at 1/LATENCY_SCALE of real time, so the real timeout and backoff settings are scaled the
+    # same way: a 90 s real provider timeout is 0.9 s here, and the 2 s retry backoff is 0.02 s.
+    names = ("IMAGE_PROVIDER_TIMEOUT_SECONDS", "IMAGE_RETRY_BACKOFF_BASE_SECONDS", "IMAGE_RETRY_BACKOFF_CAP_SECONDS")
+    saved = {n: getattr(settings, n) for n in names}
+    settings.IMAGE_PROVIDER_TIMEOUT_SECONDS = 90 * LATENCY_SCALE
+    settings.IMAGE_RETRY_BACKOFF_BASE_SECONDS = 2 * LATENCY_SCALE
+    settings.IMAGE_RETRY_BACKOFF_CAP_SECONDS = 15 * LATENCY_SCALE
+    try:
+        return await _scenario_e_body()
+    finally:
+        for n, v in saved.items():
+            setattr(settings, n, v)
+
+
+async def _scenario_e_body() -> Dict[str, Any]:
     res: Dict[str, Any] = {}
     from app.ai.image_generation_manager import ImageGenerationManager
 
@@ -474,7 +494,9 @@ async def scenario_e() -> Dict[str, Any]:
     install_fake_providers(hang_primary, ok_fallback)
     wa, ids, bal = await setup_pack(1)
     task = asyncio.create_task(place_and_run(wa, ids[0]))
-    await asyncio.sleep(1.5)  # 150 s real-equivalent at 1/100
+    # The order must finish on its own once the hung provider is cut off at the timeout and the fallback
+    # serves it: allow 300 s real-equivalent (at 1/100 scale), i.e. 90 s timeout + fallback + delivery + slack.
+    await asyncio.wait({task}, timeout=3.0)
     still_running = not task.done()
     db = SessionLocal()
     status = db.query(WhatsAppIngestion.status).filter(WhatsAppIngestion.id == ids[0]).scalar()
@@ -486,9 +508,9 @@ async def scenario_e() -> Dict[str, Any]:
     except BaseException:
         pass
     res["e3_hung_provider"] = {
-        "still_running_after_1.5s": still_running, "ingestion_status": status, "wallet_balance_now": balance_now, "initial_balance": bal,
+        "still_running_after_3s_scaled": still_running, "ingestion_status": status, "wallet_balance_now": balance_now, "initial_balance": bal,
         "fallback_calls": ok_fallback.stats.calls,
-        "meaning": "no asyncio.wait_for / SDK timeout on the generation path: order stays 'processing' and paid until process restart (recover_stuck_paid_orders)",
+        "meaning": "a hung provider is cut off by the manager's deadline (IMAGE_PROVIDER_TIMEOUT_SECONDS) and the fallback serves the order",
     }
 
     quota_row = [r for r in table if r["mode"] == "resource_exhausted_429" and r["rate"] == 0.20][0]
@@ -496,8 +518,9 @@ async def scenario_e() -> Dict[str, Any]:
     res["verdict"] = "FAIL" if (quota_row["fallback_calls"] == 0 or any(not x["wallet_reconciled"] or x["stuck_orders"] for x in e2) or still_running) else "PASS"
     res["verdict_reason"] = (
         f"wallet reconciled in all mixed-fault runs={all(x['wallet_reconciled'] for x in e2)}; "
-        f"429 RESOURCE_EXHAUSTED (Gemini's real 429 text) triggers 0 fallback calls (usable {quota_row['usable_pct']}% vs "
-        f"{plain_row['usable_pct']}% for a plain '429 rate limit' at 20%); hung provider leaves order processing={still_running}"
+        f"429 RESOURCE_EXHAUSTED (Gemini's real 429 text) is retried then falls back: {quota_row['fallback_calls']} fallback "
+        f"call(s), usable {quota_row['usable_pct']}% vs {plain_row['usable_pct']}% for a plain '429 rate limit' at 20%; "
+        f"hung provider leaves order processing={still_running}"
     )
     return res
 
