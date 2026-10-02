@@ -91,6 +91,7 @@ from app.services.wallet_service import (
     get_customer,
     price_per_image,
 )
+from app.services import eta_service
 from app.utils.logger import logger, mask_phone
 from app.ai.image_generation_manager import generation_capacity_blocked
 from app.utils.executors import run_cpu, run_io
@@ -747,6 +748,26 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
     return new_ingestion_id
 
 
+def _orders_ahead(ingestion_id: str) -> int:
+    """Paid orders currently in progress, from every customer, other than this one (sync; own session)."""
+    from app.database import SessionLocal
+    from app.services.meta_whatsapp_service import STUCK_PAID_STATUSES
+
+    try:
+        with SessionLocal() as session:
+            return int(session.query(func.count(WhatsAppIngestion.id)).filter(
+                WhatsAppIngestion.status.in_(STUCK_PAID_STATUSES), WhatsAppIngestion.id != ingestion_id
+            ).scalar() or 0)
+    except Exception:  # noqa: BLE001 -- an estimate must never block an order
+        return 0
+
+
+def _parallel_orders(calls_per_order: int) -> Optional[int]:
+    """How many orders the server works on at once (None = no limit configured, so nobody waits in line)."""
+    limit = int(getattr(settings, "MAX_CONCURRENT_PROVIDER_CALLS", 0) or 0)
+    return max(limit // max(calls_per_order, 1), 1) if limit > 0 else None
+
+
 async def _handle_product_choice(
     db: Session,
     sender: str,
@@ -962,16 +983,24 @@ async def _handle_product_choice(
             cost_note = ", test mode - no charge"
         else:
             cost_note = f", ₹{price}"
+        ahead = await run_io(_orders_ahead, ingestion.id)
+        suffix = eta_service.ack_suffix("white_bg", ahead, _parallel_orders(1), "Please allow 20-30 seconds.")
         await send_whatsapp_text(
             sender,
             "✨ Processing your Clean Studio Shot (1 image"
             + cost_note
-            + ")... Please allow 20-30 seconds.",
+            + ")... "
+            + suffix,
             reply_to_message_id=quote_id,
         )
         return process_whatsapp_white_bg, ingestion.id
-    # Existing Pack 1 acknowledgement + existing Pack 1 worker, unchanged.
-    await send_whatsapp_text(sender, CATALOG_PACK_ACK_TEMPLATE, reply_to_message_id=quote_id)
+    # Pack 1 acknowledgement + worker. The time estimate is measured from recent orders (UX-2); until some have
+    # been measured the original wording is sent unchanged.
+    ahead = await run_io(_orders_ahead, ingestion.id)
+    default_tail = "Please allow 20-30 seconds."
+    suffix = eta_service.ack_suffix("pack", ahead, _parallel_orders(_mws.pack_generation_count()), default_tail)
+    ack = CATALOG_PACK_ACK_TEMPLATE if suffix == default_tail else CATALOG_PACK_ACK_TEMPLATE.replace(default_tail, suffix)
+    await send_whatsapp_text(sender, ack, reply_to_message_id=quote_id)
     return process_whatsapp_catalog_pack, ingestion.id
 
 

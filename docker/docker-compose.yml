@@ -1,0 +1,49 @@
+# Moraa GemVision production stack (DEP-1).  Run from the docker/ folder:
+#     cp .env.example .env      (then fill in the values)
+#     docker compose up -d --build
+#
+# Services: migrate (one-off database upgrade) -> api (the web server) behind caddy (HTTPS).
+# Background work (image generation, payment checks, alerts) runs inside the api process today and is made safe for
+# several processes by the database-based leases and outbox, so adding api replicas is allowed. A separate Redis /
+# Celery generation queue is a later step (see docs/QUESTIONS_FOR_MORNING.md).
+
+services:
+  migrate:
+    build: ../backend
+    image: moraa-backend
+    env_file: .env
+    command: ["python", "scripts/release.py"]
+    restart: "no"
+
+  api:
+    image: moraa-backend
+    env_file: .env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    stop_grace_period: 150s            # lets orders in progress finish on a deploy (matches uvicorn's 120 s)
+    volumes:
+      - moraa-data:/data               # customer photos and generated files (move to object storage later)
+    expose:
+      - "8000"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      PUBLIC_HOSTNAME: ${PUBLIC_HOSTNAME:?set PUBLIC_HOSTNAME in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  moraa-data:
+  caddy-data:
+  caddy-config:

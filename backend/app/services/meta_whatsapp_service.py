@@ -19,6 +19,7 @@ import json
 from datetime import datetime, timedelta, timezone
 import os
 import random
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -1552,6 +1553,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         "prompt_ugc": build_ugc_style_prompt,
     }
 
+    started_at = time.monotonic()
     db = SessionLocal()
     ingestion = None
     # Slots this order took from the shared daily counter and has not yet accounted for (COST-1). Whatever is
@@ -1762,6 +1764,9 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
             f"Catalog pack delivered: ingestion_id={ingestion_id} images={len(media_ids)} "
             f"recipient={mask_phone(ingestion.external_user_id)}"
         )
+        from app.services import eta_service
+
+        eta_service.record_duration("pack", time.monotonic() - started_at)
         await ent.record_trial_success(db, ingestion)  # trial orders only; never raises
         return True
 
@@ -1903,6 +1908,7 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
     from app.ai.concurrency_gate import PRIORITY_SINGLE, generation_priority
 
     generation_priority.set(PRIORITY_SINGLE)       # a single shot is served ahead of Pack calls when providers are busy
+    started_at = time.monotonic()
     db = SessionLocal()
     ingestion = None
 
@@ -2050,7 +2056,9 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
             f"White BG delivered: ingestion_id={ingestion_id} provider={provider_name} model={model_used}"
         )
         from app.services import entitlement_service as ent
+        from app.services import eta_service
 
+        eta_service.record_duration("white_bg", time.monotonic() - started_at)
         await ent.record_trial_success(db, ingestion)  # trial orders only; never raises
         return True
 

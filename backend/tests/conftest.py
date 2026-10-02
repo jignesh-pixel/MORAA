@@ -46,8 +46,12 @@ def _erpnext_billing_off_by_default(monkeypatch):
     # Provider health memory is process-wide: one test's simulated outage must not open a circuit for the next.
     from app.ai.provider_protection import breaker, bucket
 
+    from app.services import eta_service
+
     breaker.reset()
     bucket.reset()
+    eta_service.reset()
     yield
     breaker.reset()
     bucket.reset()
+    eta_service.reset()
