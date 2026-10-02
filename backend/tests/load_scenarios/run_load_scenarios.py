@@ -658,8 +658,10 @@ async def scenario_f() -> Dict[str, Any]:
     dup_worker_ok = res["f6_duplicate_worker_start_threads_x4"]["provider_calls"] == len(mws.CATALOG_PACK_STYLES)
     res["verdict"] = verdict(ok and text_ok and dup_worker_ok)
     res["verdict_reason"] = (
-        f"image + button dedup {'holds' if ok else 'BROKEN'}; text messages not deduped (welcomes={welcomes} for 3 identical deliveries); "
-        f"duplicate worker start across threads/workers made {res['f6_duplicate_worker_start_threads_x4']['provider_calls']} provider calls (expected 6)"
+        f"image + button dedup {'holds' if ok else 'BROKEN'}; text messages "
+        f"{'deduped' if text_ok else 'NOT deduped'} (welcomes={welcomes} for 3 identical deliveries); "
+        f"duplicate worker start across threads/workers made {res['f6_duplicate_worker_start_threads_x4']['provider_calls']} "
+        f"provider calls (expected {len(mws.CATALOG_PACK_STYLES)})"
     )
     return res
 

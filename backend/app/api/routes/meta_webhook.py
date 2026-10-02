@@ -984,6 +984,10 @@ async def receive_webhook(
     db: Session = Depends(get_db),
     claimed: List[str] = Depends(_message_claims),
 ) -> Dict[str, Any]:
+    if not isinstance(claimed, list):
+        # Called directly (not through FastAPI, e.g. the load harness): nothing tracks the claims, so a
+        # failure part-way cannot give them back. Duplicate protection itself still works.
+        claimed = []
     try:
         raw_body = await request.body()
     except Exception as e:
