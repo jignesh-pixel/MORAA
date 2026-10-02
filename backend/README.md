@@ -50,7 +50,7 @@ You should see `(venv)` appear in your terminal prompt.
 #### 3. Install dependencies
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-dev.txt -c constraints.txt
 ```
 
 #### 4. Configure environment
@@ -148,13 +148,13 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 ```bash
 cd backend
-pytest
+python -m pytest
 ```
 
 Run tests with verbose output:
 
 ```bash
-pytest -v
+python -m pytest -v
 ```
 
 ---

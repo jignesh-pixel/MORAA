@@ -27,6 +27,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+
+from tests.db_support import make_engine
 import app.models  # noqa: F401 — register every model with Base.metadata
 from app.config import settings
 from app.database import Base, get_db
@@ -292,11 +294,7 @@ class RazorpayWebhookRouteTests(unittest.TestCase):
         self.webhook_module = webhook_module
         self.app = app
 
-        engine = create_engine(
-            "sqlite:///:memory:",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
+        engine = make_engine()
         Base.metadata.create_all(bind=engine)
         self.engine = engine
         self.session = sessionmaker(bind=engine)()
@@ -590,11 +588,7 @@ class WalletCreditStillWorksTests(unittest.TestCase):
     """Guard the downstream helper the webhook relies on."""
 
     def setUp(self):
-        engine = create_engine(
-            "sqlite:///:memory:",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
+        engine = make_engine()
         Base.metadata.create_all(bind=engine)
         self.engine = engine
         self.session = sessionmaker(bind=engine)()

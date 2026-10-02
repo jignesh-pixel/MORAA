@@ -12,6 +12,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+
+from tests.db_support import make_engine
 import app.models  # noqa: F401 -- register every model with Base.metadata
 from app.database import Base, get_db
 from app.main import app
@@ -53,9 +55,7 @@ class PasswordHashingTests(unittest.TestCase):
 
 class LoginEndToEndTests(unittest.TestCase):
     def setUp(self):
-        self.engine = create_engine(
-            "sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool
-        )
+        self.engine = make_engine()
         Base.metadata.create_all(bind=self.engine)
         self.db = sessionmaker(bind=self.engine)()
         self.db.add(User(email="ops@example.com", username="ops", hashed_password=hash_password(PASSWORD),

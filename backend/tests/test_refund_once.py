@@ -12,7 +12,6 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 import app.models  # noqa: F401 -- register every model with Base.metadata
@@ -22,6 +21,7 @@ from app.models.customer import Customer
 from app.models.whatsapp_ingestion import WhatsAppIngestion
 from app.services import meta_whatsapp_service as mws
 from app.services import wallet_service
+from tests.db_support import make_engine
 
 SENDER = "919812345678"
 START_BALANCE = 200
@@ -30,13 +30,8 @@ CHARGED = 500
 
 class RefundOnceTests(unittest.TestCase):
     def setUp(self):
-        fd, self.db_path = tempfile.mkstemp(suffix=".db")
-        os.close(fd)
-        # A real file so every thread gets its own connection and transaction.
-        self.engine = create_engine(
-            f"sqlite:///{self.db_path}",
-            connect_args={"check_same_thread": False, "timeout": 15},
-        )
+        # Several sessions at once (threads): a real file on SQLite, a real schema on PostgreSQL.
+        self.engine = make_engine(concurrent=True)
         Base.metadata.create_all(bind=self.engine)
         self.Session = sessionmaker(bind=self.engine)
         with self.Session() as db:
@@ -56,7 +51,6 @@ class RefundOnceTests(unittest.TestCase):
 
     def tearDown(self):
         self.engine.dispose()
-        os.remove(self.db_path)
 
     def _balance(self):
         with self.Session() as db:
@@ -87,7 +81,7 @@ class RefundOnceTests(unittest.TestCase):
 
     def test_racing_refunds_credit_exactly_once(self):
         racers = 12
-        barrier = threading.Barrier(racers, timeout=20)
+        barrier = threading.Barrier(racers, timeout=120)
         real_lookup = wallet_service.find_customer_by_phone
 
         def lookup_after_everyone_passed_the_fast_check(db, phone):
@@ -110,8 +104,9 @@ class RefundOnceTests(unittest.TestCase):
             for t in threads:
                 t.start()
             for t in threads:
-                t.join(timeout=60)
+                t.join(timeout=180)
 
+        self.assertFalse([t for t in threads if t.is_alive()])
         self.assertEqual(errors, [])
         self.assertEqual(self._balance(), START_BALANCE + CHARGED)
         self.assertEqual(self._refund_rows(), 1)

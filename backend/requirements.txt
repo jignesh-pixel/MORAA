@@ -1,12 +1,16 @@
-# MORAA GemVision - Backend Dependencies
-fastapi==0.115.6
+# MORAA GemVision - Backend runtime dependencies (exact pins).
+# Install for development/CI:  pip install -r requirements-dev.txt -c constraints.txt
+# Install for production:      pip install -r requirements.txt -c constraints.txt
+# constraints.txt pins every transitive package to the versions the test suite ran against.
+fastapi==0.133.1
+starlette==1.7.0
 uvicorn[standard]==0.34.0
 sqlalchemy==2.0.36
 alembic==1.14.0
 psycopg2-binary==2.9.10
-pydantic[email]>=2.12.5
+pydantic[email]==2.13.4
 pydantic-settings==2.14.2
-python-multipart==0.0.18
+python-multipart==0.0.32
 python-jose[cryptography]==3.3.0
 bcrypt==5.0.0
 python-dotenv==1.0.1
@@ -16,9 +20,8 @@ pillow==11.0.0
 loguru==0.7.3
 celery==5.6.3
 google-generativeai==0.8.3
-google-genai>=2.14.0
-openai>=1.55.0
+google-genai==2.17.0
+openai==2.51.0
 razorpay==2.0.1
 redis==8.0.1
-pytest==8.3.4
 httpx==0.28.1

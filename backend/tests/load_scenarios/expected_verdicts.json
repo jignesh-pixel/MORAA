@@ -1,0 +1,13 @@
+{
+  "_comment": "Locked load-harness verdicts. The phase gate fails if any scenario gets WORSE than its entry (PASS > WARN > FAIL) and reports any improvement so this file can be tightened. e,f,h,i,k are known gaps owned by later phases (see docs/audit).",
+  "a": "PASS",
+  "b": "PASS",
+  "c": "WARN",
+  "d": "PASS",
+  "e": "FAIL",
+  "f": "FAIL",
+  "g": "PASS",
+  "h": "FAIL",
+  "i": "FAIL",
+  "k": "FAIL"
+}

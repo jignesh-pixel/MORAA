@@ -1,0 +1,1077 @@
+{
+  "a": {
+    "verdict": "PASS",
+    "single_generate_image": {
+      "success": true,
+      "wall_s": 0.237
+    },
+    "pack": {
+      "orders": 1,
+      "wall_s": 0.52,
+      "wall_s_x100_naive": 51.7,
+      "worker_true": 1,
+      "worker_false": 0,
+      "declined_no_worker": 0,
+      "exceptions": [],
+      "loop_lag": {
+        "heartbeats": 39,
+        "lag_max_ms": 11.1,
+        "lag_p99_ms": 11.1,
+        "lag_mean_ms": 4.56,
+        "stalls_over_100ms": 0,
+        "stalled_total_s": 0
+      },
+      "sync_sql_statements": 19,
+      "sync_sql_per_order": 19.0,
+      "sync_sql_total_s": 0.002
+    },
+    "provider_primary": {
+      "calls": 6,
+      "ok": 6,
+      "fail": 0,
+      "max_inflight": 6,
+      "fail_modes": {}
+    },
+    "reconcile": {
+      "statuses": {
+        "delivered": 1
+      },
+      "per_customer": {
+        "918800000001": {
+          "initial": 500,
+          "charged": 500,
+          "refunded": 0,
+          "balance": 0,
+          "reconciled": true
+        }
+      },
+      "all_reconciled": true
+    },
+    "meta_deliveries": [
+      [
+        "918800000001",
+        6
+      ]
+    ],
+    "note": "pack = 6 styles fanned out with asyncio.gather (CATALOG_PACK_STYLES); price Rs 500",
+    "harness_runtime_s": 0.9
+  },
+  "b": {
+    "verdict": "PASS",
+    "pack": {
+      "orders": 10,
+      "wall_s": 0.98,
+      "wall_s_x100_naive": 98.1,
+      "worker_true": 10,
+      "worker_false": 0,
+      "declined_no_worker": 0,
+      "exceptions": [],
+      "loop_lag": {
+        "heartbeats": 60,
+        "lag_max_ms": 225.7,
+        "lag_p99_ms": 225.7,
+        "lag_mean_ms": 8.76,
+        "stalls_over_100ms": 2,
+        "stalled_total_s": 0.33
+      },
+      "sync_sql_statements": 190,
+      "sync_sql_per_order": 19.0,
+      "sync_sql_total_s": 0.021
+    },
+    "provider_primary": {
+      "calls": 60,
+      "ok": 60,
+      "fail": 0,
+      "max_inflight": 60,
+      "fail_modes": {}
+    },
+    "reconcile": {
+      "statuses": {
+        "delivered": 10
+      },
+      "per_customer": {
+        "918800000002": {
+          "initial": 5000,
+          "charged": 5000,
+          "refunded": 0,
+          "balance": 0,
+          "reconciled": true
+        }
+      },
+      "all_reconciled": true
+    },
+    "note": "functional PASS; provider concurrency is uncapped (max_inflight == 10 orders x 6 styles)",
+    "harness_runtime_s": 1.0
+  },
+  "c": {
+    "c1_async_provider_100x8": {
+      "calls": 800,
+      "success": 800,
+      "wall_s": 0.69,
+      "wall_s_x100_naive": 69.0,
+      "provider_max_inflight": 800,
+      "ideal_unbounded_wall_s": 0.4,
+      "loop_lag": {
+        "heartbeats": 17,
+        "lag_max_ms": 261.5,
+        "lag_p99_ms": 261.5,
+        "lag_mean_ms": 31.08,
+        "stalls_over_100ms": 2,
+        "stalled_total_s": 0.39
+      },
+      "cpu_count": 16
+    },
+    "c2_thread_provider_100x8_like_GeminiImageProvider": {
+      "calls": 800,
+      "success": 800,
+      "wall_s": 11.18,
+      "wall_s_x100_naive": 1118.0,
+      "provider_max_inflight": 800,
+      "ideal_unbounded_wall_s": 0.4,
+      "loop_lag": {
+        "heartbeats": 1974,
+        "lag_max_ms": 126.9,
+        "lag_p99_ms": 13.2,
+        "lag_mean_ms": 1.54,
+        "stalls_over_100ms": 1,
+        "stalled_total_s": 0.13
+      },
+      "cpu_count": 16,
+      "default_executor_max_workers": 20,
+      "slowdown_vs_unbounded": 16.2
+    },
+    "c3_real_pack_path_100_orders": {
+      "pack": {
+        "orders": 100,
+        "wall_s": 5.15,
+        "wall_s_x100_naive": 514.8,
+        "worker_true": 100,
+        "worker_false": 0,
+        "declined_no_worker": 0,
+        "exceptions": [],
+        "loop_lag": {
+          "heartbeats": 26,
+          "lag_max_ms": 2154.0,
+          "lag_p99_ms": 2154.0,
+          "lag_mean_ms": 188.58,
+          "stalls_over_100ms": 6,
+          "stalled_total_s": 4.68
+        },
+        "sync_sql_statements": 1900,
+        "sync_sql_per_order": 19.0,
+        "sync_sql_total_s": 0.293
+      },
+      "provider_primary": {
+        "calls": 600,
+        "ok": 600,
+        "fail": 0,
+        "max_inflight": 600,
+        "fail_modes": {}
+      },
+      "reconcile": {
+        "statuses": {
+          "delivered": 100
+        },
+        "per_customer": {
+          "918800000003": {
+            "initial": 50000,
+            "charged": 50000,
+            "refunded": 0,
+            "balance": 0,
+            "reconciled": true
+          }
+        },
+        "all_reconciled": true
+      }
+    },
+    "c4_spend_cap_100_calls_30_packs": {
+      "pack": {
+        "orders": 30,
+        "wall_s": 1.42,
+        "wall_s_x100_naive": 142.1,
+        "worker_true": 16,
+        "worker_false": 14,
+        "declined_no_worker": 0,
+        "exceptions": [],
+        "loop_lag": {
+          "heartbeats": 49,
+          "lag_max_ms": 389.1,
+          "lag_p99_ms": 389.1,
+          "lag_mean_ms": 20.96,
+          "stalls_over_100ms": 2,
+          "stalled_total_s": 0.69
+        },
+        "sync_sql_statements": 612,
+        "sync_sql_per_order": 20.4,
+        "sync_sql_total_s": 0.093
+      },
+      "provider_calls": 96,
+      "reconcile": {
+        "statuses": {
+          "delivered": 16,
+          "failed": 14
+        },
+        "per_customer": {
+          "918800000004": {
+            "initial": 15000,
+            "charged": 15000,
+            "refunded": 7000,
+            "balance": 7000,
+            "reconciled": true
+          }
+        },
+        "all_reconciled": true
+      },
+      "expected": "16 packs fit (16x6=96 <= 100); 14 refused BEFORE any provider call and refunded"
+    },
+    "verdict": "WARN",
+    "verdict_reason": "functional=ok; thread-backed provider (Gemini path) needed 11.18s vs 0.69s unbounded (16.2x) because asyncio.to_thread uses the default executor (20 threads)",
+    "harness_runtime_s": 18.6
+  },
+  "d": {
+    "verdict": "PASS",
+    "verdict_reason": "isolation/funding correct=True; but RateLimitMiddleware keys on client IP (150/150 webhook POSTs from one Meta egress IP accepted, 0 got 429): all customers share one bucket",
+    "pack": {
+      "orders": 50,
+      "wall_s": 1.78,
+      "wall_s_x100_naive": 178.0,
+      "worker_true": 30,
+      "worker_false": 0,
+      "declined_no_worker": 20,
+      "exceptions": [],
+      "loop_lag": {
+        "heartbeats": 48,
+        "lag_max_ms": 760.3,
+        "lag_p99_ms": 760.3,
+        "lag_mean_ms": 28.54,
+        "stalls_over_100ms": 2,
+        "stalled_total_s": 1.06
+      },
+      "sync_sql_statements": 730,
+      "sync_sql_per_order": 14.6,
+      "sync_sql_total_s": 0.12
+    },
+    "provider_primary": {
+      "calls": 180,
+      "ok": 180,
+      "fail": 0,
+      "max_inflight": 180,
+      "fail_modes": {}
+    },
+    "expected_funded_total": 30,
+    "delivered": 30,
+    "held_awaiting_choice": 20,
+    "per_recipient_deliveries_match_funding": true,
+    "reconcile": {
+      "statuses": {
+        "delivered": 30,
+        "awaiting_choice": 20
+      },
+      "per_customer": {
+        "918800000005": {
+          "initial": 5137,
+          "charged": 5000,
+          "refunded": 0,
+          "balance": 137,
+          "reconciled": true
+        },
+        "918800000006": {
+          "initial": 4137,
+          "charged": 4000,
+          "refunded": 0,
+          "balance": 137,
+          "reconciled": true
+        },
+        "918800000007": {
+          "initial": 3137,
+          "charged": 3000,
+          "refunded": 0,
+          "balance": 137,
+          "reconciled": true
+        },
+        "918800000008": {
+          "initial": 2137,
+          "charged": 2000,
+          "refunded": 0,
+          "balance": 137,
+          "reconciled": true
+        },
+        "918800000009": {
+          "initial": 1137,
+          "charged": 1000,
+          "refunded": 0,
+          "balance": 137,
+          "reconciled": true
+        }
+      },
+      "all_reconciled": true
+    },
+    "rate_limit_probe_meta_ip": {
+      "requests_from_one_ip_in_window": 150,
+      "limit": 100,
+      "window_s": 60,
+      "status_codes": {
+        "200": 150
+      },
+      "ok_count": 150,
+      "rejected_429": 0
+    },
+    "harness_runtime_s": 2.2
+  },
+  "e": {
+    "e1_per_mode": [
+      {
+        "mode": "rate_limit_429",
+        "rate": 0.1,
+        "calls": 600,
+        "usable": 588,
+        "silent_blank_success": 0,
+        "failed_after_manager": 12,
+        "fallback_calls": 55,
+        "fallback_used_ok": 43,
+        "usable_pct": 98.0
+      },
+      {
+        "mode": "resource_exhausted_429",
+        "rate": 0.1,
+        "calls": 600,
+        "usable": 538,
+        "silent_blank_success": 0,
+        "failed_after_manager": 62,
+        "fallback_calls": 0,
+        "fallback_used_ok": 0,
+        "usable_pct": 89.7
+      },
+      {
+        "mode": "server_500",
+        "rate": 0.1,
+        "calls": 600,
+        "usable": 593,
+        "silent_blank_success": 0,
+        "failed_after_manager": 7,
+        "fallback_calls": 66,
+        "fallback_used_ok": 59,
+        "usable_pct": 98.8
+      },
+      {
+        "mode": "timeout",
+        "rate": 0.1,
+        "calls": 600,
+        "usable": 594,
+        "silent_blank_success": 0,
+        "failed_after_manager": 6,
+        "fallback_calls": 58,
+        "fallback_used_ok": 52,
+        "usable_pct": 99.0
+      },
+      {
+        "mode": "empty_no_image",
+        "rate": 0.1,
+        "calls": 600,
+        "usable": 534,
+        "silent_blank_success": 0,
+        "failed_after_manager": 66,
+        "fallback_calls": 0,
+        "fallback_used_ok": 0,
+        "usable_pct": 89.0
+      },
+      {
+        "mode": "blank_success",
+        "rate": 0.1,
+        "calls": 600,
+        "usable": 546,
+        "silent_blank_success": 54,
+        "failed_after_manager": 0,
+        "fallback_calls": 0,
+        "fallback_used_ok": 0,
+        "usable_pct": 91.0
+      },
+      {
+        "mode": "rate_limit_429",
+        "rate": 0.2,
+        "calls": 600,
+        "usable": 562,
+        "silent_blank_success": 0,
+        "failed_after_manager": 38,
+        "fallback_calls": 135,
+        "fallback_used_ok": 97,
+        "usable_pct": 93.7
+      },
+      {
+        "mode": "resource_exhausted_429",
+        "rate": 0.2,
+        "calls": 600,
+        "usable": 467,
+        "silent_blank_success": 0,
+        "failed_after_manager": 133,
+        "fallback_calls": 0,
+        "fallback_used_ok": 0,
+        "usable_pct": 77.8
+      },
+      {
+        "mode": "server_500",
+        "rate": 0.2,
+        "calls": 600,
+        "usable": 572,
+        "silent_blank_success": 0,
+        "failed_after_manager": 28,
+        "fallback_calls": 130,
+        "fallback_used_ok": 102,
+        "usable_pct": 95.3
+      },
+      {
+        "mode": "timeout",
+        "rate": 0.2,
+        "calls": 600,
+        "usable": 575,
+        "silent_blank_success": 0,
+        "failed_after_manager": 25,
+        "fallback_calls": 115,
+        "fallback_used_ok": 90,
+        "usable_pct": 95.8
+      },
+      {
+        "mode": "empty_no_image",
+        "rate": 0.2,
+        "calls": 600,
+        "usable": 470,
+        "silent_blank_success": 0,
+        "failed_after_manager": 130,
+        "fallback_calls": 0,
+        "fallback_used_ok": 0,
+        "usable_pct": 78.3
+      },
+      {
+        "mode": "blank_success",
+        "rate": 0.2,
+        "calls": 600,
+        "usable": 493,
+        "silent_blank_success": 107,
+        "failed_after_manager": 0,
+        "fallback_calls": 0,
+        "fallback_used_ok": 0,
+        "usable_pct": 82.2
+      },
+      {
+        "mode": "rate_limit_429",
+        "rate": 0.3,
+        "calls": 600,
+        "usable": 533,
+        "silent_blank_success": 0,
+        "failed_after_manager": 67,
+        "fallback_calls": 185,
+        "fallback_used_ok": 118,
+        "usable_pct": 88.8
+      },
+      {
+        "mode": "resource_exhausted_429",
+        "rate": 0.3,
+        "calls": 600,
+        "usable": 425,
+        "silent_blank_success": 0,
+        "failed_after_manager": 175,
+        "fallback_calls": 0,
+        "fallback_used_ok": 0,
+        "usable_pct": 70.8
+      },
+      {
+        "mode": "server_500",
+        "rate": 0.3,
+        "calls": 600,
+        "usable": 546,
+        "silent_blank_success": 0,
+        "failed_after_manager": 54,
+        "fallback_calls": 155,
+        "fallback_used_ok": 101,
+        "usable_pct": 91.0
+      },
+      {
+        "mode": "timeout",
+        "rate": 0.3,
+        "calls": 600,
+        "usable": 556,
+        "silent_blank_success": 0,
+        "failed_after_manager": 44,
+        "fallback_calls": 167,
+        "fallback_used_ok": 123,
+        "usable_pct": 92.7
+      },
+      {
+        "mode": "empty_no_image",
+        "rate": 0.3,
+        "calls": 600,
+        "usable": 445,
+        "silent_blank_success": 0,
+        "failed_after_manager": 155,
+        "fallback_calls": 0,
+        "fallback_used_ok": 0,
+        "usable_pct": 74.2
+      },
+      {
+        "mode": "blank_success",
+        "rate": 0.3,
+        "calls": 600,
+        "usable": 426,
+        "silent_blank_success": 174,
+        "failed_after_manager": 0,
+        "fallback_calls": 0,
+        "fallback_used_ok": 0,
+        "usable_pct": 71.0
+      }
+    ],
+    "e2_end_to_end_packs": [
+      {
+        "fault_rate": 0.1,
+        "orders": 60,
+        "statuses": {
+          "delivered": 42,
+          "delivered_partial": 18
+        },
+        "paid_for_full_pack_but_got_partial": 18,
+        "stuck_orders": 0,
+        "provider_primary": {
+          "calls": 360,
+          "ok": 328,
+          "fail": 32,
+          "max_inflight": 360,
+          "fail_modes": {
+            "blank_success": 9,
+            "rate_limit_429": 9,
+            "timeout": 8,
+            "server_500": 7,
+            "resource_exhausted_429": 3,
+            "empty_no_image": 5
+          }
+        },
+        "provider_fallback": {
+          "calls": 24,
+          "ok": 22,
+          "fail": 2,
+          "max_inflight": 23,
+          "fail_modes": {
+            "timeout": 1,
+            "blank_success": 1,
+            "empty_no_image": 1
+          }
+        },
+        "wallet_reconciled": true,
+        "refund_rows": 0,
+        "wall_s": 2.08,
+        "worker_exceptions": []
+      },
+      {
+        "fault_rate": 0.2,
+        "orders": 60,
+        "statuses": {
+          "delivered": 28,
+          "delivered_partial": 32
+        },
+        "paid_for_full_pack_but_got_partial": 32,
+        "stuck_orders": 0,
+        "provider_primary": {
+          "calls": 360,
+          "ok": 306,
+          "fail": 54,
+          "max_inflight": 360,
+          "fail_modes": {
+            "server_500": 14,
+            "empty_no_image": 7,
+            "blank_success": 18,
+            "rate_limit_429": 12,
+            "resource_exhausted_429": 12,
+            "timeout": 9
+          }
+        },
+        "provider_fallback": {
+          "calls": 35,
+          "ok": 30,
+          "fail": 5,
+          "max_inflight": 35,
+          "fail_modes": {
+            "empty_no_image": 2,
+            "blank_success": 1,
+            "resource_exhausted_429": 1,
+            "server_500": 1,
+            "rate_limit_429": 1
+          }
+        },
+        "wallet_reconciled": true,
+        "refund_rows": 0,
+        "wall_s": 2.28,
+        "worker_exceptions": []
+      },
+      {
+        "fault_rate": 0.3,
+        "orders": 60,
+        "statuses": {
+          "delivered_partial": 46,
+          "delivered": 14
+        },
+        "paid_for_full_pack_but_got_partial": 46,
+        "stuck_orders": 0,
+        "provider_primary": {
+          "calls": 360,
+          "ok": 272,
+          "fail": 88,
+          "max_inflight": 360,
+          "fail_modes": {
+            "resource_exhausted_429": 14,
+            "blank_success": 28,
+            "empty_no_image": 12,
+            "rate_limit_429": 24,
+            "timeout": 21,
+            "server_500": 17
+          }
+        },
+        "provider_fallback": {
+          "calls": 62,
+          "ok": 42,
+          "fail": 20,
+          "max_inflight": 62,
+          "fail_modes": {
+            "rate_limit_429": 7,
+            "server_500": 4,
+            "timeout": 5,
+            "blank_success": 1,
+            "resource_exhausted_429": 3,
+            "empty_no_image": 1
+          }
+        },
+        "wallet_reconciled": true,
+        "refund_rows": 0,
+        "wall_s": 2.12,
+        "worker_exceptions": []
+      }
+    ],
+    "e3_hung_provider": {
+      "still_running_after_1.5s": true,
+      "ingestion_status": "processing",
+      "wallet_balance_now": 0,
+      "initial_balance": 500,
+      "fallback_calls": 0,
+      "meaning": "no asyncio.wait_for / SDK timeout on the generation path: order stays 'processing' and paid until process restart (recover_stuck_paid_orders)"
+    },
+    "verdict": "FAIL",
+    "verdict_reason": "wallet reconciled in all mixed-fault runs=True; 429 RESOURCE_EXHAUSTED (Gemini's real 429 text) triggers 0 fallback calls (usable 77.8% vs 93.7% for a plain '429 rate limit' at 20%); hung provider leaves order processing=True",
+    "harness_runtime_s": 18.4
+  },
+  "f": {
+    "f1_same_loop_x20": {
+      "ingestion_rows": 1,
+      "button_messages_sent": 1,
+      "media_lookups(meta_api_calls)": 1,
+      "media_downloads": 1,
+      "exceptions": [],
+      "wall_s": 0.18
+    },
+    "f2_multi_worker_threads_x20": {
+      "ingestion_rows": 1,
+      "button_messages_sent": 1,
+      "media_lookups(meta_api_calls)": 1,
+      "media_downloads": 1,
+      "exceptions": []
+    },
+    "f3_sequential_x5": {
+      "ingestion_rows": 1,
+      "button_messages_sent": 1,
+      "media_lookups": 1
+    },
+    "f4_duplicate_button_tap_threads_x20": {
+      "background_jobs_enqueued": 1,
+      "balance_before": 2500,
+      "balance_after": 2000,
+      "debits": 1,
+      "already_chosen_notices": 19,
+      "exceptions": []
+    },
+    "f5_duplicate_text_x3": {
+      "welcome_messages_sent_for_3_identical_deliveries": 3,
+      "recharge_links_sent_for_3_identical_deliveries": 3
+    },
+    "f6_duplicate_worker_start_same_loop_x2": {
+      "provider_calls": 6,
+      "expected_calls": 6,
+      "pack_deliveries": 1
+    },
+    "f6_duplicate_worker_start_threads_x4": {
+      "provider_calls": 6,
+      "expected_calls": 6,
+      "pack_deliveries": 1
+    },
+    "verdict": "FAIL",
+    "verdict_reason": "image + button dedup holds; text messages not deduped (welcomes=3 for 3 identical deliveries); duplicate worker start across threads/workers made 6 provider calls (expected 6)",
+    "harness_runtime_s": 3.0
+  },
+  "g": {
+    "g1_100_debits_100_threads": {
+      "attempts": 100,
+      "balance_before": 18750,
+      "funded_for": 37,
+      "charged": 37,
+      "declined": 63,
+      "balance_after": 250,
+      "negative": false,
+      "money_conserved": true,
+      "wrongly_declined_when_funds_left": 0,
+      "sqlite_lock_errors": 0
+    },
+    "g1b_100_debits_16_threads": {
+      "attempts": 100,
+      "balance_before": 18750,
+      "funded_for": 37,
+      "charged": 37,
+      "declined": 63,
+      "balance_after": 250,
+      "negative": false,
+      "money_conserved": true,
+      "wrongly_declined_when_funds_left": 0,
+      "sqlite_lock_errors": 0
+    },
+    "g2_tap_handler_100_threads": {
+      "queued": 37,
+      "funded_for": 37,
+      "statuses": {
+        "awaiting_choice": 63,
+        "pack_queued": 37
+      },
+      "balance_after": 250,
+      "reconciled": true,
+      "exceptions": [],
+      "sqlite_lock_errors": 0
+    },
+    "g3_tap_handler_one_loop": {
+      "queued": 37,
+      "funded_for": 37,
+      "statuses": {
+        "pack_queued": 37,
+        "awaiting_choice": 63
+      },
+      "balance_after": 250,
+      "reconciled": true
+    },
+    "g4_refund_race_20_threads": {
+      "order_charge": 500,
+      "wallet_after_20_concurrent_refunds": 500,
+      "audit_rows": 1,
+      "over_refund": 0,
+      "expected_wallet": 500
+    },
+    "verdict": "PASS",
+    "verdict_reason": "guarded debit correct (charged 37/37); tap handler correct; refund double-credit race: wallet 500 vs expected 500 (1 audit row)",
+    "harness_runtime_s": 11.2
+  },
+  "h": {
+    "test_image_mb": 3.0,
+    "h0_baseline_idle": {
+      "heartbeats": 33,
+      "lag_max_ms": 6.3,
+      "lag_p99_ms": 6.3,
+      "lag_mean_ms": 5.59,
+      "stalls_over_100ms": 0,
+      "stalled_total_s": 0,
+      "work_wall_s": 0.52
+    },
+    "h1_PreprocessingService.preprocess_x8_async_wrapper_of_sync_PIL": {
+      "heartbeats": 2,
+      "lag_max_ms": 5551.4,
+      "lag_p99_ms": 5551.4,
+      "lag_mean_ms": 2775.71,
+      "stalls_over_100ms": 1,
+      "stalled_total_s": 5.55,
+      "work_wall_s": 5.56
+    },
+    "h2_meta_validate_image_x50_direct_(webhook_path)": {
+      "heartbeats": 2,
+      "lag_max_ms": 0.0,
+      "lag_p99_ms": 0.0,
+      "lag_mean_ms": 0.0,
+      "stalls_over_100ms": 0,
+      "stalled_total_s": 0,
+      "work_wall_s": 0.0
+    },
+    "h2b_same_work_via_to_thread": {
+      "heartbeats": 7,
+      "lag_max_ms": 0.0,
+      "lag_p99_ms": 0.0,
+      "lag_mean_ms": 0.0,
+      "stalls_over_100ms": 0,
+      "stalled_total_s": 0,
+      "work_wall_s": 0.01
+    },
+    "h3_check_quality_floor_x20_direct_(image_generation_route)": {
+      "heartbeats": 2,
+      "lag_max_ms": 4789.0,
+      "lag_p99_ms": 4789.0,
+      "lag_mean_ms": 2394.51,
+      "stalls_over_100ms": 1,
+      "stalled_total_s": 4.79,
+      "work_wall_s": 4.8
+    },
+    "h3b_same_work_via_to_thread": {
+      "heartbeats": 46,
+      "lag_max_ms": 58.8,
+      "lag_p99_ms": 58.8,
+      "lag_mean_ms": 8.53,
+      "stalls_over_100ms": 0,
+      "stalled_total_s": 0.11,
+      "work_wall_s": 0.81
+    },
+    "h4_base64_encode+decode_3MB_x100": {
+      "heartbeats": 50,
+      "lag_max_ms": 218.8,
+      "lag_p99_ms": 218.8,
+      "lag_mean_ms": 94.58,
+      "stalls_over_100ms": 13,
+      "stalled_total_s": 4.69,
+      "work_wall_s": 5.23
+    },
+    "h5_UploadService.process_upload_x20_(sha256+disk+PIL_dims+sync_DB)": {
+      "heartbeats": 2,
+      "lag_max_ms": 870.2,
+      "lag_p99_ms": 870.2,
+      "lag_mean_ms": 435.11,
+      "stalls_over_100ms": 1,
+      "stalled_total_s": 0.87,
+      "work_wall_s": 0.88
+    },
+    "h6_batch_upload_route": {
+      "21_files_status": 400,
+      "21_files_detail": "Maximum 20 images per batch upload.",
+      "five_concurrent_20x3MB_results": [
+        "IntegrityError: (sqlite3.IntegrityError) FOREIGN KEY constraint failed\n[SQL: INSERT INTO processing_logs (id, request_id, proc",
+        "IntegrityError: (sqlite3.IntegrityError) FOREIGN KEY constraint failed\n[SQL: INSERT INTO processing_logs (id, request_id, proc",
+        "IntegrityError: (sqlite3.IntegrityError) FOREIGN KEY constraint failed\n[SQL: INSERT INTO processing_logs (id, request_id, proc",
+        "IntegrityError: (sqlite3.IntegrityError) FOREIGN KEY constraint failed\n[SQL: INSERT INTO processing_logs (id, request_id, proc",
+        "IntegrityError: (sqlite3.IntegrityError) FOREIGN KEY constraint failed\n[SQL: INSERT INTO processing_logs (id, request_id, proc"
+      ],
+      "heartbeats": 260,
+      "lag_max_ms": 18.7,
+      "lag_p99_ms": 15.1,
+      "lag_mean_ms": 0.64,
+      "stalls_over_100ms": 0,
+      "stalled_total_s": 0,
+      "work_wall_s": 0.59,
+      "note": "route has a hard cap of 20 files/request, so 100 images need 5 requests"
+    },
+    "verdict": "FAIL",
+    "verdict_reason": "worst single stall 5551.4 ms (idle baseline 6.3 ms; same sync work via to_thread 58.8 ms); threshold 100 ms",
+    "harness_runtime_s": 18.6
+  },
+  "k": {
+    "pool_config": "SQLAlchemy defaults used by app/database.py: pool_size=5, max_overflow=10 (15 connections); pool_timeout shortened 30 s -> 3 s so the probe finishes (behaviour is identical, stalls are 10x shorter than production)",
+    "rows": [
+      {
+        "orders": 10,
+        "wall_s": 0.96,
+        "loop_lag_max_s": 0.2,
+        "loop_stalled_total_s": 0.3,
+        "statuses": {
+          "delivered": 10
+        },
+        "tasks_raised_pool_timeout": 0,
+        "exception_sample": [],
+        "packs_debited": 10,
+        "packs_delivered": 10,
+        "paid_but_not_delivered_and_not_refunded": 0,
+        "wallet_reconciled": true,
+        "provider_calls": 60
+      },
+      {
+        "orders": 15,
+        "wall_s": 1.09,
+        "loop_lag_max_s": 0.3,
+        "loop_stalled_total_s": 0.45,
+        "statuses": {
+          "delivered": 15
+        },
+        "tasks_raised_pool_timeout": 0,
+        "exception_sample": [],
+        "packs_debited": 15,
+        "packs_delivered": 15,
+        "paid_but_not_delivered_and_not_refunded": 0,
+        "wallet_reconciled": true,
+        "provider_calls": 90
+      },
+      {
+        "orders": 16,
+        "wall_s": 3.97,
+        "loop_lag_max_s": 3.0,
+        "loop_stalled_total_s": 3.44,
+        "statuses": {
+          "delivered": 15,
+          "pack_queued": 1
+        },
+        "tasks_raised_pool_timeout": 1,
+        "exception_sample": [
+          "TimeoutError('QueuePool limit of size 5 overflow 10 reached, connection timed out, timeout 3.00')"
+        ],
+        "packs_debited": 16,
+        "packs_delivered": 15,
+        "paid_but_not_delivered_and_not_refunded": 1,
+        "wallet_reconciled": true,
+        "provider_calls": 90
+      },
+      {
+        "orders": 20,
+        "wall_s": 15.88,
+        "loop_lag_max_s": 12.4,
+        "loop_stalled_total_s": 15.56,
+        "statuses": {
+          "delivered": 15,
+          "pack_queued": 5
+        },
+        "tasks_raised_pool_timeout": 3,
+        "exception_sample": [
+          "TimeoutError('QueuePool limit of size 5 overflow 10 reached, connection timed out, timeout 3.00')"
+        ],
+        "packs_debited": 20,
+        "packs_delivered": 15,
+        "paid_but_not_delivered_and_not_refunded": 5,
+        "wallet_reconciled": true,
+        "provider_calls": 90
+      },
+      {
+        "orders": 30,
+        "wall_s": 46.3,
+        "loop_lag_max_s": 42.5,
+        "loop_stalled_total_s": 45.91,
+        "statuses": {
+          "delivered": 15,
+          "pack_queued": 15
+        },
+        "tasks_raised_pool_timeout": 3,
+        "exception_sample": [
+          "TimeoutError('QueuePool limit of size 5 overflow 10 reached, connection timed out, timeout 3.00')"
+        ],
+        "packs_debited": 30,
+        "packs_delivered": 15,
+        "paid_but_not_delivered_and_not_refunded": 15,
+        "wallet_reconciled": true,
+        "provider_calls": 90
+      }
+    ],
+    "verdict": "FAIL",
+    "verdict_reason": "each in-flight pack worker keeps its Session/connection checked out across the whole provider wait (no commit between the Image lookup and the post-generation commit); the 16th concurrent order blocks the event loop inside pool.checkout",
+    "harness_runtime_s": 92.2
+  },
+  "i": {
+    "points": [
+      {
+        "packs": 4,
+        "styles_per_pack": 6,
+        "ref_mb": 3.0,
+        "output_mb": 3.0,
+        "baseline_ws_mb": 119.0,
+        "peak_ws_mb": 250.0,
+        "peak_delta_mb": 132.0,
+        "delivered": 4,
+        "wall_s": 1.9,
+        "lag": {
+          "heartbeats": 23,
+          "lag_max_ms": 630.3,
+          "lag_p99_ms": 630.3,
+          "lag_mean_ms": 72.94,
+          "stalls_over_100ms": 3,
+          "stalled_total_s": 1.45
+        }
+      },
+      {
+        "packs": 8,
+        "styles_per_pack": 6,
+        "ref_mb": 3.0,
+        "output_mb": 3.0,
+        "baseline_ws_mb": 118.0,
+        "peak_ws_mb": 372.0,
+        "peak_delta_mb": 253.0,
+        "delivered": 8,
+        "wall_s": 3.88,
+        "lag": {
+          "heartbeats": 21,
+          "lag_max_ms": 1756.8,
+          "lag_p99_ms": 1756.8,
+          "lag_mean_ms": 174.65,
+          "stalls_over_100ms": 9,
+          "stalled_total_s": 3.55
+        }
+      },
+      {
+        "packs": 12,
+        "styles_per_pack": 6,
+        "ref_mb": 3.0,
+        "output_mb": 3.0,
+        "baseline_ws_mb": 118.0,
+        "peak_ws_mb": 493.0,
+        "peak_delta_mb": 376.0,
+        "delivered": 12,
+        "wall_s": 3.17,
+        "lag": {
+          "heartbeats": 24,
+          "lag_max_ms": 1521.8,
+          "lag_p99_ms": 1521.8,
+          "lag_mean_ms": 122.15,
+          "stalls_over_100ms": 9,
+          "stalled_total_s": 2.8
+        }
+      }
+    ],
+    "tracemalloc_run": {
+      "packs": 6,
+      "styles_per_pack": 6,
+      "ref_mb": 3.0,
+      "output_mb": 3.0,
+      "baseline_ws_mb": 117.0,
+      "peak_ws_mb": 312.0,
+      "peak_delta_mb": 195.0,
+      "delivered": 6,
+      "wall_s": 2.41,
+      "lag": {
+        "heartbeats": 24,
+        "lag_max_ms": 756.0,
+        "lag_p99_ms": 756.0,
+        "lag_mean_ms": 90.37,
+        "stalls_over_100ms": 4,
+        "stalled_total_s": 2.01
+      },
+      "tracemalloc_peak_mb": 192.0
+    },
+    "mb_per_concurrent_pack": 30.5,
+    "mb_per_generated_output": 5.1,
+    "intercept_mb": 10.0,
+    "extrapolated_peak_delta_mb_100_packs_x6": 3060.0,
+    "extrapolated_peak_delta_mb_100_images_x8_outputs": 4076.0,
+    "threshold_mb": 2048,
+    "verdict": "FAIL",
+    "verdict_reason": "~5.1 MB per live 3 MB output (bytes + base64 data URL + reference copy); 100 images x 8 outputs extrapolates to ~4076.0 MB above baseline (threshold 2048 MB, typical small container)",
+    "harness_runtime_s": 36.2
+  },
+  "_meta": {
+    "latency_scale": 0.01,
+    "real_latency_range_s": [
+      15.0,
+      40.0
+    ],
+    "scaled_latency_range_s": [
+      0.15,
+      0.4
+    ],
+    "network_calls_blocked": [],
+    "db": "sqlite (temp file, WAL)",
+    "price_per_pack_rs": 500,
+    "primary_image_provider": "gemini",
+    "fallback_image_provider": "openai",
+    "log_warning_error_top": {
+      "WARNING:Image provider 'gemini' failed (429 Too Many Requests: rate limit reac": 420,
+      "WARNING:Image provider 'gemini' returned non-recoverable error: 429 RESOURCE_E": 399,
+      "WARNING:Image provider 'gemini' failed (500 Internal Server Error from upstrea": 389,
+      "WARNING:Image provider 'gemini' failed (Request timeout: deadline exceeded) re": 378,
+      "WARNING:Image provider 'gemini' returned non-recoverable error: Gemini returne": 375,
+      "WARNING:Image provider 'openai' failed (429 Too Many Requests: rate limit reac": 125,
+      "WARNING:Image provider 'openai' failed (500 Internal Server Error from upstrea": 94,
+      "WARNING:Image provider 'openai' failed (Request timeout: deadline exceeded) re": 81,
+      "WARNING:Wallet charge declined: whatsapp_id=91******0021 balance=250 price=500": 63,
+      "WARNING:Wallet charge declined: whatsapp_id=91******0022 balance=250 price=500": 63,
+      "WARNING:Wallet charge declined: whatsapp_id=91******0023 balance=250 price=500": 63,
+      "WARNING:Wallet charge declined: whatsapp_id=91******0024 balance=250 price=500": 63
+    }
+  }
+}

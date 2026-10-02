@@ -12,16 +12,19 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.config import settings
 from app.database import Base
+import app.models  # noqa: F401  -- register every model so autogenerate sees the real metadata
 
 # Alembic Config object
 config = context.config
 
-# Override sqlalchemy.url with our setting
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+# Override sqlalchemy.url with our setting ("%" is doubled: ConfigParser interpolation)
+config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("%", "%%"))
 
-# Set up Python logging from alembic.ini
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+# Set up Python logging from alembic.ini -- only for the command line. When the
+# application or a test runs migrations in-process (it passes its own connection),
+# the host process's logging must not be reconfigured.
+if config.config_file_name is not None and config.attributes.get("connection") is None:
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # MetaData for 'autogenerate' support
 target_metadata = Base.metadata
@@ -40,20 +43,35 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+def _run_with_connection(connection) -> None:
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        compare_type=True,
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
 def run_migrations_online() -> None:
-    """Run migrations in 'online' mode."""
+    """Run migrations in 'online' mode.
+
+    A caller (application startup, tests) may hand in its own connection through
+    ``config.attributes["connection"]``; otherwise a connection is opened from
+    the configured URL, as the ``alembic`` command line always did.
+    """
+    shared_connection = config.attributes.get("connection")
+    if shared_connection is not None:
+        _run_with_connection(shared_connection)
+        return
+
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-        )
-        with context.begin_transaction():
-            context.run_migrations()
+        _run_with_connection(connection)
 
 
 if context.is_offline_mode():
