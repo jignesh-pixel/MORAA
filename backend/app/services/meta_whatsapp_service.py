@@ -1168,6 +1168,9 @@ async def run_recovery_sweep_forever(stuck_after) -> None:
             stuck = await recover_stuck_paid_orders(stuck_after)
             unrefunded = await recover_unrefunded_failed_orders(FAILED_REFUND_GRACE)
             released = await release_abandoned_choice_claims(CHOICE_CLAIM_GRACE)
+            from app.services.message_dedupe import purge_old_processed_messages
+
+            await asyncio.to_thread(purge_old_processed_messages)
             if stuck or unrefunded or released:
                 logger.warning(f"Recovery sweep: stuck={stuck} unrefunded={unrefunded} released={released}")
         except asyncio.CancelledError:

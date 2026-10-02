@@ -19,6 +19,7 @@ from app.models.customer import Customer
 from app.models.onboarding_session import OnboardingSession
 from app.models.whatsapp_payment_order import WhatsAppPaymentOrder
 from app.models.wallet_transaction import WalletTransaction
+from app.models.processed_message import ProcessedMessage
 
 __all__ = [
     "WalletTransaction",

@@ -102,7 +102,9 @@ class UniqueClaimSemanticsTests(unittest.TestCase):
     def _wait_until_a_session_is_blocked_on_a_lock(self, timeout=60.0):
         """Poll pg_stat_activity until another backend is genuinely waiting for the first claim's transaction."""
         deadline = time.monotonic() + timeout
-        with self.engine.connect() as conn:
+        # AUTOCOMMIT: PostgreSQL freezes pg_stat_activity for the length of a transaction, so polling inside one
+        # transaction can keep showing the snapshot from before the second session even connected.
+        with self.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
             while time.monotonic() < deadline:
                 waiting = conn.execute(text(
                     "SELECT count(*) FROM pg_stat_activity "

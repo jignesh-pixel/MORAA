@@ -18,7 +18,7 @@ UPDATE for charges, so a concurrent delivery can never overspend or drive
 the balance negative).
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 import asyncio
 import hmac
 import json
@@ -92,6 +92,7 @@ from app.services.wallet_service import (
 )
 from app.utils.logger import logger, mask_phone
 from app.utils.phone import same_phone
+from app.services.message_dedupe import claim_message, release_messages
 
 router = APIRouter(prefix="/api/meta", tags=["Meta WhatsApp Webhook"])
 
@@ -939,11 +940,23 @@ async def verify_webhook(
     return PlainTextResponse(content=hub_challenge)
 
 
+def _message_claims(db: Session = Depends(get_db)) -> Iterator[List[str]]:
+    """The message ids this request claimed. If handling fails part-way, the claims are given back so
+    Meta's retry of the message is handled instead of skipped."""
+    claimed: List[str] = []
+    try:
+        yield claimed
+    except BaseException:
+        release_messages(db, claimed)
+        raise
+
+
 @router.post("/webhook", summary="Receive WhatsApp webhook events")
 async def receive_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
+    claimed: List[str] = Depends(_message_claims),
 ) -> Dict[str, Any]:
     try:
         raw_body = await request.body()
@@ -997,6 +1010,9 @@ async def receive_webhook(
         events = parse_webhook_entry(entry)
 
         for event in events:
+            # Only the message being handled right now may be given back if handling fails: messages
+            # finished earlier in this payload already had their effect and must not be repeated on retry.
+            claimed.clear()
             event_type = event.get("type", "")
 
             if event_type == "payment_status":
@@ -1005,6 +1021,16 @@ async def receive_webhook(
 
             if event_type == "status":
                 continue
+
+            # Meta re-delivers a message it did not get a fast answer for. Text, button and form replies
+            # are handled once per message id (photos have their own unique-id guard further down).
+            if event_type in ("text", "interactive"):
+                message_id = event.get("message_id", "")
+                if not claim_message(db, message_id):
+                    logger.info("Duplicate delivery of a {} message ignored", event_type)
+                    continue
+                if message_id:
+                    claimed.append(message_id)
 
             if event_type == "text":
                 sender = event.get("sender", "")
@@ -1133,6 +1159,7 @@ async def receive_webhook(
             if event_type == "image":
                 image_events.append(event)
 
+    claimed.clear()     # every text / button message above is finished
     if not image_events:
         return {"status": "ok", "images_processed": 0}
 
