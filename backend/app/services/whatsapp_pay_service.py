@@ -43,6 +43,7 @@ from app.services.meta_whatsapp_service import _post_message_payload, send_whats
 from app.models.wallet_transaction import KIND_CREDIT_WHATSAPP_PAY
 from app.services.wallet_service import credit_wallet, find_customer_by_phone, get_balance
 from app.services.pending_payment_service import mark_pending_credited
+from app.utils.executors import run_io
 from app.utils.logger import logger, mask_phone
 from app.utils.phone import normalize_phone
 _plog = logger.bind(category="payments")
@@ -677,7 +678,8 @@ async def _send_receipt(db: Session, order: WhatsAppPaymentOrder) -> None:
             if settings.OUTBOX_ENABLED:
                 from app.services import outbox
 
-                queued = outbox.enqueue_detached(
+                outcome = await run_io(
+                    outbox.enqueue_status,
                     "payment_invoice",
                     {
                         "recipient_id": order.whatsapp_id,
@@ -693,6 +695,7 @@ async def _send_receipt(db: Session, order: WhatsAppPaymentOrder) -> None:
                     },
                     f"inv:{order.pg_payment_id or order.reference_id}",
                 )
+                queued = outcome in (outbox.QUEUED, outbox.DUPLICATE)   # a duplicate is already queued or sent
             if queued:                       # the durable job replaces the in-memory one
                 job.close()
                 outbox.ensure_default_handlers()

@@ -36,6 +36,7 @@ from app.services.wallet_service import (
     get_balance,
     record_ledger,
 )
+from app.utils.executors import run_io
 from app.utils.logger import logger, mask_phone
 from app.utils.phone import is_plausible_phone, normalize_phone
 router = APIRouter(prefix="/api/payments", tags=["Payments"])
@@ -375,17 +376,20 @@ def _resolve_customer(db: Session, sender_id: str) -> Optional[Customer]:
     return find_customer_by_phone(db, sender_id)
 
 
-def _queue_invoice(background_tasks: BackgroundTasks, args: Dict[str, Any]) -> None:
+async def _queue_invoice(background_tasks: BackgroundTasks, args: Dict[str, Any]) -> None:
     """Send the invoice through the durable outbox (retried, survives a restart); plain background task if the outbox
     is off or the database could not record it."""
     if settings.OUTBOX_ENABLED:
         from app.services import outbox
 
         payload = {k: args[k] for k in ("recipient_id", "payment_id", "amount", "customer_name", "customer_snapshot")}
-        if outbox.enqueue_detached("payment_invoice", payload, f"inv:{args['payment_id']}"):
+        outcome = await run_io(outbox.enqueue_status, "payment_invoice", payload, f"inv:{args['payment_id']}")
+        if outcome == outbox.QUEUED:
             outbox.ensure_default_handlers()
             background_tasks.add_task(outbox.drain_once)
             return
+        if outcome == outbox.DUPLICATE:
+            return                                # this payment's invoice is already queued or sent
     background_tasks.add_task(dispatch_payment_invoice, **args)
 
 
@@ -761,7 +765,7 @@ async def process_razorpay_event(
             local_pdf_fn=generate_invoice_pdf,
             send_document_fn=send_document_to_whatsapp,
         )
-        _queue_invoice(background_tasks, invoice_args)
+        await _queue_invoice(background_tasks, invoice_args)
 
         logger.info(f"Sent confirmation and tips to {mask_phone(clean_sender)}; invoice queued")
     except Exception as e:

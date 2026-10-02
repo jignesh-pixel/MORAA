@@ -77,12 +77,15 @@ async def dispatch_payment_invoice(
         inv_number = f"Invoice_MoraaStudio_{inv_suffix}"
         # ReportLab rendering is CPU work: keep it off the event loop.
         pdf_bytes = await run_cpu(local_pdf_fn, customer_name=customer_name, invoice_number=inv_number, amount=amount)
-        await send_document_fn(
+        sent = await send_document_fn(
             recipient_id=recipient_id,
             document_bytes=pdf_bytes,
             filename=f"{inv_number}.pdf",
             caption="",
         )
+        if sent is False:                    # the send reports False when WhatsApp refused it: let the outbox retry
+            logger.warning(f"Local invoice for {payment_id} could not be sent")
+            return "failed"
         return "local"
     except Exception as e:  # noqa: BLE001
         logger.error(f"Local invoice dispatch failed for {payment_id}: {e}")

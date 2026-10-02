@@ -46,6 +46,23 @@ def _try_acquire(name: str, ttl_seconds: float) -> bool:
             return False
 
 
+def _release_all() -> None:
+    from app.database import SessionLocal
+
+    with SessionLocal() as db:
+        db.execute(text("DELETE FROM scheduler_leases WHERE holder = :h"), {"h": HOLDER})
+        db.commit()
+
+
+async def release_leases() -> None:
+    """Give up every lease this process holds (graceful shutdown), so a restarted process takes over at once instead
+    of waiting for them to expire. Never raises."""
+    try:
+        await run_io(_release_all)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Could not release scheduler leases ({type(e).__name__}); they will expire on their own")
+
+
 async def holds_lease(name: str, ttl_seconds: float) -> bool:
     try:
         return await run_io(_try_acquire, name, ttl_seconds)

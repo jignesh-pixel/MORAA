@@ -136,10 +136,13 @@ def _queue_forward(msg: Dict[str, Any], background_tasks: BackgroundTasks) -> No
     if settings.OUTBOX_ENABLED:
         from app.services import outbox
 
-        if outbox.enqueue_detached("ops_forward", {"message": msg}, f"ops:{msg.get('id') or id(msg)}"):
+        outcome = outbox.enqueue_status("ops_forward", {"message": msg}, f"ops:{msg.get('id') or id(msg)}")
+        if outcome == outbox.QUEUED:
             outbox.ensure_default_handlers()
             background_tasks.add_task(outbox.drain_once)
             return
+        if outcome == outbox.DUPLICATE:
+            return                                # Meta re-delivered a message already forwarded: do not forward twice
     background_tasks.add_task(forward_to_ops, msg)
 
 

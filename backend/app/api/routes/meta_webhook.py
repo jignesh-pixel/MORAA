@@ -748,6 +748,10 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
     return new_ingestion_id
 
 
+# ingestion id -> outbox job id, for orders recorded in the outbox but not yet handed to a background task.
+_recorded_runs: Dict[str, int] = {}
+
+
 def _queue_order_run(background_tasks: BackgroundTasks, job: Tuple[Any, str]) -> None:
     """Start a paid order. With the outbox on, the order is first recorded in the database (so a crash or deploy
     before it starts does not strand it: the sweep starts it) and then run right here as before."""
@@ -755,8 +759,10 @@ def _queue_order_run(background_tasks: BackgroundTasks, job: Tuple[Any, str]) ->
     if settings.OUTBOX_ENABLED:
         from app.services import outbox
 
-        kind = "white" if worker is process_whatsapp_white_bg else "pack"
-        job_id = outbox.enqueue_order_run(kind, ingestion_id)
+        job_id = _recorded_runs.pop(ingestion_id, None)       # recorded when the order was queued (see above)
+        if job_id is None:
+            kind = "white" if worker is process_whatsapp_white_bg else "pack"
+            job_id = outbox.enqueue_order_run(kind, ingestion_id)
         if job_id is not None:
             background_tasks.add_task(outbox.run_job_now, job_id)
             return
@@ -780,7 +786,10 @@ def _orders_ahead(ingestion_id: str) -> int:
 async def _orders_ahead_released(db: Session, ingestion_id: str) -> int:
     """``_orders_ahead`` after ending this request's transaction: the count uses its own connection, and holding two per
     order exhausts the pool under bursts (PERF-1)."""
-    db.commit()
+    try:
+        db.commit()
+    except Exception:  # noqa: BLE001 -- an estimate must never fail an order that is already paid and queued
+        db.rollback()
     return await run_io(_orders_ahead, ingestion_id)
 
 
@@ -996,6 +1005,18 @@ async def _handle_product_choice(
     # order, so a paid order can be followed from the customer's tap to its delivery (OBS-6).
     logger.info(f"Order queued: ingestion_id={ingestion_id} product={product} free_access={free_access or 'no'}")
 
+    # Record the paid order in the durable outbox NOW, before anything else can fail (the acknowledgement message, the
+    # queue-depth lookup): from here on a crash or deploy cannot strand it, the outbox sweep starts it (Q-1).
+    if settings.OUTBOX_ENABLED:
+        from app.services import outbox
+
+        db.commit()                      # end this transaction: the outbox write below uses its own connection
+        run_id = await run_io(outbox.enqueue_order_run, "white" if product == PRODUCT_WHITE_BG else "pack", ingestion_id)
+        if run_id is not None:
+            if len(_recorded_runs) > 1000:
+                _recorded_runs.clear()
+            _recorded_runs[ingestion_id] = run_id
+
     if product == PRODUCT_WHITE_BG:
         if free_access == "trial":
             cost_note = ", complimentary trial credit"
@@ -1005,7 +1026,7 @@ async def _handle_product_choice(
             cost_note = ", test mode - no charge"
         else:
             cost_note = f", ₹{price}"
-        ahead = await _orders_ahead_released(db, ingestion.id)
+        ahead = await _orders_ahead_released(db, ingestion_id)
         suffix = eta_service.ack_suffix("white_bg", ahead, _parallel_orders(1), "Please allow 20-30 seconds.")
         await send_whatsapp_text(
             sender,
@@ -1015,15 +1036,15 @@ async def _handle_product_choice(
             + suffix,
             reply_to_message_id=quote_id,
         )
-        return process_whatsapp_white_bg, ingestion.id
+        return process_whatsapp_white_bg, ingestion_id
     # Pack 1 acknowledgement + worker. The time estimate is measured from recent orders (UX-2); until some have
     # been measured the original wording is sent unchanged.
-    ahead = await _orders_ahead_released(db, ingestion.id)
+    ahead = await _orders_ahead_released(db, ingestion_id)
     default_tail = "Please allow 20-30 seconds."
     suffix = eta_service.ack_suffix("pack", ahead, _parallel_orders(_mws.pack_generation_count()), default_tail)
     ack = CATALOG_PACK_ACK_TEMPLATE if suffix == default_tail else CATALOG_PACK_ACK_TEMPLATE.replace(default_tail, suffix)
     await send_whatsapp_text(sender, ack, reply_to_message_id=quote_id)
-    return process_whatsapp_catalog_pack, ingestion.id
+    return process_whatsapp_catalog_pack, ingestion_id
 
 
 @router.get("/webhook", summary="Meta webhook verification")

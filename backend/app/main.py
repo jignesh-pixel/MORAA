@@ -100,13 +100,14 @@ async def lifespan(app: FastAPI):
 
         from app.services.scheduler_lease import holds_lease
 
-        # Only the process that owns order recovery runs it, so a worker that restarts cannot refund an order that a
-        # sibling worker is still generating (ARC-2).
-        if not await holds_lease("order_recovery", 90):
-            raise RuntimeError("another process owns order recovery; skipped at startup")
-        recovered = await recover_stuck_paid_orders(STUCK_WHITE_AFTER)
-        if recovered:
-            logger.bind(category="system").warning(f"Recovered {recovered} stuck paid order(s) at startup")
+        # Only the process that owns order recovery refunds stuck orders, so a worker that restarts cannot refund an
+        # order that a sibling worker is still generating (ARC-2). The other recovery steps are always safe to run.
+        if await holds_lease("order_recovery", 90):
+            recovered = await recover_stuck_paid_orders(STUCK_WHITE_AFTER)
+            if recovered:
+                logger.bind(category="system").warning(f"Recovered {recovered} stuck paid order(s) at startup")
+        else:
+            logger.bind(category="system").info("Another process owns order recovery; skipping the startup refund pass")
         from app.services.meta_whatsapp_service import (
             FAILED_REFUND_GRACE,
             CHOICE_CLAIM_GRACE,
@@ -187,15 +188,24 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown
-    if reconcile_task is not None:
-        reconcile_task.cancel()
+    # Shutdown. Order matters: stop the periodic jobs first, let orders the outbox sweep started finish (they still
+    # need the worker pools and the provider clients), give the periodic-job leases back, and only then close the
+    # pools and clients.
+    for sweep in (reconcile_task, alert_task, link_reconcile_task, recovery_task, outbox_task):
+        if sweep is not None:
+            sweep.cancel()
     try:
-        from app.utils.executors import shutdown_executors
+        from app.services.outbox import wait_for_detached
 
-        shutdown_executors()
+        await wait_for_detached(100)          # orders the outbox sweep started get time to finish (DEP-2)
     except Exception as e:  # noqa: BLE001
-        logger.bind(category="system").warning(f"Worker pool shutdown skipped: {e}")
+        logger.bind(category="system").warning(f"Waiting for background orders skipped: {e}")
+    try:
+        from app.services.scheduler_lease import release_leases
+
+        await release_leases()                # a restarted process can take the periodic jobs over at once
+    except Exception as e:  # noqa: BLE001
+        logger.bind(category="system").warning(f"Lease release skipped: {e}")
     try:
         from app.ai.providers.gemini_image_provider import close_gemini_client
         from app.ai.providers.openai_image_provider import close_openai_client
@@ -204,20 +214,12 @@ async def lifespan(app: FastAPI):
         await close_openai_client()
     except Exception as e:  # noqa: BLE001 -- shutdown must never fail on this
         logger.bind(category="system").warning(f"Provider client close skipped: {e}")
-    if alert_task is not None:
-        alert_task.cancel()
-    if link_reconcile_task is not None:
-        link_reconcile_task.cancel()
-    if recovery_task is not None:
-        recovery_task.cancel()
-    if outbox_task is not None:
-        outbox_task.cancel()
     try:
-        from app.services.outbox import wait_for_detached
+        from app.utils.executors import shutdown_executors
 
-        await wait_for_detached(100)          # orders the outbox sweep started get time to finish (DEP-2)
+        shutdown_executors()
     except Exception as e:  # noqa: BLE001
-        logger.bind(category="system").warning(f"Waiting for background orders skipped: {e}")
+        logger.bind(category="system").warning(f"Worker pool shutdown skipped: {e}")
     logger.bind(category="system").info(f"Shutting down {settings.APP_NAME}")
 
 
@@ -277,14 +279,16 @@ app.mount(
 @app.get("/")
 async def root():
     """Root endpoint with API information."""
-    return {
+    info = {
         "name": settings.APP_NAME,
         "version": settings.APP_VERSION,
         "description": settings.APP_DESCRIPTION,
-        "docs": "/docs",
-        "redoc": "/redoc",
         "health": "/health",
     }
+    if not settings.IS_PRODUCTION:               # the API docs are switched off in production
+        info["docs"] = "/docs"
+        info["redoc"] = "/redoc"
+    return info
 
 
 # Entry point for running directly
