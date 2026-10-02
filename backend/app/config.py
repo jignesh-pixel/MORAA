@@ -396,6 +396,15 @@ class Settings(BaseSettings):
     # Daily ceiling on ImageGenerationManager.generate_image() calls.
     MAX_GENERATIONS_PER_DAY: int = 100000
 
+    # --- Meta (WhatsApp) request retries (app/services/meta_whatsapp_service.py) ---
+    # 429 / 5xx answers and connection failures are retried this many times with jittered waits. A timed-out
+    # SEND is never retried (it may already have been delivered).
+    META_REQUEST_RETRIES: int = 2
+    META_RETRY_BACKOFF_BASE_SECONDS: float = 1.0
+    META_RETRY_BACKOFF_CAP_SECONDS: float = 10.0
+    # Razorpay API calls (payment-link creation) give up after this long; the static fallback link is used.
+    RAZORPAY_API_TIMEOUT_SECONDS: float = 10.0
+
     # --- Worker thread pools (app/utils/executors.py); 0 = automatic ---
     CPU_WORKER_THREADS: int = 0
     IO_WORKER_THREADS: int = 0
@@ -468,6 +477,9 @@ class Settings(BaseSettings):
 
     # Name of the Celery task queue for analysis jobs
     CELERY_ANALYSIS_QUEUE: str = "analysis"
+    # Per-task limits for analysis / prompt tasks (Q-4): soft first, then hard.
+    CELERY_TASK_SOFT_TIME_LIMIT_SECONDS: int = 240
+    CELERY_TASK_TIME_LIMIT_SECONDS: int = 300
 
     # Number of Celery worker processes (only used when not eager)
     CELERY_WORKER_CONCURRENCY: int = 2

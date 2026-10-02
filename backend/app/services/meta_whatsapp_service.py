@@ -18,11 +18,13 @@ import io
 import json
 from datetime import datetime, timedelta, timezone
 import os
+import random
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
 from app.config import settings
+from app.utils.executors import run_io
 from app.utils.logger import logger, mask_phone
 # ─── Constants ────────────────────────────────────────────────────────────
 
@@ -203,6 +205,72 @@ def parse_flow_response_json(raw: Any) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+# ─── Meta request helper (retry on 429 / 5xx) ────────────────────────────
+
+# Answers worth retrying for calls that can be repeated safely (lookups, downloads).
+META_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+# A SEND may be retried only when Meta certainly did NOT process it. 429 means "rejected before processing".
+# A 500/502/503/504 can come from a gateway AFTER Meta accepted the message, so retrying could send the
+# customer the same image or text twice; those are left to the caller, as before.
+META_SEND_RETRYABLE_STATUSES = frozenset({429})
+
+
+def _meta_retry_wait(response: Optional["httpx.Response"], attempt: int) -> Optional[float]:
+    """Seconds to wait before retry number ``attempt`` (0-based); None = do not retry.
+
+    Exponential backoff with +-50% jitter. When Meta sends ``Retry-After`` and it is longer than the cap,
+    waiting is not worth it (the caller gets the failure now, as before)."""
+    base = max(float(settings.META_RETRY_BACKOFF_BASE_SECONDS), 0.0)
+    cap = max(float(settings.META_RETRY_BACKOFF_CAP_SECONDS), 0.0)
+    delay = min(base * (2 ** attempt), cap) * random.uniform(0.5, 1.5)
+    if response is not None:
+        hint = response.headers.get("retry-after")
+        try:
+            asked = float(hint) if hint else None
+        except ValueError:
+            asked = None
+        if asked is not None:
+            if asked > cap:
+                return None
+            delay = max(delay, asked)
+    return delay
+
+
+async def _meta_request(call: Any, label: str, *, idempotent: bool) -> "httpx.Response":
+    """Run one Meta HTTP call (``call`` is a zero-argument coroutine factory), retrying what is safe to retry.
+
+    Retried (up to META_REQUEST_RETRIES times, with jittered waits): "could not connect" errors (the request
+    never left, so nothing can be duplicated) and HTTP 429. For ``idempotent`` calls (lookups, downloads) also
+    5xx answers and read timeouts. A SEND is never retried after a 5xx or a read timeout: it may already have
+    been delivered, and retrying would send the customer the same message twice, so that is left to the caller.
+    The last response (or exception) is returned/raised unchanged when retries run out (EXT-4).
+    """
+    retries = max(int(settings.META_REQUEST_RETRIES or 0), 0)
+    retryable = META_RETRYABLE_STATUSES if idempotent else META_SEND_RETRYABLE_STATUSES
+    for attempt in range(retries + 1):
+        last = attempt >= retries
+        try:
+            response = await call()
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            # No connection was ever established, so nothing was sent: always safe to retry.
+            if last:
+                raise
+            wait = _meta_retry_wait(None, attempt)
+        except httpx.TimeoutException:
+            if last or not idempotent:
+                raise
+            wait = _meta_retry_wait(None, attempt)
+        else:
+            if response.status_code not in retryable or last:
+                return response
+            wait = _meta_retry_wait(response, attempt)
+            if wait is None:
+                return response
+        logger.warning(f"Meta {label}: transient failure, retry {attempt + 1}/{retries} in {wait:.1f}s")
+        await asyncio.sleep(wait)
+    raise RuntimeError("unreachable")  # pragma: no cover
+
+
 # ─── Media retrieval ─────────────────────────────────────────────────────
 
 
@@ -216,9 +284,9 @@ async def get_media_url(media_id: str) -> Optional[str]:
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(
-                url,
-                headers={"Authorization": f"Bearer {settings.META_WHATSAPP_TOKEN}"},
+            response = await _meta_request(
+                lambda: client.get(url, headers={"Authorization": f"Bearer {settings.META_WHATSAPP_TOKEN}"}),
+                "media lookup", idempotent=True,
             )
 
             if response.status_code != 200:
@@ -256,7 +324,9 @@ async def download_media(media_url: str) -> Optional[Tuple[bytes, str]]:
 
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
-            response = await client.get(media_url, headers=headers)
+            response = await _meta_request(
+                lambda: client.get(media_url, headers=headers), "media download", idempotent=True
+            )
 
             if response.status_code != 200:
                 logger.error(
@@ -414,13 +484,17 @@ async def _post_message_payload(
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {settings.META_WHATSAPP_TOKEN}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
+            response = await _meta_request(
+                lambda: client.post(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {settings.META_WHATSAPP_TOKEN}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                ),
+                label,
+                idempotent=False,     # a send that timed out may have been delivered: never resent blindly
             )
 
             if response.status_code not in (200, 201):
@@ -1455,6 +1529,10 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
 
     db = SessionLocal()
     ingestion = None
+    # Slots this order took from the shared daily counter and has not yet accounted for (COST-1). Whatever is
+    # left here when the worker ends (an exception, a cancellation) is given back in the `finally` below.
+    held_slots = 0
+    held_day: Optional[str] = None
 
     async def _fail(message: str, delivery: bool = False) -> bool:
         # Same path as before (status + refund exactly once via the audit
@@ -1541,12 +1619,15 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
             # (the GENERATION_ENABLED kill switch still applies per call).
             spend_reserved = True
         elif not DRY_RUN_IMAGE_MODE:
-            from app.ai.image_generation_manager import reserve_generation_slots
+            from app.ai.image_generation_manager import current_spend_day, reserve_generation_slots
 
-            blocked = reserve_generation_slots(len(style_jobs))
+            _release_db(db)           # the shared counter is a database call; hold no connection meanwhile
+            reserve_day = current_spend_day()
+            blocked = await run_io(reserve_generation_slots, len(style_jobs))
             if blocked:
                 return await _fail(f"Generation blocked: {blocked}")
             spend_reserved = True
+            held_slots, held_day = len(style_jobs), reserve_day
 
         logger.info(
             f"Catalog pack generation started: ingestion_id={ingestion_id} "
@@ -1584,6 +1665,16 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         # deadline) is None. Same order as the styles, failures skipped, exactly as before.
         generated_any = any(r and r[0] for r in gather_results)
         media_ids: List[str] = [r[1] for r in gather_results if r and r[1]]
+
+        # Styles that produced nothing (failed, dropped at the deadline) cost nothing: give their reserved
+        # slots back to the shared daily counter (COST-1).
+        if held_slots:
+            failed_styles = sum(1 for r in gather_results if not (r and r[0]))
+            held_slots = 0              # accounted for: the `finally` must not release these a second time
+            if failed_styles:
+                from app.ai.image_generation_manager import release_generation_slots
+
+                await run_io(release_generation_slots, failed_styles, held_day)
 
         if not generated_any:
             return await _fail("All catalog style generations failed")
@@ -1666,6 +1757,15 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
             )
         return False
     finally:
+        if held_slots:
+            # The worker ended (error / cancellation) before it could account for the slots it took: they paid
+            # for nothing delivered, so they go back to the daily counter.
+            try:
+                from app.ai.image_generation_manager import release_generation_slots
+
+                await run_io(release_generation_slots, held_slots, held_day)
+            except BaseException:  # noqa: BLE001 -- must never mask the real outcome
+                pass
         db.close()
 
 

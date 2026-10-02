@@ -92,7 +92,7 @@ from app.services.wallet_service import (
 )
 from app.utils.logger import logger, mask_phone
 from app.ai.image_generation_manager import generation_capacity_blocked
-from app.utils.executors import run_cpu
+from app.utils.executors import run_cpu, run_io
 from app.utils.phone import same_phone
 from app.services.message_dedupe import claim_message, release_messages
 
@@ -795,7 +795,8 @@ async def _handle_product_choice(
     # are not counted against the daily cap, and dry-run makes no provider calls.
     if not _mws.DRY_RUN_IMAGE_MODE and not (customer is not None and ent.is_admin(customer)):
         needed = 1 if product == PRODUCT_WHITE_BG else _mws.pack_generation_count()
-        no_capacity = generation_capacity_blocked(needed)
+        db.commit()           # end this transaction first: the counter lookup below needs its own connection
+        no_capacity = await run_io(generation_capacity_blocked, needed)
         if no_capacity:
             logger.warning(f"Order {ingestion_id} declined before charging: {no_capacity}")
             db.query(WhatsAppIngestion).filter(
@@ -1252,7 +1253,7 @@ async def receive_webhook(
         "Re-runs the 7-style catalog pack and attempts delivery again."
     ),
 )
-async def retry_delivery(
+def retry_delivery(
     ingestion_id: str,
     background_tasks: BackgroundTasks,
     current_user: Any = Depends(require_auth),
@@ -1362,7 +1363,7 @@ async def retry_delivery(
     "/webhook/status/{ingestion_id}",
     summary="Check ingestion status",
 )
-async def get_ingestion_status(
+def get_ingestion_status(
     ingestion_id: str,
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
@@ -1414,7 +1415,7 @@ async def webhook_health() -> Dict[str, Any]:
         "included. Target ceiling: 15%."
     ),
 )
-async def get_generation_failure_rate(
+def get_generation_failure_rate(
     window_hours: int = 24,
     current_user: Any = Depends(require_auth),
     db: Session = Depends(get_db),

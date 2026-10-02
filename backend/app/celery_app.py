@@ -51,6 +51,10 @@ celery_app.conf.update(
     # Retry policy for broker connection
     broker_connection_retry_on_startup=True,
     broker_connection_max_retries=10,
+    # Time limits (Q-4): a hung AI call can never keep a worker forever. The soft limit raises inside the task
+    # first (so it can record the failure); the hard limit then kills it.
+    task_soft_time_limit=settings.CELERY_TASK_SOFT_TIME_LIMIT_SECONDS,
+    task_time_limit=settings.CELERY_TASK_TIME_LIMIT_SECONDS,
 )
 
 

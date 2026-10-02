@@ -214,8 +214,7 @@ class RazorpayLinkSweepTests(_Base):
     def test_creating_a_link_records_it(self):
         import asyncio
         link = {"id": "plink_new", "short_url": "https://rzp.io/x"}
-        client = type("C", (), {"payment_link": type("P", (), {"create": staticmethod(lambda payload: link)})})()
-        with patch.object(razorpay_service, "get_razorpay_client", return_value=client), \
+        with patch.object(razorpay_service, "_post_payment_link", new=AsyncMock(return_value=link)), \
              patch("app.database.SessionLocal", self.Session):
             url = asyncio.run(razorpay_service.create_recharge_payment_link("+91 98123 45678", "T", 500))
         self.assertEqual(url, "https://rzp.io/x")

@@ -25,7 +25,7 @@ router = APIRouter(prefix="/api/history", tags=["History"])
     summary="Get analysis history",
     description="Get paginated list of all previous jewellery analyses.",
 )
-async def get_history(
+def get_history(
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
     status: Optional[str] = Query(None, description="Filter by status"),
@@ -51,7 +51,7 @@ async def get_history(
     summary="Get history statistics",
     description="Get aggregate statistics about analysis history.",
 )
-async def get_history_stats(
+def get_history_stats(
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user),
 ):
@@ -67,7 +67,7 @@ async def get_history_stats(
     summary="Get history item",
     description="Get a specific history entry by ID.",
 )
-async def get_history_item(
+def get_history_item(
     history_id: str,
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user),
@@ -92,7 +92,7 @@ async def get_history_item(
     summary="Delete history item",
     description="Delete a specific history entry by ID.",
 )
-async def delete_history_item(
+def delete_history_item(
     history_id: str,
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user),

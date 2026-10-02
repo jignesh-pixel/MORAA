@@ -26,7 +26,7 @@ router = APIRouter(prefix="/api/auth", tags=["Authentication"])
     summary="Register a new user",
     description="Create a new user account with email, username, and password.",
 )
-async def signup(request: SignupRequest, db: Session = Depends(get_db)):
+def signup(request: SignupRequest, db: Session = Depends(get_db)):
     """Register a new user account."""
     if not settings.ALLOW_SIGNUP:
         raise HTTPException(
@@ -51,7 +51,7 @@ async def signup(request: SignupRequest, db: Session = Depends(get_db)):
     summary="User login",
     description="Authenticate with username and password to receive JWT tokens.",
 )
-async def login(request: LoginRequest, db: Session = Depends(get_db)):
+def login(request: LoginRequest, db: Session = Depends(get_db)):
     """Authenticate user and return JWT tokens."""
     service = AuthService(db)
     try:
@@ -70,7 +70,7 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)):
     summary="Refresh access token",
     description="Get a new access token using a valid refresh token.",
 )
-async def refresh_token(request: RefreshTokenRequest, db: Session = Depends(get_db)):
+def refresh_token(request: RefreshTokenRequest, db: Session = Depends(get_db)):
     """Refresh an expired access token."""
     service = AuthService(db)
     try:

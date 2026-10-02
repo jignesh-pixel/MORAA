@@ -22,6 +22,7 @@ from app.models.wallet_transaction import WalletTransaction
 from app.models.processed_message import ProcessedMessage
 from app.models.pending_payment import PendingPayment
 from app.models.razorpay_payment_link import RazorpayPaymentLink
+from app.models.generation_spend import GenerationSpend
 
 __all__ = [
     "WalletTransaction",

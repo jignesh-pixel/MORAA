@@ -132,7 +132,8 @@ class WorkerCannotDeliverASweptOrderTests(RecoveryBase):
 class RetryCannotGiveAFreeOrderTests(RecoveryBase):
     def _retry(self, ingestion_id):
         tasks = MagicMock()
-        return asyncio.run(meta_webhook.retry_delivery(ingestion_id, tasks, current_user=object(), db=self.db)), tasks
+        # retry_delivery is a plain function now (FastAPI runs it on a worker thread), not a coroutine
+        return meta_webhook.retry_delivery(ingestion_id, tasks, current_user=object(), db=self.db), tasks
 
     def test_retry_of_a_refunded_order_is_refused(self):
         customer = self.make_customer(1000)

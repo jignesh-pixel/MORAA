@@ -14,6 +14,7 @@ A burst of one kind queues behind its own pool and cannot take threads from the 
 import asyncio
 import functools
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Optional, TypeVar
 
@@ -29,8 +30,14 @@ _net_pool: Optional[ThreadPoolExecutor] = None
 def _cpu() -> ThreadPoolExecutor:
     global _cpu_pool
     if _cpu_pool is None:
-        workers = int(settings.CPU_WORKER_THREADS or 0) or min(8, (os.cpu_count() or 2) + 2)
+        # Leave one core free for the event loop: image work is CPU-bound, and when every core is busy the loop
+        # thread is not scheduled for ~100 ms (measured: all cores busy stalled the loop 100-200 ms, one core
+        # left free about 20 ms).
+        workers = int(settings.CPU_WORKER_THREADS or 0) or max(1, min(4, (os.cpu_count() or 2) - 1))
         _cpu_pool = ThreadPoolExecutor(max_workers=max(workers, 1), thread_name_prefix="moraa-cpu")
+        # While CPU threads run, Python hands the interpreter to the event loop only every 5 ms by default; a
+        # shorter interval lets the loop thread get back in sooner, which keeps requests responsive.
+        sys.setswitchinterval(0.001)
     return _cpu_pool
 
 

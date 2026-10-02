@@ -151,6 +151,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.bind(category="system").warning(f"Paid-order recovery sweep not started: {e}")
 
+    # Everything imported and created so far lives for the whole life of the process. Freezing it keeps
+    # Python's garbage collector from re-scanning it on every full collection, which paused the event loop for
+    # 50-100 ms at a time under load (standard practice for long-running web servers).
+    import gc
+
+    gc.collect()
+    gc.freeze()
+
     yield
 
     # Shutdown

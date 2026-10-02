@@ -807,6 +807,12 @@ async def tap2(wa: str, iid: str) -> bool:
 
 
 async def lag_run(label: str, coro_factory: Callable[[], Awaitable[Any]]) -> Dict[str, Any]:
+    # Collect the previous probe's multi-MB garbage BEFORE measuring, so a garbage-collection pause caused by
+    # an earlier probe is not blamed on this one.
+    import gc
+
+    gc.collect()
+    gc.freeze()           # like the application after startup (see app/main.py): long-lived objects are not rescanned
     t0 = time.perf_counter()
     async with LoopLagMonitor() as mon:
         await coro_factory()

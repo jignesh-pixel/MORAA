@@ -197,7 +197,7 @@ async def analyze_image(
     summary="Get analysis result",
     description="Retrieve the result of a completed jewellery analysis.",
 )
-async def get_analysis(
+def get_analysis(
     analysis_id: str,
     db: Session = Depends(get_db),
 ):
@@ -233,7 +233,7 @@ async def get_analysis(
     summary="List all analyses",
     description="Get a list of all completed analyses.",
 )
-async def list_analyses(
+def list_analyses(
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user),
 ):
@@ -323,7 +323,7 @@ async def regenerate_analysis(
         "processing steps, tool executions, and audit events. (Part 12)"
     ),
 )
-async def get_analysis_timeline(
+def get_analysis_timeline(
     analysis_id: str,
     db: Session = Depends(get_db),
 ):

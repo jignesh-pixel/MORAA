@@ -172,7 +172,7 @@ class ProductChoiceAtomicityTests(LedgerTestBase):
 
         def flaky_commit():
             calls["n"] += 1
-            if calls["n"] == 2:                               # 1 = claim, 2 = debit + status
+            if calls["n"] == 3:                               # 1 = claim, 2 = release before the capacity check, 3 = debit + status
                 raise RuntimeError("simulated crash between debit and status")
             return real_commit()
 
@@ -193,7 +193,7 @@ class ProductChoiceAtomicityTests(LedgerTestBase):
         def commit_then_error():
             calls["n"] += 1
             real_commit()
-            if calls["n"] == 2:                               # the commit DID reach the server, then the link dropped
+            if calls["n"] == 3:                               # (1 claim, 2 capacity-check release) the debit commit DID reach the server, then the link dropped
                 raise RuntimeError("connection dropped at COMMIT")
 
         with patch.object(self.db, "commit", side_effect=commit_then_error):

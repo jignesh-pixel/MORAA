@@ -15,6 +15,7 @@ The manager provides a single ``generate_image()`` entry point that:
 import asyncio
 import random
 import re
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -27,6 +28,8 @@ from app.ai.providers.openai_image_provider import OpenAIImageProvider
 from app.ai.marketplaces.registry import get_marketplace_presentation
 from app.ai.product_fidelity import REFERENCE_PRIORITY_BLOCK, evaluate_fidelity
 from app.config import settings
+from app.services import spend_counter
+from app.utils.executors import run_io
 from app.utils.logger import logger
 
 
@@ -218,22 +221,90 @@ _spend_day: Optional[str] = None
 _spend_count: int = 0
 
 
+_spend_lock = threading.Lock()
+
+
+def _today() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def _counts_against_cap() -> bool:
+    """True when the cap is a real number (otherwise nothing was counted, so there is nothing to give back)."""
+    cap = getattr(settings, "MAX_GENERATIONS_PER_DAY", None)
+    return isinstance(cap, int) and not isinstance(cap, bool)
+
+
 def _spend_check(count: int, consume: bool) -> Optional[str]:
-    """The one rule for the kill switch and the daily cap; ``consume`` decides whether slots are taken."""
+    """The one rule for the kill switch and the daily cap; ``consume`` decides whether slots are taken.
+
+    The count is shared by every server process through the database (``spend_counter``). If the database
+    cannot answer, the in-process counter below is used instead, so a counter problem never blocks customers.
+    """
     global _spend_day, _spend_count
     if getattr(settings, "GENERATION_ENABLED", True) is False:
         return "Image generation is disabled (GENERATION_ENABLED=false)"
     cap = getattr(settings, "MAX_GENERATIONS_PER_DAY", None)
     if isinstance(cap, bool) or not isinstance(cap, int):
         return None  # no valid cap configured -- never throttle on a bad value
-    today = time.strftime("%Y-%m-%d", time.gmtime())
-    if _spend_day != today:
-        _spend_day, _spend_count = today, 0
-    if _spend_count + max(count, 1) > max(cap, 1):
-        return "Daily image-generation cap reached (MAX_GENERATIONS_PER_DAY)"
+    today = _today()
+    n = max(count, 1)
     if consume:
-        _spend_count += max(count, 1)
+        shared = spend_counter.reserve(today, n, max(cap, 1))
+    else:
+        already = spend_counter.used(today)
+        shared = None if already is None else already + n <= max(cap, 1)
+    if shared is True:
+        return None
+    if shared is False:
+        return "Daily image-generation cap reached (MAX_GENERATIONS_PER_DAY)"
+    with _spend_lock:
+        if _spend_day != today:
+            _spend_day, _spend_count = today, 0
+        if _spend_count + n > max(cap, 1):
+            return "Daily image-generation cap reached (MAX_GENERATIONS_PER_DAY)"
+        if consume:
+            _spend_count += n
     return None
+
+
+def current_spend_day() -> str:
+    """Today's UTC date as used by the spend counter. Capture it when slots are taken and pass it to
+    ``release_generation_slots``, so a release after midnight UTC still credits the day that was charged."""
+    return _today()
+
+
+def release_generation_slots(count: int, day: Optional[str] = None) -> None:
+    """Give back slots that were taken for calls that failed (the daily ceiling counts only real spend).
+
+    ``day`` is the day the slots were taken on (default: today)."""
+    global _spend_count
+    n = max(int(count), 0)
+    if not n or not _counts_against_cap():
+        return
+    charged_day = day or _today()
+    if spend_counter.release(charged_day, n) is True:
+        return
+    with _spend_lock:
+        if _spend_day == charged_day:           # the in-process counter only holds the current day
+            _spend_count = max(_spend_count - n, 0)
+
+
+def record_external_spend(count: int = 1) -> None:
+    """Count paid AI calls made outside ``generate_image`` (the photo pre-check) toward today's total.
+
+    Only counted, never blocked: refusing a customer's photo because the cap is full would be worse than
+    letting the count run slightly over; the generation calls themselves are what the cap stops."""
+    global _spend_day, _spend_count
+    if not _counts_against_cap():
+        return
+    n = max(int(count), 1)
+    if spend_counter.reserve(_today(), n, None) is True:
+        return
+    with _spend_lock:
+        today = _today()
+        if _spend_day != today:
+            _spend_day, _spend_count = today, 0
+        _spend_count += n
 
 
 def _spend_blocked(count: int = 1) -> Optional[str]:
@@ -392,6 +463,36 @@ class ImageGenerationManager:
         marketplace: Optional[str] = None,
         spend_reserved: bool = False,
     ) -> ImageGenerationResult:
+        """Generate one image (see ``_generate_image_inner``). A slot this call took from the daily counter is
+        given back if the call ends in failure, so failed generations do not eat the daily ceiling (COST-1)."""
+        state: Dict[str, Any] = {}
+        succeeded = False
+        try:
+            result = await self._generate_image_inner(
+                prompt, context, force_provider, reference_image, reference_mime_type, marketplace,
+                spend_reserved, state,
+            )
+            succeeded = bool(result.success)
+            return result
+        finally:
+            # Also when the call is cancelled or raises: a slot is kept only by a call that produced an image.
+            if state.get("slot_taken") and not succeeded:
+                try:
+                    await run_io(release_generation_slots, 1, state.get("day"))
+                except BaseException:  # noqa: BLE001 -- giving a slot back must never mask the real outcome
+                    pass
+
+    async def _generate_image_inner(
+        self,
+        prompt: str,
+        context: Optional[Dict[str, Any]],
+        force_provider: Optional[str],
+        reference_image: Optional[bytes],
+        reference_mime_type: str,
+        marketplace: Optional[str],
+        spend_reserved: bool,
+        state: Dict[str, Any],
+    ) -> ImageGenerationResult:
         context = dict(context) if context else {}
         request_id = context.get("request_id", "unknown")
 
@@ -404,7 +505,10 @@ class ImageGenerationManager:
                 else None
             )
         else:
-            blocked = _spend_blocked()
+            # The shared counter is a database call: keep it off the event loop.
+            state["day"] = _today()                 # the day this slot is charged to (for a later release)
+            blocked = await run_io(_spend_blocked)
+            state["slot_taken"] = blocked is None and _counts_against_cap()
         if blocked:
             logger.error(f"ImageGenerationManager: {blocked} -- no provider called request_id={request_id}")
             return ImageGenerationResult(
