@@ -116,6 +116,20 @@ def evaluate_alerts(db: Session) -> List[Alert]:
                 f"refund them, but something is slowing orders down.",
             ))
 
+    def daily_cost() -> None:
+        limit = int(settings.OPS_ALERT_DAILY_COST_RUPEES or 0)
+        if limit <= 0:
+            return
+        from app.services import provider_call_log
+
+        today = provider_call_log.todays_summary(db)
+        if today["rupees"] >= limit:
+            alerts.append(Alert(
+                "daily_cost",
+                f"Moraa alert: today's estimated AI image spend is about Rs {today['rupees']:,} "
+                f"({today['calls']} calls), past your Rs {limit:,} warning line.",
+            ))
+
     def dead_jobs() -> None:
         from app.models.outbox_job import DEAD, OutboxJob
 
@@ -127,7 +141,7 @@ def evaluate_alerts(db: Session) -> List[Alert]:
                 f"failures and need a look.",
             ))
 
-    for check in (failure_rate, spend, parked_payments, review_rows, stuck_orders, dead_jobs):
+    for check in (failure_rate, spend, parked_payments, review_rows, stuck_orders, dead_jobs, daily_cost):
         guarded(check)
     return alerts
 

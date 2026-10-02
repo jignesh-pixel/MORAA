@@ -91,7 +91,7 @@ from app.services.wallet_service import (
     get_customer,
     price_per_image,
 )
-from app.services import data_lifecycle, eta_service
+from app.services import consent_service, data_lifecycle, eta_service
 from app.utils.logger import logger, mask_phone
 from app.ai.image_generation_manager import generation_capacity_blocked
 from app.utils.executors import run_cpu, run_io
@@ -626,6 +626,10 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
     caption = event.get("caption", "")
     timestamp = event.get("timestamp", "")
 
+    # Nothing about this customer or photo is stored until they have agreed to the data notice (PRIV-2).
+    if await _consent_gate(db, sender, message_id):
+        return None
+
     # CLAIM the message first. external_message_id is UNIQUE, so a Meta retry
     # or a concurrent copy of this delivery stops here and never reaches the
     # balance message, the AI pre-check or a second set of buttons.
@@ -750,6 +754,18 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
 
 # ingestion id -> outbox job id, for orders recorded in the outbox but not yet handed to a background task.
 _recorded_runs: Dict[str, int] = {}
+
+
+async def _consent_gate(db: Session, sender: str, reply_to_message_id: Optional[str] = None) -> bool:
+    """True when this number has not yet agreed to the data notice: the notice was (re)sent and the caller must stop
+    here, collecting nothing (PRIV-2). Always False while the consent step is switched off."""
+    if not consent_service.is_active():
+        return False
+    if consent_service.has_consented(db, sender):
+        return False
+    if not await consent_service.ask_for_consent(sender, reply_to_message_id):
+        logger.warning(f"Consent notice could not be sent to {mask_phone(sender)}")
+    return True
 
 
 async def _handle_erasure_command(db: Session, sender: str, raw_text: str) -> None:
@@ -1214,6 +1230,8 @@ async def receive_webhook(
                     continue
 
                 if "name:" in lower_text and any(k in lower_text for k in ("business", "brand", "gst", "city", "address")):
+                    if await _consent_gate(db, sender):
+                        continue
                     parsed = _parse_registration_text(raw_text)
                     user_name = parsed["name"]
                     biz_name = parsed["business"]
@@ -1241,6 +1259,8 @@ async def receive_webhook(
                     continue
 
                 if re.search(r"\b(hi|hii|hello|hey|start)\b", lower_text):
+                    if await _consent_gate(db, sender):
+                        continue
                     # Two separate messages: welcome first, then the form.
                     # New / unregistered senders get the registration Flow;
                     # when it is not configured or Meta rejects it (and for
@@ -1314,6 +1334,14 @@ async def receive_webhook(
                 sender = event.get("sender", "")
 
                 if await handle_gst_button(db, sender, b_id, on_complete=_confirmation_for(db, sender)):
+                    continue
+
+                if b_id in (consent_service.CONSENT_YES, consent_service.CONSENT_NO):
+                    if b_id == consent_service.CONSENT_YES:
+                        consent_service.record_consent(db, sender)
+                        await send_whatsapp_text(sender, consent_service.AGREED_MESSAGE)
+                    else:
+                        await send_whatsapp_text(sender, consent_service.DECLINED_MESSAGE)
                     continue
 
                 product_choice = parse_product_button_id(b_id)

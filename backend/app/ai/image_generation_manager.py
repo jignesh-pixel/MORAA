@@ -30,7 +30,7 @@ from app.ai.providers.openai_image_provider import OpenAIImageProvider
 from app.ai.marketplaces.registry import get_marketplace_presentation
 from app.ai.product_fidelity import REFERENCE_PRIORITY_BLOCK, evaluate_fidelity
 from app.config import settings
-from app.services import metrics, spend_counter
+from app.services import metrics, provider_call_log, spend_counter
 from app.utils.executors import run_io
 from app.utils.logger import logger
 
@@ -565,9 +565,17 @@ class ImageGenerationManager:
                 metadata={"local_limit": True},
             )
         async with gate_for_current_loop().slot(generation_priority.get()):
-            return await self._call_provider_once(
+            result = await self._call_provider_once(
                 provider, prompt, context, reference_image, reference_mime_type, request_id
             )
+        try:
+            await run_io(
+                provider_call_log.record, provider_name, getattr(result, "model_used", None), bool(result.success),
+                float(getattr(result, "processing_time", 0.0) or 0.0), result.error, request_id,
+            )
+        except Exception:  # noqa: BLE001 -- the cost log must never affect an order
+            pass
+        return result
 
     async def generate_image(
         self,

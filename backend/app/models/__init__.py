@@ -26,6 +26,8 @@ from app.models.generation_spend import GenerationSpend
 from app.models.revoked_token import RevokedToken
 from app.models.outbox_job import OutboxJob
 from app.models.scheduler_lease import SchedulerLease
+from app.models.consent_record import ConsentRecord
+from app.models.provider_call import ProviderCall
 
 __all__ = [
     "WalletTransaction",
