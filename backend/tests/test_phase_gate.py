@@ -80,7 +80,7 @@ class PhaseGateTests(unittest.TestCase):
 
         expected = json.loads((BACKEND / "tests" / "load_scenarios" / "expected_verdicts.json").read_text(encoding="utf-8"))
         scenarios = {k for k in expected if not k.startswith("_")}
-        self.assertEqual(scenarios, set("abcdefghik"))
+        self.assertEqual(scenarios, set("abcdefghikl"))
         self.assertTrue(all(v in ("PASS", "WARN", "FAIL") for k, v in expected.items() if not k.startswith("_")))
 
 
