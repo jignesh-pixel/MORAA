@@ -58,3 +58,11 @@ Approved: production upgrade in principle (timing still to be agreed, after veri
 privacy notice (without the AI-abroad and how-to-delete lines), 90-day retention, 3 orders per customer, bulk photo orders, Sentry, alert numbers
 919699899825 and 919820666332, paid GST verification (vendor still to be chosen). Built since: bulk orders (migration 0020), configurable GST vendor,
 verified-only GSTIN on invoices, `docs/ENV_TO_ADD.md`. Still open: items 3, 4, 7, 10, 13 and parts of 11/12 (see the owner message in the chat).
+
+## Phase 7 - WhatsApp chat dashboard (branch `phase-7-dashboard`, tag `phase-7-gate-passed-except-timing`)
+Built 2026-10-03: record of every message, image we produced and invoice (migration 0021), read-only API with signed image links, Google sign-in, Drive archive
+(off until configured), Next.js "WhatsApp Chats" page (chats, profile, weekly audit, zoom viewer), retention and erasure of the chat record. Independent review done and fixed.
+Tests: SQLite 1176, PostgreSQL 1197 pass; prompts unchanged. Load checks h (loop stalls) and i (memory per image) pass when the laptop runs at full speed (13 s / 1.1 MB) and fail
+when its CPU is throttled (about 62% performance: 27-34 s / 2.6-3.1 MB); the older phase 6 code behaves identically in that state, so it is the machine. Re-run on a cool machine or in CI.
+New load scenario l measures the dashboard record's own cost (3 MB write = 7.5 ms, worst loop stall 22 ms, nothing left in memory).
+Verification gate reports: docs/phase-gates/verification-2026-10-03/. Still needed before any phase counts as locked: production upgrade (migrations 0009-0021), CI green, h/i re-run.
