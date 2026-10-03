@@ -293,3 +293,43 @@ class RecoveryPatienceTests(_Base):
             self.db.commit()
             self.assertEqual(asyncio.run(mws.recover_stuck_paid_orders(timedelta(minutes=10))), 1)
         self.assertIsNotNone(customer)
+
+
+class NeverStrandedTests(_Base):
+    def setUp(self):
+        super().setUp()
+        self.single = AsyncMock(return_value=True)
+        p = patch("app.services.meta_whatsapp_service.send_product_selection_buttons", new=self.single)
+        p.start()
+        self.addCleanup(p.stop)
+        self.make_customer(1000)
+
+    def test_a_held_photo_left_alone_gets_its_ordinary_buttons(self):
+        # photo A was chosen by the customer meanwhile; photo B was held and is now the only one waiting
+        a, b = self.photos(2)
+        a.status = "choice_claimed"
+        b.group_id = bulk_orders.HELD
+        self.db.commit()
+        self.assertFalse(asyncio.run(bulk_orders.send_group_prompt(SENDER)))
+        self.assertEqual(self.single.await_count, 1)
+        self.assertEqual(self.single.await_args.kwargs["ingestion_id"], b.id)
+        self.db.expire_all()
+        self.assertIsNone(self.db.get(WhatsAppIngestion, b.id).group_id)
+
+    def test_a_failed_group_prompt_gives_every_photo_its_ordinary_buttons_again(self):
+        rows = self.photos(3)
+        for r in rows:
+            r.group_id = bulk_orders.HELD
+        self.db.commit()
+        self.buttons.return_value = False
+        self.assertFalse(asyncio.run(bulk_orders.send_group_prompt(SENDER)))
+        self.assertEqual(self.single.await_count, 3)
+        self.db.expire_all()
+        self.assertEqual({r.group_id for r in self.db.query(WhatsAppIngestion)}, {None})
+
+    def test_a_customer_still_sending_is_not_released(self):
+        a, = self.photos(1, age_seconds=1)
+        a.group_id = bulk_orders.HELD
+        self.db.commit()
+        asyncio.run(bulk_orders.send_group_prompt(SENDER))
+        self.single.assert_not_awaited()

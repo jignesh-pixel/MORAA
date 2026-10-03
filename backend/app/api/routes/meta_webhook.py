@@ -743,10 +743,12 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
         and not (ent.is_admin(customer) or ent.has_trial_credits(customer))
         and bulk_orders.is_burst(db, ingestion)
     ):
+        ingestion.group_id = bulk_orders.HELD         # held back until the group prompt (or released to normal buttons)
         db.commit()
         if await bulk_orders.schedule_prompt(sender, new_ingestion_id):
             return new_ingestion_id
-        # could not schedule the group prompt: fall through to the ordinary buttons
+        ingestion.group_id = None                     # could not schedule the group prompt: ordinary buttons below
+        db.commit()
 
     # Re-read the balance at send time: download + AI pre-check can take
     # ~10 s, and a payment or another order may have committed meanwhile.
@@ -798,7 +800,9 @@ def _queue_bulk_runs(background_tasks: BackgroundTasks, jobs: List[Tuple[Any, st
         if settings.OUTBOX_ENABLED:
             from app.services import outbox
 
-            job_id = _recorded_runs.pop(ingestion_id, None) or outbox.enqueue_order_run("white", ingestion_id)
+            # A long delay: the bounded runner below starts these; the outbox sweep must not start them all at once.
+            job_id = _recorded_runs.pop(ingestion_id, None) or outbox.enqueue_order_run(
+                "white", ingestion_id, delay_seconds=900)
         runs.append((worker, ingestion_id, job_id))
     background_tasks.add_task(_run_bulk_jobs, runs)
 

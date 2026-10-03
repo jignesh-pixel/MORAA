@@ -18,7 +18,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
-from sqlalchemy import update
+from sqlalchemy import or_, update
 
 from app.config import settings
 from app.models.whatsapp_ingestion import WhatsAppIngestion
@@ -28,6 +28,7 @@ from app.utils.logger import logger, mask_phone
 BULK_OK = "gv_bulk_ok"
 BULK_NO = "gv_bulk_no"
 OUTBOX_KIND = "burst_prompt"
+HELD = "pending"          # group_id of a photo whose own buttons were held back until the group prompt
 
 
 def _now() -> datetime:
@@ -59,7 +60,7 @@ def is_burst(db, ingestion: WhatsAppIngestion) -> bool:
     return db.query(WhatsAppIngestion.id).filter(
         WhatsAppIngestion.external_user_id == ingestion.external_user_id,
         WhatsAppIngestion.status == "awaiting_choice",
-        WhatsAppIngestion.group_id.is_(None),
+        or_(WhatsAppIngestion.group_id.is_(None), WhatsAppIngestion.group_id == HELD),
         WhatsAppIngestion.id != ingestion.id,
         WhatsAppIngestion.created_at >= since,
     ).first() is not None
@@ -75,7 +76,8 @@ def prepare_group(sender: str) -> Optional[Tuple[str, int]]:
         rows = (
             db.query(WhatsAppIngestion.id, WhatsAppIngestion.created_at)
             .filter(WhatsAppIngestion.external_user_id == sender, WhatsAppIngestion.status == "awaiting_choice",
-                    WhatsAppIngestion.group_id.is_(None), WhatsAppIngestion.created_at >= lookback)
+                    or_(WhatsAppIngestion.group_id.is_(None), WhatsAppIngestion.group_id == HELD),
+                    WhatsAppIngestion.created_at >= lookback)
             .order_by(WhatsAppIngestion.created_at)
             .limit(int(settings.BULK_MAX_PHOTOS))
             .all()
@@ -89,7 +91,7 @@ def prepare_group(sender: str) -> Optional[Tuple[str, int]]:
         claimed = db.execute(
             update(WhatsAppIngestion)
             .where(WhatsAppIngestion.id.in_([r[0] for r in rows]), WhatsAppIngestion.status == "awaiting_choice",
-                   WhatsAppIngestion.group_id.is_(None))
+                   or_(WhatsAppIngestion.group_id.is_(None), WhatsAppIngestion.group_id == HELD))
             .values(group_id=group_id)
         ).rowcount
         db.commit()
@@ -106,12 +108,61 @@ def _balance_and_price(sender: str) -> Tuple[int, int]:
     return balance, max(int(settings.WHITE_BG_PRICE_RUPEES), 1)
 
 
+def release_held_photos(sender: str, group_id: Optional[str] = None) -> list:
+    """(blocking, own session) Give held photos back their ordinary per-photo buttons. With ``group_id`` it undoes a
+    group whose prompt could not be sent; without it, it frees photos still marked as held once the customer has gone
+    quiet (for example the other photo of the burst was already chosen). Returns [(ingestion_id, message_id)] of the
+    photos to send buttons for."""
+    from app.database import SessionLocal
+
+    with SessionLocal() as db:
+        if group_id is None:
+            lookback = _now() - timedelta(minutes=int(settings.BULK_LOOKBACK_MINUTES))
+            waiting = db.query(WhatsAppIngestion.created_at).filter(
+                WhatsAppIngestion.external_user_id == sender, WhatsAppIngestion.status == "awaiting_choice",
+                or_(WhatsAppIngestion.group_id.is_(None), WhatsAppIngestion.group_id == HELD),
+                WhatsAppIngestion.created_at >= lookback,
+            ).all()
+            if waiting and _now() - max(_aware(r[0]) for r in waiting) < timedelta(seconds=int(settings.BULK_QUIET_SECONDS) - 1):
+                return []                                  # still sending
+            marker = WhatsAppIngestion.group_id == HELD
+        else:
+            marker = WhatsAppIngestion.group_id == group_id
+        rows = db.query(WhatsAppIngestion.id, WhatsAppIngestion.external_message_id).filter(
+            WhatsAppIngestion.external_user_id == sender, WhatsAppIngestion.status == "awaiting_choice", marker,
+        ).all()
+        if not rows:
+            return []
+        db.execute(update(WhatsAppIngestion).where(WhatsAppIngestion.id.in_([r[0] for r in rows]), marker)
+                   .values(group_id=None))
+        db.commit()
+        return [(r[0], r[1]) for r in rows]
+
+
+async def send_single_buttons(sender: str, photos: list) -> None:
+    """The ordinary product-choice buttons for each photo (the pre-bulk behaviour)."""
+    from app.services.meta_whatsapp_service import send_product_selection_buttons
+    from app.services.wallet_service import price_per_image
+
+    balance, white_price = await run_io(_balance_and_price, sender)
+    pack_price = await run_io(price_per_image)
+    for ingestion_id, message_id in photos:
+        await send_product_selection_buttons(
+            recipient_id=sender, ingestion_id=ingestion_id, white_price=white_price, pack_price=pack_price,
+            balance=balance, reply_to_message_id=message_id,
+        )
+
+
 async def send_group_prompt(sender: str) -> bool:
-    """Send the one "N photos, Rs X: confirm?" message if this number's photos are ready to be grouped."""
+    """Send the one "N photos, Rs X: confirm?" message if this number's photos are ready to be grouped. A held photo
+    is never left without buttons: if it ends up alone, or the prompt cannot be sent, it gets its ordinary buttons."""
     from app.services.meta_whatsapp_service import send_reply_buttons
 
     group = await run_io(prepare_group, sender)
     if group is None:
+        freed = await run_io(release_held_photos, sender)
+        if freed:
+            await send_single_buttons(sender, freed)
         return False
     group_id, count = group
     balance, price = await run_io(_balance_and_price, sender)
@@ -126,7 +177,10 @@ async def send_group_prompt(sender: str) -> bool:
         [(bulk_button_id(BULK_OK, group_id), f"Confirm ₹{total:,}"), (bulk_button_id(BULK_NO, group_id), "Cancel")],
     )
     if not sent:
-        logger.error(f"Bulk prompt not sent to {mask_phone(sender)} (group of {count})")
+        logger.error(f"Bulk prompt not sent to {mask_phone(sender)} (group of {count}); falling back to per-photo buttons")
+        freed = await run_io(release_held_photos, sender, group_id)
+        if freed:
+            await send_single_buttons(sender, freed)
     return bool(sent)
 
 

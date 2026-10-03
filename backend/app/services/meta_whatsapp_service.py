@@ -2089,13 +2089,20 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
                 if blocked:
                     return await _fail(f"Generation blocked: {blocked}")
                 admin_key = admin_spend_key()
-            result = await ImageGenerationManager().generate_image(
-                prompt=build_ecommerce_shot_prompt(),
-                context={"request_id": order_request_id, "aspect_ratio": "1:1"},
-                reference_image=reference_image_bytes,
-                reference_mime_type=reference_mime_type,
-                **({"spend_reserved": True} if admin_order else {}),
-            )
+            try:
+                result = await ImageGenerationManager().generate_image(
+                    prompt=build_ecommerce_shot_prompt(),
+                    context={"request_id": order_request_id, "aspect_ratio": "1:1"},
+                    reference_image=reference_image_bytes,
+                    reference_mime_type=reference_mime_type,
+                    **({"spend_reserved": True} if admin_order else {}),
+                )
+            except BaseException:
+                if admin_key:
+                    from app.ai.image_generation_manager import release_admin_slots
+
+                    await run_io(release_admin_slots, 1, admin_key)     # a raised call does not use up the team ceiling
+                raise
             if admin_key and not result.success:
                 from app.ai.image_generation_manager import release_admin_slots
 
