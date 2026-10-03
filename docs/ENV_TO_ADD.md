@@ -36,3 +36,19 @@ Notes:
 - Razorpay offers a free GST lookup web page but no public API for it, so a separate vendor is needed (for example Cashfree
   Verification, Appyflow, Surepass or gstinapi.in; typical price is a few paise to two rupees per lookup). Tell us which one you open
   an account with and we will test it with their key.
+
+## ERPNext invoices (decision 2026-10-03: ERPNext is the only invoice source)
+```
+ERPNEXT_INVOICE_ENABLED=true
+ERPNEXT_BASE_URL=<your ERPNext address>
+ERPNEXT_API_KEY=<key>
+ERPNEXT_API_SECRET=<secret>
+ERPNEXT_COMPANY=<company name in ERPNext>
+ERPNEXT_RECHARGE_ITEM_CODE=<item code used for wallet recharges>
+ERPNEXT_TAX_TEMPLATE=<GST template name>
+ERPNEXT_DEFAULT_DEBTORS_ACCOUNT=<account>
+ERPNEXT_PAYMENT_ACCOUNT=<account>
+ERPNEXT_MODE_OF_PAYMENT=Razorpay
+```
+With this on there is no local PDF fallback: if ERPNext is down, the customer still gets the "payment received" message and the invoice
+is retried automatically (6 tries over about two hours, then you get an alert).
