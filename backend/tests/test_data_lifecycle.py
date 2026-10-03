@@ -75,6 +75,18 @@ class RetentionTests(_Base):
         self.assertEqual(details["a"], "paid by 91******5678")
         self.assertEqual(details["b"], "paid by 919812345678")
 
+    def test_masking_reaches_rows_beyond_the_first_page_and_spares_pending_reviews(self):
+        for i in range(7):
+            self.db.add(AuditLog(action="x", status="success", details=f"p 91981234567{i}", resource_id=f"r{i}"))
+        self.db.add(AuditLog(action="razorpay_payment_review", status="pending", details="payer 919812345678", resource_id="keep"))
+        self.db.commit()
+        self.db.query(AuditLog).update({"created_at": OLD})
+        self.db.commit()
+        self.assertEqual(dl.mask_old_audit_details(self.db, days=30, batch=3), 7)
+        self.db.expire_all()
+        keep = self.db.query(AuditLog).filter(AuditLog.resource_id == "keep").one()
+        self.assertEqual(keep.details, "payer 919812345678")
+
     def test_the_pass_does_nothing_unless_enabled(self):
         with patch.object(settings, "RETENTION_ENABLED", False):
             self.assertEqual(dl.run_retention_pass(), {"photos": 0, "audit_rows": 0})
@@ -129,6 +141,23 @@ class ErasureTests(_Base):
         self.assertEqual(self.db.query(WalletTransaction).count(), ledger_rows)       # the money trail is intact
         self.assertEqual(self.db.query(AuditLog).filter(AuditLog.action == dl.ERASED_ACTION).count(), 1)
         assert_ledger_matches_balances(self, self.db)
+
+    def test_erasure_waits_while_an_order_is_in_progress(self):
+        customer = self.make_customer(0)
+        self.make_ingestion(status="processing", message_id="wamid.busy")
+        with self.assertRaises(dl.ErasureRefused) as ctx:
+            dl.erase_customer(self.db, customer)
+        self.assertIn("in progress", str(ctx.exception))
+        self.db.expire_all()
+        self.assertEqual(self.db.get(Customer, customer.id).full_name, "T")
+
+    def test_a_longer_number_containing_the_phone_is_not_rewritten(self):
+        customer = self.make_customer(0)
+        self.db.add(AuditLog(action="note", status="success", details="ref 99" + SENDER + "7 ok", resource_id="long"))
+        self.db.commit()
+        dl.erase_customer(self.db, customer)
+        self.db.expire_all()
+        self.assertEqual(self.db.query(AuditLog).filter(AuditLog.resource_id == "long").one().details, "ref 99" + SENDER + "7 ok")
 
     def test_the_commands_are_recognised_loosely_but_exactly(self):
         for text in ("DELETE MY DATA", "  delete   my data. ", "Delete my data!"):

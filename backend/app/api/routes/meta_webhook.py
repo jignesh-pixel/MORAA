@@ -837,16 +837,28 @@ async def _handle_bulk_choice(db: Session, sender: str, button: str, group_id: s
         await send_whatsapp_text(sender, BULK_CANCELLED_MESSAGE)
         return []
 
-    claimed = db.query(WhatsAppIngestion).filter(
-        WhatsAppIngestion.id.in_(ids), WhatsAppIngestion.status == "awaiting_choice"
-    ).update({WhatsAppIngestion.status: "choice_claimed", WhatsAppIngestion.product_code: PRODUCT_WHITE_BG},
-             synchronize_session=False)
+    if button == bulk_orders.BULK_EACH:
+        db.commit()
+        freed = await run_io(bulk_orders.release_held_photos, sender, group_id)
+        if freed:
+            await bulk_orders.send_single_buttons(sender, freed)
+        return []
+
+    # Claim each photo on its own with a guarded UPDATE and keep exactly the ones THIS tap took, so a concurrent tap
+    # (or another server process) can never have its claimed photos handed back or charged twice.
+    mine: List[str] = []
+    for photo_id in ids:
+        took = db.query(WhatsAppIngestion).filter(
+            WhatsAppIngestion.id == photo_id, WhatsAppIngestion.status == "awaiting_choice"
+        ).update({WhatsAppIngestion.status: "choice_claimed", WhatsAppIngestion.product_code: PRODUCT_WHITE_BG},
+                 synchronize_session=False)
+        if took == 1:
+            mine.append(photo_id)
     db.commit()
-    if claimed != len(ids):
-        # A concurrent tap claimed some of them: hand back what we took and stop (the other tap proceeds).
+    if len(mine) != len(ids):
         db.query(WhatsAppIngestion).filter(
-            WhatsAppIngestion.id.in_(ids), WhatsAppIngestion.status == "choice_claimed",
-            WhatsAppIngestion.product_code == PRODUCT_WHITE_BG, WhatsAppIngestion.amount_charged.is_(None),
+            WhatsAppIngestion.id.in_(mine), WhatsAppIngestion.status == "choice_claimed",
+            WhatsAppIngestion.amount_charged.is_(None),
         ).update({WhatsAppIngestion.status: "awaiting_choice", WhatsAppIngestion.product_code: None},
                  synchronize_session=False)
         db.commit()
@@ -888,7 +900,9 @@ async def _handle_bulk_choice(db: Session, sender: str, button: str, group_id: s
         return []
 
     try:
-        for ingestion in db.query(WhatsAppIngestion).filter(WhatsAppIngestion.id.in_(ids)).all():
+        for ingestion in db.query(WhatsAppIngestion).filter(
+            WhatsAppIngestion.id.in_(ids), WhatsAppIngestion.status == "choice_claimed"
+        ).all():
             charged, _balance_after = charge_customer_balance(db, customer, price, ingestion_id=ingestion.id, commit=False)
             if not charged:
                 raise RuntimeError("wallet could not cover every photo")
@@ -896,10 +910,22 @@ async def _handle_bulk_choice(db: Session, sender: str, button: str, group_id: s
             ingestion.status = "white_queued"
         db.commit()                      # every debit + ledger row + status change in ONE transaction
     except Exception as e:  # noqa: BLE001
-        logger.error(f"Bulk order {group_id}: nothing charged ({type(e).__name__}: {e})")
-        release()
-        await send_whatsapp_text(sender, "Sorry, we could not start your bulk order, so nothing was charged. Please tap Confirm again.")
-        return []
+        db.rollback()
+        # The commit may have reached the database before the error: if every photo has its debit row the order IS
+        # charged, so finish it from the ledger instead of telling the customer nothing was charged.
+        debited = db.query(WalletTransaction.ingestion_id).filter(
+            WalletTransaction.ingestion_id.in_(ids), WalletTransaction.kind == KIND_DEBIT_ORDER).count()
+        if debited == len(ids):
+            db.query(WhatsAppIngestion).filter(WhatsAppIngestion.id.in_(ids)).update(
+                {WhatsAppIngestion.amount_charged: price, WhatsAppIngestion.status: "white_queued"},
+                synchronize_session=False)
+            db.commit()
+            logger.error(f"Bulk order {group_id}: commit error after the debits were stored; completed from the ledger")
+        else:
+            logger.error(f"Bulk order {group_id}: nothing charged ({type(e).__name__}: {e})")
+            release()
+            await send_whatsapp_text(sender, "Sorry, we could not start your bulk order, so nothing was charged. Please tap Confirm again.")
+            return []
 
     logger.info(f"Bulk order queued: group={group_id} photos={count} total={total}")
     ahead = await _orders_ahead_released(db, ids[0])

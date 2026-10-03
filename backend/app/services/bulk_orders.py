@@ -27,6 +27,7 @@ from app.utils.logger import logger, mask_phone
 
 BULK_OK = "gv_bulk_ok"
 BULK_NO = "gv_bulk_no"
+BULK_EACH = "gv_bulk_each"
 OUTBOX_KIND = "burst_prompt"
 HELD = "pending"          # group_id of a photo whose own buttons were held back until the group prompt
 
@@ -45,7 +46,7 @@ def bulk_button_id(button: str, group_id: str) -> str:
 
 def parse_bulk_button_id(button_id: str) -> Optional[Tuple[str, str]]:
     button, sep, group_id = (button_id or "").partition(":")
-    if not sep or not group_id or button not in (BULK_OK, BULK_NO):
+    if not sep or not group_id or button not in (BULK_OK, BULK_NO, BULK_EACH):
         return None
     return button, group_id
 
@@ -66,6 +67,24 @@ def is_burst(db, ingestion: WhatsAppIngestion) -> bool:
     ).first() is not None
 
 
+def _still_sending(db, sender: str) -> bool:
+    """True while a photo from this number is still being processed (received) or the newest waiting photo changed
+    less than BULK_QUIET_SECONDS ago. Processing a photo takes several seconds, so the quiet period is measured from the
+    moment each photo became ready, not from when it arrived."""
+    quiet = timedelta(seconds=max(int(settings.BULK_QUIET_SECONDS) - 1, 0))
+    recent = _now() - timedelta(minutes=2)
+    in_flight = db.query(WhatsAppIngestion.id).filter(
+        WhatsAppIngestion.external_user_id == sender, WhatsAppIngestion.status == "received",
+        WhatsAppIngestion.created_at >= recent).first() is not None
+    if in_flight:
+        return True
+    newest = db.query(WhatsAppIngestion.updated_at).filter(
+        WhatsAppIngestion.external_user_id == sender, WhatsAppIngestion.status == "awaiting_choice",
+        or_(WhatsAppIngestion.group_id.is_(None), WhatsAppIngestion.group_id == HELD),
+    ).order_by(WhatsAppIngestion.updated_at.desc()).first()
+    return bool(newest and newest[0] and _now() - _aware(newest[0]) < quiet)
+
+
 def prepare_group(sender: str) -> Optional[Tuple[str, int]]:
     """(blocking, own session) Gather this number's waiting photos into one group. None when there is nothing to
     prompt about: the customer is still sending, fewer than two photos wait, or another run already grouped them."""
@@ -84,8 +103,7 @@ def prepare_group(sender: str) -> Optional[Tuple[str, int]]:
         )
         if len(rows) < 2:
             return None
-        newest = max(_aware(r[1]) for r in rows)
-        if _now() - newest < timedelta(seconds=int(settings.BULK_QUIET_SECONDS) - 1):
+        if _still_sending(db, sender):
             return None                               # still sending: the newest photo's own job will prompt later
         group_id = str(uuid.uuid4())
         claimed = db.execute(
@@ -117,13 +135,7 @@ def release_held_photos(sender: str, group_id: Optional[str] = None) -> list:
 
     with SessionLocal() as db:
         if group_id is None:
-            lookback = _now() - timedelta(minutes=int(settings.BULK_LOOKBACK_MINUTES))
-            waiting = db.query(WhatsAppIngestion.created_at).filter(
-                WhatsAppIngestion.external_user_id == sender, WhatsAppIngestion.status == "awaiting_choice",
-                or_(WhatsAppIngestion.group_id.is_(None), WhatsAppIngestion.group_id == HELD),
-                WhatsAppIngestion.created_at >= lookback,
-            ).all()
-            if waiting and _now() - max(_aware(r[0]) for r in waiting) < timedelta(seconds=int(settings.BULK_QUIET_SECONDS) - 1):
+            if _still_sending(db, sender):
                 return []                                  # still sending
             marker = WhatsAppIngestion.group_id == HELD
         else:
@@ -170,11 +182,13 @@ async def send_group_prompt(sender: str) -> bool:
     body = (
         f"You sent {count} photos. Clean Studio Shot (white background) for all {count} photos is "
         f"₹{total:,} (₹{price} each). Your wallet balance is ₹{balance:,}.\n"
-        f"Tap Confirm to create all {count} images. Nothing is charged until you confirm."
+        f"Tap Confirm to create all {count} images, or choose one by one (Studio Shot or Catalog Pack for each photo). "
+        "Nothing is charged until you confirm."
     )
     sent = await send_reply_buttons(
         sender, body,
-        [(bulk_button_id(BULK_OK, group_id), f"Confirm ₹{total:,}"), (bulk_button_id(BULK_NO, group_id), "Cancel")],
+        [(bulk_button_id(BULK_OK, group_id), f"Confirm ₹{total:,}"), (bulk_button_id(BULK_EACH, group_id), "Choose one by one"),
+         (bulk_button_id(BULK_NO, group_id), "Cancel")],
     )
     if not sent:
         logger.error(f"Bulk prompt not sent to {mask_phone(sender)} (group of {count}); falling back to per-photo buttons")

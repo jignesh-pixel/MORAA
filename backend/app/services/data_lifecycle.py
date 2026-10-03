@@ -88,25 +88,33 @@ def purge_expired_media(db: Session, days: Optional[int] = None, batch: int = 20
 
 
 def mask_old_audit_details(db: Session, days: Optional[int] = None, batch: int = 500) -> int:
-    """Mask phone numbers in the details of audit rows older than ``days``. Returns how many rows changed."""
+    """Mask phone numbers in the details of audit rows older than ``days``, page by page until every old row has been
+    looked at. Rows that a person still has to act on (a pending payment review, a pending clawback) keep their numbers
+    until they are resolved. Returns how many rows changed."""
     days = int(settings.RETENTION_AUDIT_MASK_DAYS if days is None else days)
     if days <= 0:
         return 0
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    rows = (
-        db.query(AuditLog)
-        .filter(AuditLog.created_at < cutoff, AuditLog.details.isnot(None))
-        .order_by(AuditLog.created_at)
-        .limit(batch)
-        .all()
-    )
     changed = 0
-    for row in rows:
-        masked = mask_numbers(row.details)
-        if masked != row.details:
-            row.details = masked
-            changed += 1
-    db.commit()
+    last_id = ""
+    while True:
+        rows = (
+            db.query(AuditLog)
+            .filter(AuditLog.created_at < cutoff, AuditLog.details.isnot(None), AuditLog.id > last_id,
+                    or_(AuditLog.status.is_(None), AuditLog.status != "pending"))
+            .order_by(AuditLog.id)
+            .limit(batch)
+            .all()
+        )
+        if not rows:
+            break
+        for row in rows:
+            masked = mask_numbers(row.details)
+            if masked != row.details:
+                row.details = masked
+                changed += 1
+        db.commit()
+        last_id = rows[-1].id
     return changed
 
 
@@ -169,6 +177,8 @@ class ErasureRefused(Exception):
 
 def erase_customer(db: Session, customer: Customer) -> Dict[str, int]:
     """Erase one customer's personal data (see the module docstring). Returns counts of what was removed."""
+    db.query(Customer).filter(Customer.id == customer.id).with_for_update().first()   # no credit can slip in meanwhile
+    db.refresh(customer)
     if customer.tier == "ADMIN":
         raise ErasureRefused("Team accounts are removed by the owner, not through this command.")
     if int(customer.wallet_balance or 0) > 0:
@@ -177,8 +187,23 @@ def erase_customer(db: Session, customer: Customer) -> Dict[str, int]:
             "your balance for orders first, then ask again."
         )
     phone = customer.whatsapp_id
+    variants = {phone, f"+{phone}", phone[-10:]} if phone.isdigit() else {phone}
+    # Refuse while anything involving money or an order for this number is still moving: a refund, a late payment or a
+    # generation in progress would otherwise land on an erased, unreachable account.
+    from app.models.whatsapp_payment_order import WhatsAppPaymentOrder
+    from app.services.meta_whatsapp_service import STUCK_PAID_STATUSES
+
+    busy = db.query(WhatsAppIngestion.id).filter(
+        WhatsAppIngestion.external_user_id.in_(variants),
+        WhatsAppIngestion.status.in_(tuple(STUCK_PAID_STATUSES) + ("choice_claimed", "received")),
+    ).first() is not None or db.query(WhatsAppPaymentOrder.id).filter(
+        WhatsAppPaymentOrder.whatsapp_id.in_(variants),
+        WhatsAppPaymentOrder.status.in_(("created", "sent", "pending")),
+    ).first() is not None
+    if busy:
+        raise ErasureRefused("You still have an order or a payment in progress. Please wait until it finishes, then ask again.")
     photos = 0
-    ingestions = db.query(WhatsAppIngestion).filter(WhatsAppIngestion.external_user_id == phone).all()
+    ingestions = db.query(WhatsAppIngestion).filter(WhatsAppIngestion.external_user_id.in_(variants)).all()
     for ingestion in ingestions:
         if ingestion.image_id:
             image = db.get(Image, ingestion.image_id)
@@ -191,8 +216,9 @@ def erase_customer(db: Session, customer: Customer) -> Dict[str, int]:
         ingestion.external_media_id = None
     masked_rows = 0
     last4 = phone[-4:]
-    for row in db.query(AuditLog).filter(AuditLog.details.isnot(None), AuditLog.details.contains(last4)).all():
-        masked = row.details.replace(phone, mask_numbers(phone) or "") if phone in (row.details or "") else row.details
+    pattern = re.compile(r"(?<!\d)\+?(?:" + "|".join(re.escape(v.lstrip("+")) for v in variants) + r")(?!\d)")
+    for row in db.query(AuditLog).filter(AuditLog.details.isnot(None), AuditLog.details.contains(last4)).limit(5000).all():
+        masked = pattern.sub(lambda m: mask_numbers(m.group(0)) or "", row.details)
         if masked != row.details:
             row.details = masked
             masked_rows += 1

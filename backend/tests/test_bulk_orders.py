@@ -43,9 +43,15 @@ class _Base(LedgerTestBase):
         for i in range(n):
             row = self.make_ingestion(status=status, message_id=f"wamid.bulk.{start + i}")
             row.created_at = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+            row.updated_at = row.created_at
             rows.append(row)
         self.db.commit()
         return rows
+
+    def settle(self):
+        """Make every photo look as if it became ready a minute ago (a status change refreshes updated_at)."""
+        self.db.query(WhatsAppIngestion).update({"updated_at": datetime.now(timezone.utc) - timedelta(seconds=60)})
+        self.db.commit()
 
     def group(self, n=3):
         self.photos(n)
@@ -103,7 +109,7 @@ class GroupingTests(_Base):
         self.assertIn("12 photos", body)
         self.assertIn("₹600", body)
         self.assertIn("₹1,000", body)
-        self.assertEqual([b[1] for b in buttons], ["Confirm ₹600", "Cancel"])
+        self.assertEqual([b[1] for b in buttons], ["Confirm ₹600", "Choose one by one", "Cancel"])
 
 
 class ConfirmTests(_Base):
@@ -310,6 +316,7 @@ class NeverStrandedTests(_Base):
         a.status = "choice_claimed"
         b.group_id = bulk_orders.HELD
         self.db.commit()
+        self.settle()
         self.assertFalse(asyncio.run(bulk_orders.send_group_prompt(SENDER)))
         self.assertEqual(self.single.await_count, 1)
         self.assertEqual(self.single.await_args.kwargs["ingestion_id"], b.id)
@@ -321,6 +328,7 @@ class NeverStrandedTests(_Base):
         for r in rows:
             r.group_id = bulk_orders.HELD
         self.db.commit()
+        self.settle()
         self.buttons.return_value = False
         self.assertFalse(asyncio.run(bulk_orders.send_group_prompt(SENDER)))
         self.assertEqual(self.single.await_count, 3)
@@ -333,3 +341,45 @@ class NeverStrandedTests(_Base):
         self.db.commit()
         asyncio.run(bulk_orders.send_group_prompt(SENDER))
         self.single.assert_not_awaited()
+
+
+class SecondReviewTests(_Base):
+    def test_a_photo_still_being_processed_holds_back_the_prompt(self):
+        self.photos(3)
+        self.make_ingestion(status="received", message_id="wamid.bulk.inflight")        # arrived a moment ago
+        self.assertIsNone(bulk_orders.prepare_group(SENDER))
+
+    def test_one_by_one_gives_every_photo_its_ordinary_buttons(self):
+        self.make_customer(1000)
+        gid = self.group(3)
+        single = AsyncMock(return_value=True)
+        with patch("app.services.meta_whatsapp_service.send_product_selection_buttons", new=single):
+            self.assertEqual(self.confirm(gid, bulk_orders.BULK_EACH), [])
+        self.assertEqual(single.await_count, 3)
+        self.db.expire_all()
+        self.assertEqual({r.group_id for r in self.db.query(WhatsAppIngestion)}, {None})
+        self.assertEqual({r.status for r in self.db.query(WhatsAppIngestion)}, {"awaiting_choice"})
+
+    def test_a_commit_error_after_the_debits_were_stored_finishes_the_order(self):
+        customer = self.make_customer(1000)
+        gid = self.group(3)
+        real_commit = self.db.commit
+        state = {"calls": 0}
+
+        def flaky_commit():
+            real_commit()
+            state["calls"] += 1
+            if state["calls"] == 4:                              # the big charge-and-queue commit: stored, then "fails"
+                raise RuntimeError("connection lost after commit")
+
+        with patch.object(self.db, "commit", side_effect=flaky_commit):
+            jobs = self.confirm(gid)
+        self.db.expire_all()
+        charged = self.db.query(WalletTransaction).filter(WalletTransaction.kind == KIND_DEBIT_ORDER).count()
+        statuses = {r.status for r in self.db.query(WhatsAppIngestion).filter(WhatsAppIngestion.group_id == gid)}
+        if charged:
+            self.assertEqual((len(jobs), statuses), (3, {"white_queued"}))
+            self.assertEqual(self.db.get(Customer, customer.id).wallet_balance, 1000 - 3 * PRICE)
+        else:
+            self.assertEqual(statuses, {"awaiting_choice"})
+        assert_ledger_matches_balances(self, self.db)
