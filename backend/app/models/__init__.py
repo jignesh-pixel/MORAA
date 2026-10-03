@@ -28,6 +28,7 @@ from app.models.outbox_job import OutboxJob
 from app.models.scheduler_lease import SchedulerLease
 from app.models.consent_record import ConsentRecord
 from app.models.provider_call import ProviderCall
+from app.models.chat_log import ChatMessage, InvoiceRecord, OrderOutput  # noqa: F401
 
 __all__ = [
     "WalletTransaction",

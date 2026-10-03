@@ -12,6 +12,7 @@ from app.api.routes import batch_upload
 from app.api.routes import prompts
 from app.api.routes import image_generation
 from app.api.routes import prompt_fusion
+from app.api.routes import dashboard
 from app.api.routes import earring_ecommerce
 from app.api.routes import earring_close_up_ears
 from app.api.routes import earring_scale_reference
@@ -253,6 +254,7 @@ setup_public_host_guard(app)
 # Include routers
 app.include_router(health_router)
 app.include_router(auth.router)
+app.include_router(dashboard.router)
 app.include_router(upload.router)
 app.include_router(analysis.router)
 app.include_router(history.router)

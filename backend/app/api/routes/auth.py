@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_db
 from app.schemas.auth import (
+    GoogleLoginRequest,
     LoginRequest,
     LoginResponse,
     RefreshTokenRequest,
@@ -13,7 +14,7 @@ from app.schemas.auth import (
     TokenResponse,
     UserResponse,
 )
-from app.services.auth_service import AuthService
+from app.services.auth_service import AuthService, verify_google_id_token
 from app.utils.logger import logger
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
@@ -62,6 +63,25 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(e),
         )
+
+
+@router.post(
+    "/google",
+    response_model=LoginResponse,
+    summary="Sign in with Google (dashboard)",
+    description="Exchange a Google ID token for our tokens. Only emails in DASHBOARD_ALLOWED_EMAILS are accepted.",
+)
+async def google_login(request: GoogleLoginRequest, db: Session = Depends(get_db)):
+    if not settings.GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Google sign-in is not configured")
+    email = await verify_google_id_token(request.id_token)
+    allowed = {e.strip().lower() for e in (settings.DASHBOARD_ALLOWED_EMAILS or "").split(",") if e.strip()}
+    if not email or email.lower() not in allowed:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This Google account is not allowed")
+    try:
+        return AuthService(db).login_with_verified_email(email)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
 
 
 @router.post(

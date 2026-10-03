@@ -25,8 +25,39 @@ REUSE_GRACE_SECONDS = 20
 _DUMMY_PASSWORD_HASH = hash_password("not-a-real-password")
 
 
+async def verify_google_id_token(id_token: str) -> Optional[str]:
+    """Ask Google whether this ID token is genuine, for OUR client id, and return its verified email (else None)."""
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            response = await client.get("https://oauth2.googleapis.com/tokeninfo", params={"id_token": id_token})
+        if response.status_code != 200:
+            return None
+        data = response.json()
+    except Exception:  # noqa: BLE001
+        return None
+    if data.get("aud") != settings.GOOGLE_CLIENT_ID or str(data.get("email_verified")).lower() != "true":
+        return None
+    return str(data.get("email") or "") or None
+
+
 class AuthService:
     """Authentication and user management service."""
+
+    def login_with_verified_email(self, email: str) -> LoginResponse:
+        """Log in (creating the account on first use) a person whose email Google has verified and who is allowed in."""
+        import secrets
+
+        user = self.repo.find_first(email=email)
+        if user is None:
+            user = self.repo.create(
+                email=email, username=email, hashed_password=hash_password(secrets.token_urlsafe(32)), full_name=email,
+            )
+            logger.bind(category="auth").info("Dashboard account created through Google sign-in")
+        if not user.is_active:
+            raise ValueError("Account is deactivated")
+        return self._generate_auth_response(user)
 
     def __init__(self, db: Session):
         self.db = db

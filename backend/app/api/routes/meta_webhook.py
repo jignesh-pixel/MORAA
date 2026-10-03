@@ -91,7 +91,7 @@ from app.services.wallet_service import (
     get_customer,
     price_per_image,
 )
-from app.services import bulk_orders, consent_service, data_lifecycle, eta_service
+from app.services import bulk_orders, chat_log, consent_service, data_lifecycle, eta_service
 from app.utils.logger import logger, mask_phone
 from app.ai.image_generation_manager import generation_capacity_blocked
 from app.utils.executors import run_cpu, run_io
@@ -729,6 +729,7 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
         )
         return None
 
+    chat_log.fire(chat_log.attach_photo, message_id, sender, new_ingestion_id, upload_result.id)
     ingestion.image_id = upload_result.id
     ingestion.file_size = len(image_bytes)
     ingestion.mime_type = content_type
@@ -1374,6 +1375,7 @@ async def receive_webhook(
         events = parse_webhook_entry(entry)
 
         for event in events:
+            chat_log.fire(chat_log.write_in, event)          # the dashboard's record of what the customer sent
             # Only the message being handled right now may be given back if handling fails: messages
             # finished earlier in this payload already had their effect and must not be repeated on retry.
             claimed.clear()

@@ -27,6 +27,7 @@ import httpx
 
 from app.config import settings
 from app.services import metrics
+from app.services import chat_log
 from app.utils.executors import run_io
 from app.utils.logger import logger, mask_phone
 # ─── Constants ────────────────────────────────────────────────────────────
@@ -558,6 +559,7 @@ async def _post_message_payload(
                 f"message_id={messages[0].get('id', '')}"
             )
             metrics.registry.inc("moraa_meta_send_total", {"outcome": "ok"})
+            chat_log.fire(chat_log.write_out, dict(payload), messages[0].get("id"))      # the dashboard's record
             return True
 
     except httpx.TimeoutException:
@@ -903,6 +905,18 @@ async def send_catalog_pack_images_to_whatsapp(
 
 
 # ─── Meta media upload ───────────────────────────────────────────────────
+
+
+async def _upload_and_keep(image_bytes: bytes, ingestion_id: str, style: Optional[str]) -> Optional[str]:
+    """Keep a copy of an image we produced (for the chat dashboard), then upload it to Meta. The copy is best effort:
+    if it cannot be kept the upload and delivery go ahead exactly as before."""
+    output_id = None
+    if chat_log.enabled():
+        output_id = await run_io(chat_log.save_output, ingestion_id, style, 0, image_bytes)
+    media_id = await upload_media_to_meta(image_bytes)
+    if output_id and media_id:
+        await run_io(chat_log.set_output_media, output_id, media_id)
+    return media_id
 
 
 async def upload_media_to_meta(
@@ -1575,7 +1589,7 @@ async def _generate_and_upload_style(
         return False, None
     if not image_bytes:
         return False, None
-    media_id = await upload_media_to_meta(image_bytes)
+    media_id = await _upload_and_keep(image_bytes, str(kwargs.get("ingestion_id") or ""), kwargs.get("style_title"))
     del image_bytes
     return True, (media_id or None)
 
@@ -2145,7 +2159,7 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
         if not _advance_status(db, ingestion_id, "processing", "generated"):
             return False
 
-        media_id = await upload_media_to_meta(generated_bytes)
+        media_id = await _upload_and_keep(generated_bytes, ingestion_id, "Clean Studio Shot")
         if not media_id:
             return await _fail("Meta media upload failed", delivery=True)
 

@@ -87,6 +87,50 @@ def purge_expired_media(db: Session, days: Optional[int] = None, batch: int = 20
     return expired
 
 
+def purge_chat_history(db: Session, days: Optional[int] = None, batch: int = 500) -> Dict[str, int]:
+    """Delete chat messages older than ``days`` and the files of images we produced that are older than that (the
+    dashboard keeps 90 days). The order and money records themselves are not touched. Returns counts."""
+    from app.models.chat_log import ChatMessage, OrderOutput
+
+    days = int(settings.RETENTION_CHAT_DAYS if days is None else days)
+    if days <= 0:
+        return {"messages": 0, "outputs": 0}
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    messages = 0
+    while True:
+        ids = [r[0] for r in db.query(ChatMessage.id).filter(ChatMessage.created_at < cutoff).limit(batch).all()]
+        if not ids:
+            break
+        messages += db.query(ChatMessage).filter(ChatMessage.id.in_(ids)).delete(synchronize_session=False)
+        db.commit()
+    outputs = 0
+    while True:
+        rows = db.query(OrderOutput).filter(OrderOutput.created_at < cutoff, OrderOutput.file_path.isnot(None)).limit(batch).all()
+        if not rows:
+            break
+        for row in rows:
+            _delete_output_file(row)
+            row.file_path = None
+            outputs += 1
+        db.commit()
+    if messages or outputs:
+        logger.bind(category="system").info(f"Retention: removed {messages} chat message(s) and {outputs} output image(s)")
+    return {"messages": messages, "outputs": outputs}
+
+
+def _delete_output_file(output) -> None:
+    import os
+
+    if not output.file_path:
+        return
+    try:
+        path = (settings.UPLOAD_PATH / output.file_path).resolve()
+        if settings.UPLOAD_PATH.resolve() in path.parents and path.is_file():
+            os.remove(path)
+    except OSError:
+        pass
+
+
 def mask_old_audit_details(db: Session, days: Optional[int] = None, batch: int = 500) -> int:
     """Mask phone numbers in the details of audit rows older than ``days``, page by page until every old row has been
     looked at. Rows that a person still has to act on (a pending payment review, a pending clawback) keep their numbers
@@ -121,13 +165,14 @@ def mask_old_audit_details(db: Session, days: Optional[int] = None, batch: int =
 def run_retention_pass() -> Dict[str, int]:
     """One retention pass in its own session (blocking). Does nothing unless RETENTION_ENABLED."""
     if not settings.RETENTION_ENABLED:
-        return {"photos": 0, "audit_rows": 0}
+        return {"photos": 0, "audit_rows": 0, "chat_messages": 0, "outputs": 0}
     from app.database import SessionLocal
 
     with SessionLocal() as db:
         photos = purge_expired_media(db)
         audit_rows = mask_old_audit_details(db)
-    return {"photos": photos, "audit_rows": audit_rows}
+        chat = purge_chat_history(db)
+    return {"photos": photos, "audit_rows": audit_rows, "chat_messages": chat["messages"], "outputs": chat["outputs"]}
 
 
 async def run_retention_forever() -> None:
@@ -214,6 +259,19 @@ def erase_customer(db: Session, customer: Customer) -> Dict[str, int]:
         ingestion.external_user_id = f"erased-{customer.id[:8]}"
         ingestion.caption = None
         ingestion.external_media_id = None
+    # The chat record and the images we produced for this customer go too (the money trail stays).
+    from app.models.chat_log import ChatMessage, OrderOutput
+
+    chat_digits = {v.lstrip("+") for v in variants}
+    chat_removed = 0
+    try:
+        with db.begin_nested():                       # the chat tables may not exist yet on an older database
+            chat_removed = db.query(ChatMessage).filter(ChatMessage.customer_phone.in_(chat_digits)).delete(synchronize_session=False)
+            for output in db.query(OrderOutput).filter(OrderOutput.ingestion_id.in_([i.id for i in ingestions] or ["-"])).all():
+                _delete_output_file(output)
+                output.file_path = None
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Erasure: chat record not removed ({type(e).__name__})")
     masked_rows = 0
     last4 = phone[-4:]
     pattern = re.compile(r"(?<!\d)\+?(?:" + "|".join(re.escape(v.lstrip("+")) for v in variants) + r")(?!\d)")
@@ -233,7 +291,7 @@ def erase_customer(db: Session, customer: Customer) -> Dict[str, int]:
                     status="success", details=f"photos={photos} orders={len(ingestions)}"))
     db.commit()
     logger.bind(category="system").info(f"Customer {customer.id} erased: photos={photos} orders={len(ingestions)}")
-    return {"photos": photos, "orders": len(ingestions), "audit_rows": masked_rows}
+    return {"photos": photos, "orders": len(ingestions), "audit_rows": masked_rows, "chat_messages": chat_removed}
 
 
 def erase_customer_by_id(customer_id: str) -> Dict[str, int]:

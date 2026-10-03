@@ -349,7 +349,14 @@ async def _handle_burst_prompt(payload: Dict[str, Any]) -> Any:
     return await bulk_orders.handle_outbox_job(payload)
 
 
+async def _handle_drive_archive(payload: Dict[str, Any]) -> Any:
+    from app.services import drive_archive
+
+    return await drive_archive.handle_outbox_job(payload)
+
+
 def ensure_default_handlers() -> None:
+    _handlers.setdefault("drive_archive", _handle_drive_archive)
     _handlers.setdefault("burst_prompt", _handle_burst_prompt)
     _handlers.setdefault("order_run", _handle_order_run)
     _handlers.setdefault("ops_forward", _handle_ops_forward)

@@ -89,7 +89,7 @@ class RetentionTests(_Base):
 
     def test_the_pass_does_nothing_unless_enabled(self):
         with patch.object(settings, "RETENTION_ENABLED", False):
-            self.assertEqual(dl.run_retention_pass(), {"photos": 0, "audit_rows": 0})
+            self.assertEqual(sum(dl.run_retention_pass().values()), 0)
 
     def test_financial_rows_are_never_touched_by_retention(self):
         customer = self.make_customer(500)
@@ -209,6 +209,48 @@ class CommandFlowTests(_Base):
         self.make_customer(500)
         self.run_command("DELETE MY DATA")
         self.assertIn("not refunded", self.run_command("CONFIRM DELETE"))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class ChatHistoryTests(_Base):
+    def test_old_chats_and_their_image_files_are_removed_recent_ones_kept(self):
+        import tempfile
+        from pathlib import Path
+
+        from app.models.chat_log import ChatMessage, OrderOutput
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "outputs" / "i" / "a.png"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"x")
+            with patch.object(type(settings), "UPLOAD_PATH", new=property(lambda s: Path(tmp))):
+                old = ChatMessage(customer_phone=SENDER, direction="in", msg_type="text", text="old")
+                new = ChatMessage(customer_phone=SENDER, direction="in", msg_type="text", text="new")
+                out = OrderOutput(ingestion_id="i", style="S", position=1, file_path="outputs/i/a.png")
+                self.db.add_all([old, new, out])
+                self.db.commit()
+                old.created_at = OLD
+                out.created_at = OLD
+                self.db.commit()
+                self.assertEqual(dl.purge_chat_history(self.db, days=90), {"messages": 1, "outputs": 1})
+                self.assertFalse(path.exists())
+            self.db.expire_all()
+            self.assertEqual([m.text for m in self.db.query(ChatMessage).all()], ["new"])
+            self.assertIsNone(self.db.get(OrderOutput, out.id).file_path)
+
+    def test_erasure_removes_the_customers_chat_record(self):
+        from app.models.chat_log import ChatMessage
+
+        customer = self.make_customer(0)
+        self.db.add(ChatMessage(customer_phone=SENDER, direction="in", msg_type="text", text="my gstin is ..."))
+        self.db.add(ChatMessage(customer_phone="919000000009", direction="in", msg_type="text", text="someone else"))
+        self.db.commit()
+        result = dl.erase_customer(self.db, customer)
+        self.assertEqual(result["chat_messages"], 1)
+        self.assertEqual([m.text for m in self.db.query(ChatMessage).all()], ["someone else"])
 
 
 if __name__ == "__main__":

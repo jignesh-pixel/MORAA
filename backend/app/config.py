@@ -461,6 +461,22 @@ class Settings(BaseSettings):
     # Photo bursts become one bulk order (UX-1). A photo within BULK_WINDOW_SECONDS of another waiting photo is part of a
     # burst; after BULK_QUIET_SECONDS without a new photo the customer gets ONE "N photos, Rs X: confirm?" message.
     # Needs OUTBOX_ENABLED. At most BULK_MAX_PHOTOS per confirmation; photos older than BULK_LOOKBACK_MINUTES are not grouped.
+    # The WhatsApp chat dashboard's record (every message, every image we produced, every invoice). Chats and the images
+    # we produced are kept RETENTION_CHAT_DAYS days (with RETENTION_ENABLED), like customer photos.
+    # Dashboard access: usernames in ADMIN_USERNAMES / is_admin users, plus these Google or login emails (comma-separated).
+    # GOOGLE_CLIENT_ID turns on "Sign in with Google" (the dashboard sends Google's ID token to /api/auth/google).
+    DASHBOARD_ALLOWED_EMAILS: str = ""
+    GOOGLE_CLIENT_ID: str = ""
+    DASHBOARD_HISTORY_DAYS: int = 90
+    # Google Drive archive of customer photos and the images we produced (see app/services/drive_archive.py). OFF until
+    # DRIVE_ENABLED=true and the OAuth credentials of the Drive owner's account are set.
+    DRIVE_ENABLED: bool = False
+    GOOGLE_DRIVE_CLIENT_ID: str = ""
+    GOOGLE_DRIVE_CLIENT_SECRET: str = ""
+    GOOGLE_DRIVE_REFRESH_TOKEN: str = ""
+    DRIVE_FOLDER_ID: str = ""
+    CHAT_LOG_ENABLED: bool = True
+    RETENTION_CHAT_DAYS: int = 90
     BULK_ENABLED: bool = True
     BULK_WINDOW_SECONDS: int = 45
     BULK_QUIET_SECONDS: int = 8

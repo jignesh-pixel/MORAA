@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, Optional
 
 from app.config import settings
 from app.services.erpnext_service import get_erpnext_service
-from app.utils.executors import run_cpu
+from app.utils.executors import run_cpu, run_io
 from app.utils.logger import logger, mask_phone
 _GSTIN_RE = re.compile(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]$")
 _PLACEHOLDER_NAMES = {"", "valued customer", "jewelry business", "there", "customer"}
@@ -39,6 +39,17 @@ def billing_gstin(snapshot: Optional[Dict[str, Any]]) -> Optional[str]:
     if settings.GST_VERIFICATION_ENABLED and (snapshot or {}).get("is_gst_verified") is not True:
         return None
     return value
+
+
+async def _note_invoice(payment_id: str, phone: str, amount: int, status: str, invoice: Optional[str] = None) -> None:
+    """Remember this invoice for the chat dashboard. Never raises, never delays the invoice."""
+    try:
+        from app.services import chat_log
+
+        if chat_log.enabled():
+            await run_io(chat_log.upsert_invoice, payment_id, phone, amount, status, invoice)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def dispatch_payment_invoice(
@@ -75,12 +86,14 @@ async def dispatch_payment_invoice(
                     caption="",
                 ):
                     logger.info(f"ERPNext invoice {invoice_name} sent to {mask_phone(recipient_id)} (payment={payment_id})")
+                    await _note_invoice(payment_id, recipient_id, amount, "sent", invoice_name)
                     return "erpnext"
                 logger.warning(f"ERPNext invoice {invoice_name} could not be sent; it will be retried")
             else:
                 logger.warning(f"ERPNext produced no invoice for {payment_id}; it will be retried")
         except Exception as e:  # noqa: BLE001
             logger.warning(f"ERPNext invoice dispatch failed for {payment_id}: {e}; it will be retried")
+        await _note_invoice(payment_id, recipient_id, amount, "failed")
         return "failed"
 
     # Existing local ReportLab receipt (unchanged numbering and content).
@@ -98,6 +111,7 @@ async def dispatch_payment_invoice(
         if sent is False:                    # the send reports False when WhatsApp refused it: let the outbox retry
             logger.warning(f"Local invoice for {payment_id} could not be sent")
             return "failed"
+        await _note_invoice(payment_id, recipient_id, amount, "sent")
         return "local"
     except Exception as e:  # noqa: BLE001
         logger.error(f"Local invoice dispatch failed for {payment_id}: {e}")
