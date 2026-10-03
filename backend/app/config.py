@@ -458,6 +458,15 @@ class Settings(BaseSettings):
     # Team (ADMIN) orders are not part of the customers' daily ceiling but have a ceiling of their own, so a mistake
     # or a loop on a team phone cannot spend without limit (COST-2). 0 = no limit.
     MAX_ADMIN_GENERATIONS_PER_DAY: int = 200
+    # Photo bursts become one bulk order (UX-1). A photo within BULK_WINDOW_SECONDS of another waiting photo is part of a
+    # burst; after BULK_QUIET_SECONDS without a new photo the customer gets ONE "N photos, Rs X: confirm?" message.
+    # Needs OUTBOX_ENABLED. At most BULK_MAX_PHOTOS per confirmation; photos older than BULK_LOOKBACK_MINUTES are not grouped.
+    BULK_ENABLED: bool = True
+    BULK_WINDOW_SECONDS: int = 45
+    BULK_QUIET_SECONDS: int = 8
+    BULK_MAX_PHOTOS: int = 50
+    BULK_CONCURRENCY: int = 4                 # photos of one bulk order worked on at the same time
+    BULK_LOOKBACK_MINUTES: int = 15
     # What one successful image call costs, in rupees, per provider (COST-4). 0 = unknown: calls are still counted.
     # OPS_ALERT_DAILY_COST_RUPEES warns the owner on WhatsApp when a day's estimated AI spend passes this (0 = off).
     COST_PER_CALL_GEMINI_RUPEES: float = 0.0

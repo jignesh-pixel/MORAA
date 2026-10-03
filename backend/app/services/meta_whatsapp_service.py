@@ -1415,12 +1415,16 @@ async def recover_stuck_paid_orders(older_than) -> int:
     try:
         cutoff = datetime.now(timezone.utc) - older_than
         generated_cutoff = datetime.now(timezone.utc) - older_than * GENERATED_PATIENCE
+        # Photos of a bulk order are worked on a few at a time, so the last ones legitimately wait a long time before
+        # they start: they get three times the patience of a single order.
+        bulk_cutoff = datetime.now(timezone.utc) - older_than * 3
         rows = (
             db.query(WhatsAppIngestion)
             .filter(
                 WhatsAppIngestion.status.in_(STUCK_PAID_STATUSES),
                 WhatsAppIngestion.amount_charged > 0,
                 WhatsAppIngestion.updated_at < cutoff,
+                or_(WhatsAppIngestion.group_id.is_(None), WhatsAppIngestion.updated_at < bulk_cutoff),
                 or_(
                     WhatsAppIngestion.status != "generated",
                     WhatsAppIngestion.updated_at < generated_cutoff,

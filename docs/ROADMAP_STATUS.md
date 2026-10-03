@@ -34,7 +34,7 @@ calls and a per-customer limit on orders in progress (Q-6); interrupted-photo re
 (UX-2); Dockerfile, compose and HTTPS proxy files plus graceful shutdown (DEP-1, DEP-2, not yet run on a server).
 New migrations: 0016 (outbox_jobs), 0017 (scheduler_leases) - applied by `scripts/release.py`.
 NOT built, and why:
-- UX-1 photo-burst grouping: needs the owner's pricing/flow decision (QUESTIONS_FOR_MORNING).
+- UX-1 photo-burst grouping: BUILT on 2026-10-03 after the owner's answer (see OPERATIONS_RUNBOOK section 14).
 - DEP-3 object storage and signed image links (SEC-7 rest): needs the owner's choice of storage provider.
 - Q-1 full Celery/Redis generation queue and Q-2 "webhook only records and answers": larger changes whose benefit depends on real load; the
   database outbox covers the lost-order risk for now.
@@ -52,3 +52,9 @@ MAINT-3 (the experiment scripts and outputs were already untracked and ignored; 
 NOT done: MAINT-1/ARC-4/ARC-5 (large refactors of money paths: recommended after launch), MAINT-2 (frozen prompt route files), a real GST
 verification provider (EXT-8, owner decision), "only verified GSTINs on invoices" (needs the GST provider).
 
+
+## Owner decisions received 2026-10-03
+Approved: production upgrade in principle (timing still to be agreed, after verification), push to GitHub (blocked by the tool permission, see below),
+privacy notice (without the AI-abroad and how-to-delete lines), 90-day retention, 3 orders per customer, bulk photo orders, Sentry, alert numbers
+919699899825 and 919820666332, paid GST verification (vendor still to be chosen). Built since: bulk orders (migration 0020), configurable GST vendor,
+verified-only GSTIN on invoices, `docs/ENV_TO_ADD.md`. Still open: items 3, 4, 7, 10, 13 and parts of 11/12 (see the owner message in the chat).

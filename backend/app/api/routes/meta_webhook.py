@@ -91,7 +91,7 @@ from app.services.wallet_service import (
     get_customer,
     price_per_image,
 )
-from app.services import consent_service, data_lifecycle, eta_service
+from app.services import bulk_orders, consent_service, data_lifecycle, eta_service
 from app.utils.logger import logger, mask_phone
 from app.ai.image_generation_manager import generation_capacity_blocked
 from app.utils.executors import run_cpu, run_io
@@ -735,6 +735,19 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
     ingestion.status = "awaiting_choice"
     db.commit()
 
+    # A photo that follows another waiting photo is part of a burst: hold its buttons back, the customer gets ONE
+    # "N photos, Rs X: confirm?" message when they stop sending (UX-1). Paying customers only.
+    if (
+        bulk_orders.is_enabled()
+        and not _mws.DRY_RUN_IMAGE_MODE
+        and not (ent.is_admin(customer) or ent.has_trial_credits(customer))
+        and bulk_orders.is_burst(db, ingestion)
+    ):
+        db.commit()
+        if await bulk_orders.schedule_prompt(sender, new_ingestion_id):
+            return new_ingestion_id
+        # could not schedule the group prompt: fall through to the ordinary buttons
+
     # Re-read the balance at send time: download + AI pre-check can take
     # ~10 s, and a payment or another order may have committed meanwhile.
     current_balance = get_balance(db, customer_wallet_id)
@@ -754,6 +767,143 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
 
 # ingestion id -> outbox job id, for orders recorded in the outbox but not yet handed to a background task.
 _recorded_runs: Dict[str, int] = {}
+
+
+async def _run_bulk_jobs(runs: List[Tuple[Any, str, Optional[int]]]) -> None:
+    """Run a bulk order's photos a few at a time (BULK_CONCURRENCY), so 50 photos never hold 50 database connections
+    and provider calls at once. Each photo is still its own order with its own refund path."""
+    from app.services import outbox
+
+    gate = asyncio.Semaphore(max(int(settings.BULK_CONCURRENCY), 1))
+
+    async def one(worker: Any, ingestion_id: str, job_id: Optional[int]) -> None:
+        async with gate:
+            try:
+                if job_id is not None:
+                    await outbox.run_job_now(job_id)
+                else:
+                    await worker(ingestion_id)
+            except Exception as e:  # noqa: BLE001 -- the worker records its own failure and refund
+                logger.error(f"Bulk photo {ingestion_id} raised: {type(e).__name__}: {e}")
+
+    await asyncio.gather(*(one(*run) for run in runs))
+
+
+def _queue_bulk_runs(background_tasks: BackgroundTasks, jobs: List[Tuple[Any, str]]) -> None:
+    """Start a confirmed bulk order: each photo recorded in the outbox (so a restart cannot strand it) and then run
+    through the bounded runner above as one background task."""
+    runs: List[Tuple[Any, str, Optional[int]]] = []
+    for worker, ingestion_id in jobs:
+        job_id = None
+        if settings.OUTBOX_ENABLED:
+            from app.services import outbox
+
+            job_id = _recorded_runs.pop(ingestion_id, None) or outbox.enqueue_order_run("white", ingestion_id)
+        runs.append((worker, ingestion_id, job_id))
+    background_tasks.add_task(_run_bulk_jobs, runs)
+
+
+BULK_CANCELLED_MESSAGE = "Cancelled. Nothing was charged. Send your photos again whenever you are ready."
+BULK_GONE_MESSAGE = "These photos have already been handled."
+
+
+async def _handle_bulk_choice(db: Session, sender: str, button: str, group_id: str) -> List[Tuple[Any, str]]:
+    """Confirm or cancel a bulk order (UX-1). Returns the (worker, ingestion_id) jobs to start.
+
+    Confirming claims every photo of the group with one guarded UPDATE, checks capacity and funds BEFORE any money moves,
+    then debits each photo's price (one ledger row per photo, so a later refund is per photo exactly as for a single
+    order) in ONE transaction together with the status change: all photos are charged and queued, or none is."""
+    group = (
+        db.query(WhatsAppIngestion)
+        .filter(WhatsAppIngestion.group_id == group_id, WhatsAppIngestion.status == "awaiting_choice")
+        .all()
+    )
+    group = [g for g in group if _same_sender(g.external_user_id, sender)]
+    if not group:
+        await send_whatsapp_text(sender, BULK_GONE_MESSAGE)
+        return []
+    ids = [g.id for g in group]
+
+    if button == bulk_orders.BULK_NO:
+        db.query(WhatsAppIngestion).filter(
+            WhatsAppIngestion.id.in_(ids), WhatsAppIngestion.status == "awaiting_choice"
+        ).update({WhatsAppIngestion.status: "rejected", WhatsAppIngestion.error_message: "Bulk order cancelled"},
+                 synchronize_session=False)
+        db.commit()
+        await send_whatsapp_text(sender, BULK_CANCELLED_MESSAGE)
+        return []
+
+    claimed = db.query(WhatsAppIngestion).filter(
+        WhatsAppIngestion.id.in_(ids), WhatsAppIngestion.status == "awaiting_choice"
+    ).update({WhatsAppIngestion.status: "choice_claimed", WhatsAppIngestion.product_code: PRODUCT_WHITE_BG},
+             synchronize_session=False)
+    db.commit()
+    if claimed != len(ids):
+        # A concurrent tap claimed some of them: hand back what we took and stop (the other tap proceeds).
+        db.query(WhatsAppIngestion).filter(
+            WhatsAppIngestion.id.in_(ids), WhatsAppIngestion.status == "choice_claimed",
+            WhatsAppIngestion.product_code == PRODUCT_WHITE_BG, WhatsAppIngestion.amount_charged.is_(None),
+        ).update({WhatsAppIngestion.status: "awaiting_choice", WhatsAppIngestion.product_code: None},
+                 synchronize_session=False)
+        db.commit()
+        await send_whatsapp_text(sender, BULK_GONE_MESSAGE)
+        return []
+
+    def release() -> None:
+        db.rollback()
+        db.query(WhatsAppIngestion).filter(
+            WhatsAppIngestion.id.in_(ids), WhatsAppIngestion.status == "choice_claimed"
+        ).update({WhatsAppIngestion.status: "awaiting_choice", WhatsAppIngestion.product_code: None},
+                 synchronize_session=False)
+        db.commit()
+
+    count = len(ids)
+    price = _product_price(PRODUCT_WHITE_BG)
+    total = count * price
+    customer = find_customer_by_phone(db, sender)
+
+    if not _mws.DRY_RUN_IMAGE_MODE:
+        db.commit()
+        no_capacity = await run_io(generation_capacity_blocked, count)
+        if no_capacity:
+            logger.warning(f"Bulk order {group_id} declined before charging: {no_capacity}")
+            release()
+            await send_whatsapp_text(sender, CAPACITY_MESSAGE)
+            return []
+
+    balance = get_balance(db, customer.whatsapp_id) if customer else 0
+    if customer is None or balance < total:
+        release()
+        body = _hold_body(total, balance, f"{count} Clean Studio Shots")
+        top_up = max(total - balance, 500)
+        if await try_send_native_recharge(db, sender, top_up, body, site="bulk_choice"):
+            return []
+        if await send_payment_unavailable(sender, "bulk_choice", body_text=body):
+            return []
+        await send_whatsapp_text(sender, _hold_message(total, balance, f"{count} Clean Studio Shots"))
+        return []
+
+    try:
+        for ingestion in db.query(WhatsAppIngestion).filter(WhatsAppIngestion.id.in_(ids)).all():
+            charged, _balance_after = charge_customer_balance(db, customer, price, ingestion_id=ingestion.id, commit=False)
+            if not charged:
+                raise RuntimeError("wallet could not cover every photo")
+            ingestion.amount_charged = price
+            ingestion.status = "white_queued"
+        db.commit()                      # every debit + ledger row + status change in ONE transaction
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Bulk order {group_id}: nothing charged ({type(e).__name__}: {e})")
+        release()
+        await send_whatsapp_text(sender, "Sorry, we could not start your bulk order, so nothing was charged. Please tap Confirm again.")
+        return []
+
+    logger.info(f"Bulk order queued: group={group_id} photos={count} total={total}")
+    ahead = await _orders_ahead_released(db, ids[0])
+    suffix = eta_service.ack_suffix("white_bg", ahead + count, _parallel_orders(1), "Your images will arrive here one by one.")
+    await send_whatsapp_text(
+        sender, f"✨ Processing your {count} Clean Studio Shots (₹{total:,}). {suffix}"
+    )
+    return [(process_whatsapp_white_bg, i) for i in ids]
 
 
 async def _consent_gate(db: Session, sender: str, reply_to_message_id: Optional[str] = None) -> bool:
@@ -1342,6 +1492,13 @@ async def receive_webhook(
                         await send_whatsapp_text(sender, consent_service.AGREED_MESSAGE)
                     else:
                         await send_whatsapp_text(sender, consent_service.DECLINED_MESSAGE)
+                    continue
+
+                bulk_choice = bulk_orders.parse_bulk_button_id(b_id)
+                if bulk_choice:
+                    jobs = await _handle_bulk_choice(db, sender, *bulk_choice)
+                    if jobs:
+                        _queue_bulk_runs(background_tasks, jobs)
                     continue
 
                 product_choice = parse_product_button_id(b_id)

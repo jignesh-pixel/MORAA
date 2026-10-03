@@ -223,6 +223,25 @@ async def wait_for_detached(timeout: float) -> None:
         await asyncio.wait(pending, timeout=timeout)
 
 
+def enqueue_job(kind: str, payload: Dict[str, Any], dedupe_key: str, delay_seconds: int = 0) -> Optional[int]:
+    """Record one job to run after ``delay_seconds`` and return its id (None when the database could not record it or
+    the same ``dedupe_key`` already exists). Blocking."""
+    from app.database import SessionLocal
+
+    try:
+        with SessionLocal() as db:
+            job = OutboxJob(kind=kind, dedupe_key=dedupe_key[:120], payload=payload, status=PENDING, attempts=0,
+                            next_attempt_at=_now() + timedelta(seconds=delay_seconds))
+            db.add(job)
+            db.commit()
+            return job.id
+    except IntegrityError:
+        return None
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Outbox could not record {kind}: {type(e).__name__}: {e}")
+        return None
+
+
 def enqueue_order_run(worker: str, ingestion_id: str, delay_seconds: int = 90) -> Optional[int]:
     """Record "run this paid order" so a crash before it starts does not lose it. The sweep starts it if nobody has
     after ``delay_seconds``. Returns the job id, or None when it could not be recorded (caller runs it directly)."""
@@ -324,7 +343,14 @@ async def _handle_order_run(payload: Dict[str, Any]) -> Any:
     return True
 
 
+async def _handle_burst_prompt(payload: Dict[str, Any]) -> Any:
+    from app.services import bulk_orders
+
+    return await bulk_orders.handle_outbox_job(payload)
+
+
 def ensure_default_handlers() -> None:
+    _handlers.setdefault("burst_prompt", _handle_burst_prompt)
     _handlers.setdefault("order_run", _handle_order_run)
     _handlers.setdefault("ops_forward", _handle_ops_forward)
     _handlers.setdefault("payment_invoice", _handle_payment_invoice)

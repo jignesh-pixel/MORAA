@@ -108,6 +108,11 @@ class WhatsAppIngestion(Base):
         comment="Downloaded file size in bytes",
     )
 
+    group_id: Mapped[str] = mapped_column(
+        String(36), nullable=True, index=True,
+        comment="Bulk order group this photo was gathered into (UX-1); NULL for an ordinary single photo",
+    )
+
     # ── Processing state ───────────────────────────────────────────────
     status: Mapped[str] = mapped_column(
         String(20),

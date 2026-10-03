@@ -118,3 +118,13 @@ the last week. Team orders have their own daily limit (`MAX_ADMIN_GENERATIONS_PE
 minute so orders fail fast and are refunded instead of waiting for timeouts. `IMAGE_PROVIDER_RPM` and `MAX_CONCURRENT_PROVIDER_CALLS`
 (both 0 = no limit) smooth bursts to the provider's quota; a single Studio Shot is served ahead of Pack images when the limit is
 reached. `MAX_INFLIGHT_ORDERS_PER_CUSTOMER` (3) limits paid orders one customer can have in progress at once.
+
+## 14. Bulk orders (photo bursts)
+
+A paying customer who sends photos in a row (each within 45 seconds of another waiting photo) gets ONE message when they stop for
+8 seconds: "You sent 12 photos. Clean Studio Shot for all 12 is Rs 600 ... Confirm / Cancel". Confirm charges every photo (one ledger
+row per photo, all in one step; nothing is charged if any part fails) and starts one Studio Shot per photo, four at a time; each image
+is sent back as it finishes, and a failed photo is refunded on its own. The customer needs enough wallet balance for the whole
+batch, so "pay Rs 1,000 then send 20 photos" is simply a wallet recharge followed by the photos. Settings: `BULK_ENABLED`,
+`BULK_WINDOW_SECONDS` (45), `BULK_QUIET_SECONDS` (8), `BULK_MAX_PHOTOS` (50), `BULK_CONCURRENCY` (4). Needs the outbox (migration 0016)
+and migration 0020. Team and trial customers keep the one-message-per-photo flow. Only the Clean Studio Shot is offered in bulk.
