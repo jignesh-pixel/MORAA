@@ -315,6 +315,9 @@ class Settings(BaseSettings):
     GST_VERIFICATION_ENABLED: bool = False
     GST_PROVIDER: str = "none"
     GST_API_TIMEOUT_SECONDS: float = 8.0
+    GST_API_URL: str = ""                     # GST_PROVIDER=http: https://vendor/.../{gstin}
+    GST_API_KEY: str = ""
+    GST_API_KEY_HEADER: str = "x-api-key"
 
     # --- Earring e-commerce prompt version ---
     # "v1" (default) = the original live prompt, byte-for-byte unchanged.

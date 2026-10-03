@@ -11,7 +11,8 @@ Pieces:
                                                 pradr) wherever a vendor nests it
     verify_gstin                             -- Step B, never raises
 
-No real vendor is wired yet. ``GST_PROVIDER``:
+``GST_PROVIDER``:
+    "http"           -> a paid vendor configured by GST_API_URL / GST_API_KEY (see HttpGstProvider)
     "none" (default) -> every lookup reports ``unavailable`` (retry / skip)
     "mock"           -> local testing only; honoured only while DEBUG=true
 To add a vendor: subclass GstProvider, implement ``lookup`` to return the
@@ -148,7 +149,40 @@ class MockGstProvider(GstProvider):
         }}
 
 
-_PROVIDERS = {"none": NoGstProvider, "mock": MockGstProvider}
+class HttpGstProvider(GstProvider):
+    """Any vendor that answers a GSTIN lookup over HTTPS with the GST-portal taxpayer JSON (most Indian verification
+    APIs do: Cashfree, Appyflow, Surepass, gstinapi.in and others). Configure it, no code change:
+
+        GST_PROVIDER=http
+        GST_API_URL=https://vendor.example/gstin/{gstin}      ({gstin} is replaced by the number)
+        GST_API_KEY=...                                       (sent in the header named by GST_API_KEY_HEADER)
+        GST_API_KEY_HEADER=x-api-key
+
+    A 404 means "not found"; any other error becomes ``unavailable`` (the customer can retry or skip). The key is
+    never logged."""
+    name = "http"
+
+    async def lookup(self, gstin: str) -> Any:
+        import httpx
+
+        url_template = str(getattr(settings, "GST_API_URL", "") or "")
+        if "{gstin}" not in url_template or not url_template.lower().startswith("https://"):
+            raise RuntimeError("GST_API_URL must be an https address containing {gstin}")
+        headers = {}
+        key = str(getattr(settings, "GST_API_KEY", "") or "")
+        if key:
+            headers[str(getattr(settings, "GST_API_KEY_HEADER", "x-api-key") or "x-api-key")] = key
+        timeout = float(getattr(settings, "GST_API_TIMEOUT_SECONDS", 8.0) or 8.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(url_template.replace("{gstin}", gstin), headers=headers)
+        if response.status_code == 404:
+            raise GstLookupNotFound("vendor reports no such GSTIN")
+        if response.status_code != 200:
+            raise RuntimeError(f"vendor answered HTTP {response.status_code}")
+        return response.json()
+
+
+_PROVIDERS = {"none": NoGstProvider, "mock": MockGstProvider, "http": HttpGstProvider}
 
 
 def get_gst_provider() -> GstProvider:

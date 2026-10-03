@@ -25,3 +25,4 @@ openai==2.51.0
 razorpay==2.0.1
 redis==8.0.1
 httpx==0.28.1
+sentry-sdk==2.19.2

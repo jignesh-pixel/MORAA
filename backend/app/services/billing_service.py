@@ -33,7 +33,12 @@ def billing_name(snapshot: Optional[Dict[str, Any]], whatsapp_id: str) -> str:
 
 def billing_gstin(snapshot: Optional[Dict[str, Any]]) -> Optional[str]:
     value = str((snapshot or {}).get("gst_number") or "").replace(" ", "").upper()
-    return value if _GSTIN_RE.match(value) else None
+    if not _GSTIN_RE.match(value):
+        return None
+    # With live verification switched on, only a GSTIN the registry confirmed is printed on an invoice (EXT-8).
+    if settings.GST_VERIFICATION_ENABLED and (snapshot or {}).get("is_gst_verified") is not True:
+        return None
+    return value
 
 
 async def dispatch_payment_invoice(

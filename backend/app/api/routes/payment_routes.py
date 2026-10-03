@@ -760,6 +760,7 @@ async def process_razorpay_event(
                 "full_name": getattr(customer, "full_name", None),
                 "business_name": getattr(customer, "business_name", None),
                 "gst_number": getattr(customer, "gst_number", None),
+                "is_gst_verified": bool(getattr(customer, "is_gst_verified", False)),
                 "address": getattr(customer, "address", None),
             },
             local_pdf_fn=generate_invoice_pdf,
