@@ -25,6 +25,7 @@ T = TypeVar("T")
 _cpu_pool: Optional[ThreadPoolExecutor] = None
 _io_pool: Optional[ThreadPoolExecutor] = None
 _net_pool: Optional[ThreadPoolExecutor] = None
+_disk_pool: Optional[ThreadPoolExecutor] = None
 
 
 def _cpu() -> ThreadPoolExecutor:
@@ -73,10 +74,23 @@ async def run_net(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     return await asyncio.get_running_loop().run_in_executor(_net(), functools.partial(fn, *args, **kwargs))
 
 
+def _disk() -> ThreadPoolExecutor:
+    global _disk_pool
+    if _disk_pool is None:
+        _disk_pool = ThreadPoolExecutor(max_workers=32, thread_name_prefix="moraa-disk")
+    return _disk_pool
+
+
+async def run_disk(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    """Write a file on a pool of its own. Jobs here hold a whole image in memory while they wait, so they must never
+    queue behind database work: every writer gets a thread at once and the image is released as soon as it is on disk."""
+    return await asyncio.get_running_loop().run_in_executor(_disk(), functools.partial(fn, *args, **kwargs))
+
+
 def shutdown_executors() -> None:
     """Stop all pools (application shutdown). Running jobs finish; nothing new is accepted."""
-    global _cpu_pool, _io_pool, _net_pool
-    for pool in (_cpu_pool, _io_pool, _net_pool):
+    global _cpu_pool, _io_pool, _net_pool, _disk_pool
+    for pool in (_cpu_pool, _io_pool, _net_pool, _disk_pool):
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
-    _cpu_pool = _io_pool = _net_pool = None
+    _cpu_pool = _io_pool = _net_pool = _disk_pool = None

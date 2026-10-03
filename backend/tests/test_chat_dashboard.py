@@ -69,7 +69,7 @@ class RecordingTests(_Base):
 
     def test_a_sent_image_is_linked_to_the_output_we_kept(self):
         output_id = chat_log.save_output("ing-1", "Style A", 0, b"\x89PNG-bytes")
-        chat_log.set_output_media(output_id, "meta-123")
+        chat_log.link_output_media(output_id, "meta-123")
         chat_log.write_out({"type": "image", "to": SENDER, "image": {"id": "meta-123", "caption": "x"}}, "o1")
         row = self.db.query(ChatMessage).one()
         self.assertEqual((row.output_id, row.ingestion_id), (output_id, "ing-1"))
@@ -234,8 +234,16 @@ class ApiTests(_Base):
 
     def test_an_allowed_email_can_read(self):
         self.user.is_admin = False
+        self.user.is_verified = True
         with patch.object(settings, "ADMIN_USERNAMES", ""), patch.object(settings, "DASHBOARD_ALLOWED_EMAILS", "Owner@Example.com"):
             self.assertEqual(self.client.get("/api/dashboard/me").status_code, 200)
+
+    def test_an_unverified_account_with_an_allowed_email_is_refused(self):
+        # a password sign-up never proves it owns the email address
+        self.user.is_admin = False
+        self.user.is_verified = False
+        with patch.object(settings, "ADMIN_USERNAMES", ""), patch.object(settings, "DASHBOARD_ALLOWED_EMAILS", "owner@example.com"):
+            self.assertEqual(self.client.get("/api/dashboard/me").status_code, 403)
 
     def test_the_signed_image_link_works_without_a_login_and_a_bad_one_does_not(self):
         path = Path(self.tmp.name) / "outputs" / "i" / "a.png"
@@ -257,6 +265,85 @@ class ApiTests(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewFixTests(_Base):
+    def test_signed_addresses_are_stable_between_refreshes_and_still_expire(self):
+        a, b = svc.sign_media("output", "x"), svc.sign_media("output", "x")
+        self.assertEqual(a, b)
+        exp = int(a.split("exp=")[1].split("&")[0])
+        self.assertGreater(exp - time.time(), 600 - 1)             # at least 10 minutes of validity
+        self.assertLessEqual(exp - time.time(), 900 + 300)
+
+    def test_paging_back_never_skips_rows_when_one_source_is_sparse(self):
+        customer = self.make_customer(0)
+        for i in range(10):                                          # 10 messages, oldest first
+            self.msg("in", f"m{i}", minutes_ago=100 - i * 10)
+        tx = WalletTransaction(customer_id=customer.id, kind=KIND_CREDIT_PAYMENT, amount=500, balance_after=500, ref="p")
+        tx.created_at = datetime.now(timezone.utc) - timedelta(minutes=200)       # an old event, older than every message
+        self.db.add(tx)
+        self.db.commit()
+        seen = []
+        before = None
+        for _ in range(10):
+            page = svc.timeline(self.db, SENDER, before=datetime.fromisoformat(before) if before else None, limit=4)
+            seen += [i["text"] for i in page["items"]]
+            if not page["has_more"]:
+                break
+            before = page["cursor"]
+        texts = [t for t in seen if t and t.startswith("m")]
+        self.assertEqual(sorted(texts), sorted(f"m{i}" for i in range(10)))      # every message exactly once
+        self.assertEqual(len(texts), len(set(texts)))
+        self.assertTrue(any("Payment received" in (t or "") for t in seen))
+
+    def test_a_before_time_with_an_offset_is_read_as_that_moment(self):
+        self.msg("in", "early", minutes_ago=120)
+        self.msg("in", "late", minutes_ago=10)
+        cut = (datetime.now(timezone.utc) - timedelta(minutes=60)).astimezone(timezone(timedelta(hours=5, minutes=30)))
+        items = svc.timeline(self.db, SENDER, before=cut)["items"]
+        self.assertEqual([i["text"] for i in items], ["early"])
+
+    def test_an_invoice_link_is_only_built_from_a_web_address(self):
+        with patch.object(settings, "ERPNEXT_BASE_URL", "javascript:alert(1)//"):
+            self.assertIsNone(svc._invoice_url("INV-1"))
+        with patch.object(settings, "ERPNEXT_BASE_URL", "https://erp.example.com/"):
+            self.assertEqual(svc._invoice_url("A B/1"), "https://erp.example.com/app/sales-invoice/A%20B%2F1")
+
+    def test_search_treats_percent_and_underscore_literally(self):
+        self.make_customer(0)
+        self.msg("in", "x")
+        self.assertEqual(svc.list_customers(self.db, "%"), [])
+        self.assertEqual(svc.list_customers(self.db, "_"), [])
+
+    def test_one_failed_write_does_not_switch_recording_off(self):
+        with patch.object(chat_log, "_session", side_effect=RuntimeError("temporary glitch")):
+            chat_log.write_in({"type": "text", "sender": SENDER, "message_id": "g1", "body": "x"})
+        self.assertTrue(chat_log.enabled())
+
+    def test_the_photo_link_survives_the_generic_writer_getting_there_first(self):
+        chat_log.write_in({"type": "image", "sender": SENDER, "message_id": "w5", "media_id": "m5", "caption": "c"})
+        chat_log.attach_photo("w5", SENDER, "ing-5", "img-5")
+        row = self.db.query(ChatMessage).one()
+        self.assertEqual((row.ingestion_id, row.image_id, row.text, row.meta_media_id), ("ing-5", "img-5", "c", "m5"))
+
+    def test_an_image_saved_after_the_message_was_recorded_is_connected_later(self):
+        chat_log.write_out({"type": "image", "to": SENDER, "image": {"id": "late-1", "caption": "x"}}, "o9")   # message first
+        output_id = chat_log.save_output("ing-7", "S", 0, b"\xff\xd8\xff-jpeg")
+        chat_log.link_output_media(output_id, "late-1")
+        row = self.db.query(ChatMessage).one()
+        self.assertEqual((row.output_id, row.ingestion_id), (output_id, "ing-7"))
+        self.assertEqual(self.db.get(OrderOutput, output_id).mime_type, "image/jpeg")
+
+    def test_an_erased_number_is_not_recorded_again(self):
+        chat_log.suppress(SENDER)
+        chat_log.write_out({"type": "text", "to": SENDER, "text": {"body": "Done. Your data was deleted."}}, "z1")
+        chat_log.write_in({"type": "text", "sender": SENDER, "message_id": "z2", "body": "bye"})
+        self.assertEqual(self.db.query(ChatMessage).count(), 0)
+
+    def test_the_invoice_record_survives_two_writers_racing(self):
+        chat_log.upsert_invoice("pay_r", SENDER, 100, "failed")
+        chat_log.upsert_invoice("pay_r", SENDER, 100, "sent", "ACC-9")
+        self.assertEqual(self.db.query(InvoiceRecord).count(), 1)
 
 
 class StartupCleanupTests(unittest.TestCase):

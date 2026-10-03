@@ -1009,6 +1009,11 @@ def process_mem_mb() -> Tuple[float, float]:
 async def memory_child(n: int, trace: bool) -> Dict[str, Any]:
     import tracemalloc
 
+    # This scenario measures the memory of GENERATION. The chat-dashboard record writes every produced image to disk; the
+    # harness runs provider time 100x faster than real life, so there the disk write would dominate and distort the number.
+    # The record's own cost is measured, at real size and real speed, by scenario l.
+    settings.CHAT_LOG_ENABLED = False
+
     jpeg3 = make_noise_jpeg(3.0)
     out_bytes = 3 * 1024 * 1024
     primary, fallback = fresh_providers(output_bytes=out_bytes)
@@ -1133,11 +1138,48 @@ def run_pool_children() -> Dict[str, Any]:
     }
 
 
+# ─── (l) the chat-dashboard record of produced images ───────────────────
+
+async def scenario_l() -> Dict[str, Any]:
+    """What it costs to keep a copy of every produced image for the chat dashboard (3 MB, 36 images = 6 Packs finishing
+    together): how long each write blocks the loop, the worst loop stall, and whether any memory is left behind."""
+    import shutil
+    import tracemalloc
+
+    from app.services import chat_log
+
+    data = make_noise_jpeg(3.0)
+    folder = f"load-l-{uuid.uuid4().hex[:6]}"
+    times: List[float] = []
+    tracemalloc.start()
+    async with fakes.LoopLagMonitor() as lag:
+        for _ in range(36):
+            t0 = time.perf_counter()
+            info = chat_log.write_output_file(folder, data)
+            times.append(time.perf_counter() - t0)
+            await asyncio.sleep(0.01)
+            if info is None:
+                break
+    current, _peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    shutil.rmtree(settings.UPLOAD_PATH / "outputs" / folder, ignore_errors=True)
+    times.sort()
+    p95_ms = round(times[min(len(times) - 1, int(len(times) * 0.95))] * 1000, 1)
+    summary = lag.summary()
+    ok = info is not None and p95_ms <= 80 and summary["lag_max_ms"] <= 150 and current < 12 * 1024 * 1024
+    return {
+        "images_written": len(times), "write_ms_p95": p95_ms, "write_ms_max": round(times[-1] * 1000, 1),
+        "loop_lag": summary, "memory_left_behind_mb": round(current / 1048576, 1), "verdict": verdict(ok),
+        "verdict_reason": f"writing a 3 MB image takes {p95_ms} ms (p95), the worst loop stall was {summary['lag_max_ms']} ms, "
+                          f"{round(current / 1048576, 1)} MB left in memory afterwards",
+    }
+
+
 # ─── driver ─────────────────────────────────────────────────────────────
 
 SCENARIOS: Dict[str, Callable[[], Awaitable[Dict[str, Any]]]] = {
     "a": scenario_a, "b": scenario_b, "c": scenario_c, "d": scenario_d,
-    "e": scenario_e, "f": scenario_f, "g": scenario_g, "h": scenario_h,
+    "e": scenario_e, "f": scenario_f, "g": scenario_g, "h": scenario_h, "l": scenario_l,
 }
 
 
@@ -1157,7 +1199,7 @@ async def main_async(selected: List[str]) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--only", default="a,b,c,d,e,f,g,h,i,k")
+    ap.add_argument("--only", default="a,b,c,d,e,f,g,h,i,k,l")
     ap.add_argument("--memchild", type=int, default=0)
     ap.add_argument("--trace", action="store_true")
     ap.add_argument("--poolchild", type=int, default=0)

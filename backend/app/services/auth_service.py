@@ -49,12 +49,21 @@ class AuthService:
         """Log in (creating the account on first use) a person whose email Google has verified and who is allowed in."""
         import secrets
 
-        user = self.repo.find_first(email=email)
+        from sqlalchemy import func
+
+        email = email.strip().lower()
+        user = self.db.query(User).filter(func.lower(User.email) == email).first()
         if user is None:
+            if self.db.query(User.id).filter(func.lower(User.username) == email).first() is not None:
+                raise ValueError("An account with this name already exists; ask the developer to link it")
             user = self.repo.create(
                 email=email, username=email, hashed_password=hash_password(secrets.token_urlsafe(32)), full_name=email,
+                is_verified=True,
             )
             logger.bind(category="auth").info("Dashboard account created through Google sign-in")
+        elif not user.is_verified:
+            user.is_verified = True                 # Google has just proved this email address
+            self.db.commit()
         if not user.is_active:
             raise ValueError("Account is deactivated")
         return self._generate_auth_response(user)

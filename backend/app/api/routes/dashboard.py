@@ -26,7 +26,10 @@ def allowed_emails() -> set:
 
 
 def require_dashboard_user(user: User = Depends(require_auth), db: Session = Depends(get_db)) -> User:
-    if is_admin_user(user, db) or str(getattr(user, "email", "") or "").lower() in allowed_emails():
+    # An email in DASHBOARD_ALLOWED_EMAILS only counts for a VERIFIED account (created by Google sign-in or by the
+    # create_dashboard_user script): a password sign-up never proves ownership of its email address.
+    verified_email = bool(getattr(user, "is_verified", False)) and str(getattr(user, "email", "") or "").lower() in allowed_emails()
+    if is_admin_user(user, db) or verified_email:
         return user
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This dashboard is for the owners only")
 

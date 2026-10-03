@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { X, ZoomIn, ZoomOut, ExternalLink } from "lucide-react";
-import { absoluteMediaUrl } from "@/services/chat-dashboard.service";
+import { absoluteMediaUrl, safeHref } from "@/services/chat-dashboard.service";
 
 interface Props {
   url: string;
@@ -47,9 +47,9 @@ export default function ImageLightbox({ url, title, driveLink, onClose }: Props)
           <button className="rounded p-2 hover:bg-white/10" aria-label="Zoom in" onClick={() => setZoom((z) => Math.min(z + 0.5, 6))}>
             <ZoomIn size={18} />
           </button>
-          {driveLink && (
+          {safeHref(driveLink) && (
             <a
-              href={driveLink}
+              href={safeHref(driveLink)}
               target="_blank"
               rel="noreferrer"
               className="flex items-center gap-1 rounded bg-white/10 px-3 py-1.5 text-xs hover:bg-white/20"

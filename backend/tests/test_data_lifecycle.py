@@ -241,6 +241,22 @@ class ChatHistoryTests(_Base):
             self.assertEqual([m.text for m in self.db.query(ChatMessage).all()], ["new"])
             self.assertIsNone(self.db.get(OrderOutput, out.id).file_path)
 
+    def test_erasure_also_deletes_drive_copies_hides_the_invoice_phone_and_keeps_the_customer_out_of_the_dashboard(self):
+        from app.models.chat_log import ChatMessage, InvoiceRecord
+        from app.services import chat_log, drive_archive
+
+        customer = self.make_customer(0)
+        self.db.add(ChatMessage(customer_phone=SENDER, direction="in", msg_type="image", drive_file_id="drive-1"))
+        self.db.add(InvoiceRecord(payment_id="pay_x", customer_phone=SENDER, amount_rupees=500, status="sent"))
+        self.db.commit()
+        with patch.object(drive_archive, "delete_files_sync") as deleter:
+            dl.erase_customer(self.db, customer)
+        self.assertIn("drive-1", deleter.call_args.args[0])
+        self.assertTrue(self.db.query(InvoiceRecord).one().customer_phone.startswith("erased-"))
+        chat_log.write_out({"type": "text", "to": SENDER, "text": {"body": "Done."}}, "after")        # the confirmation message
+        self.assertEqual(self.db.query(ChatMessage).count(), 0)
+        chat_log.reset_for_tests()
+
     def test_erasure_removes_the_customers_chat_record(self):
         from app.models.chat_log import ChatMessage
 

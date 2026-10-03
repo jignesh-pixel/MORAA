@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { X, ExternalLink, Loader2 } from "lucide-react";
-import { fetchProfile, type CustomerProfile } from "@/services/chat-dashboard.service";
+import { fetchProfile, safeHref, type CustomerProfile } from "@/services/chat-dashboard.service";
 
 const rupees = (n: number) => `₹${n.toLocaleString("en-IN")}`;
 const when = (iso: string | null | undefined) =>
@@ -89,8 +89,8 @@ export default function ProfilePanel({ phone, onClose }: { phone: string; onClos
                     <div className="font-medium" style={{ color: "var(--theme-text)" }}>{inv.number ?? "Receipt"} · {rupees(inv.amount)}</div>
                     <div className="text-xs opacity-70">{when(inv.at)} · {inv.status}</div>
                   </div>
-                  {inv.link && (
-                    <a href={inv.link} target="_blank" rel="noreferrer" className="flex items-center gap-1 text-xs underline">
+                  {safeHref(inv.link) && (
+                    <a href={safeHref(inv.link)} target="_blank" rel="noreferrer" className="flex items-center gap-1 text-xs underline">
                       Open in ERPNext <ExternalLink size={12} />
                     </a>
                   )}

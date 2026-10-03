@@ -89,8 +89,10 @@ def purge_expired_media(db: Session, days: Optional[int] = None, batch: int = 20
 
 def purge_chat_history(db: Session, days: Optional[int] = None, batch: int = 500) -> Dict[str, int]:
     """Delete chat messages older than ``days`` and the files of images we produced that are older than that (the
-    dashboard keeps 90 days). The order and money records themselves are not touched. Returns counts."""
+    dashboard keeps 90 days), including their Google Drive copies. The order and money records themselves are not
+    touched. Returns counts."""
     from app.models.chat_log import ChatMessage, OrderOutput
+    from app.services import drive_archive
 
     days = int(settings.RETENTION_CHAT_DAYS if days is None else days)
     if days <= 0:
@@ -98,37 +100,53 @@ def purge_chat_history(db: Session, days: Optional[int] = None, batch: int = 500
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     messages = 0
     while True:
-        ids = [r[0] for r in db.query(ChatMessage.id).filter(ChatMessage.created_at < cutoff).limit(batch).all()]
-        if not ids:
-            break
-        messages += db.query(ChatMessage).filter(ChatMessage.id.in_(ids)).delete(synchronize_session=False)
-        db.commit()
-    outputs = 0
-    while True:
-        rows = db.query(OrderOutput).filter(OrderOutput.created_at < cutoff, OrderOutput.file_path.isnot(None)).limit(batch).all()
+        rows = db.query(ChatMessage.id, ChatMessage.drive_file_id).filter(ChatMessage.created_at < cutoff).limit(batch).all()
         if not rows:
             break
+        drive_archive.delete_files_sync([r[1] for r in rows])
+        messages += db.query(ChatMessage).filter(ChatMessage.id.in_([r[0] for r in rows])).delete(synchronize_session=False)
+        db.commit()
+    outputs = 0
+    skipped: set = set()
+    while True:
+        rows = [r for r in db.query(OrderOutput).filter(OrderOutput.created_at < cutoff, OrderOutput.file_path.isnot(None))
+                .limit(batch).all() if r.id not in skipped]
+        if not rows:
+            break
+        drive_archive.delete_files_sync([r.drive_file_id for r in rows])
         for row in rows:
-            _delete_output_file(row)
-            row.file_path = None
-            outputs += 1
+            if _delete_output_file(row):
+                row.file_path = None
+                row.drive_file_id = row.drive_link = None
+                outputs += 1
+            else:
+                skipped.add(row.id)                   # could not be removed now: try again at the next pass
         db.commit()
     if messages or outputs:
         logger.bind(category="system").info(f"Retention: removed {messages} chat message(s) and {outputs} output image(s)")
     return {"messages": messages, "outputs": outputs}
 
 
-def _delete_output_file(output) -> None:
+def _delete_output_file(output) -> bool:
+    """Remove the file of a kept image (and its folder when empty). True when it is gone (or never existed)."""
     import os
 
     if not output.file_path:
-        return
+        return True
     try:
+        root = settings.UPLOAD_PATH.resolve()
         path = (settings.UPLOAD_PATH / output.file_path).resolve()
-        if settings.UPLOAD_PATH.resolve() in path.parents and path.is_file():
+        if root not in path.parents:
+            return True                                # not ours to touch: treat as gone
+        if path.is_file():
             os.remove(path)
+        try:
+            path.parent.rmdir()                        # the per-order folder, only when it is now empty
+        except OSError:
+            pass
+        return True
     except OSError:
-        pass
+        return False
 
 
 def mask_old_audit_details(db: Session, days: Optional[int] = None, batch: int = 500) -> int:
@@ -262,16 +280,30 @@ def erase_customer(db: Session, customer: Customer) -> Dict[str, int]:
     # The chat record and the images we produced for this customer go too (the money trail stays).
     from app.models.chat_log import ChatMessage, OrderOutput
 
-    chat_digits = {v.lstrip("+") for v in variants}
+    from app.models.chat_log import InvoiceRecord
+    from app.services import chat_log, drive_archive
+    from app.utils.phone import normalize_phone
+
+    chat_digits = {v.lstrip("+") for v in variants} | {normalize_phone(phone)}
     chat_removed = 0
+    drive_ids = []
     try:
         with db.begin_nested():                       # the chat tables may not exist yet on an older database
+            drive_ids += [r[0] for r in db.query(ChatMessage.drive_file_id).filter(ChatMessage.customer_phone.in_(chat_digits)).all()]
             chat_removed = db.query(ChatMessage).filter(ChatMessage.customer_phone.in_(chat_digits)).delete(synchronize_session=False)
             for output in db.query(OrderOutput).filter(OrderOutput.ingestion_id.in_([i.id for i in ingestions] or ["-"])).all():
-                _delete_output_file(output)
-                output.file_path = None
+                drive_ids.append(output.drive_file_id)
+                if _delete_output_file(output):
+                    output.file_path = None
+                    output.drive_file_id = output.drive_link = None
+            # The invoice record is a financial note: it stays, but the phone number in it goes.
+            db.query(InvoiceRecord).filter(InvoiceRecord.customer_phone.in_(chat_digits)).update(
+                {"customer_phone": f"erased-{customer.id[:8]}"}, synchronize_session=False)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"Erasure: chat record not removed ({type(e).__name__})")
+    drive_archive.delete_files_sync(drive_ids)
+    for number in chat_digits:
+        chat_log.suppress(number)                     # the confirmation message must not bring this customer back
     masked_rows = 0
     last4 = phone[-4:]
     pattern = re.compile(r"(?<!\d)\+?(?:" + "|".join(re.escape(v.lstrip("+")) for v in variants) + r")(?!\d)")

@@ -910,12 +910,13 @@ async def send_catalog_pack_images_to_whatsapp(
 async def _upload_and_keep(image_bytes: bytes, ingestion_id: str, style: Optional[str]) -> Optional[str]:
     """Keep a copy of an image we produced (for the chat dashboard), then upload it to Meta. The copy is best effort:
     if it cannot be kept the upload and delivery go ahead exactly as before."""
-    output_id = None
-    if chat_log.enabled():
-        output_id = await run_io(chat_log.save_output, ingestion_id, style, 0, image_bytes)
     media_id = await upload_media_to_meta(image_bytes)
-    if output_id and media_id:
-        await run_io(chat_log.set_output_media, output_id, media_id)
+    # Delivery has already happened. The copy is written right here, to the local disk (a few milliseconds for a 3 MB
+    # file): handing the image to another thread or task would keep it in memory until the busy event loop got round to
+    # it, which measurably raised memory under bursts. Only the small database record is written in the background.
+    info = chat_log.write_output_file(ingestion_id, image_bytes) if chat_log.enabled() else None
+    if info:
+        chat_log.fire(chat_log.register_output, ingestion_id, style, 0, info, media_id)
     return media_id
 
 

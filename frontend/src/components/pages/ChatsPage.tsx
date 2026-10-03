@@ -13,6 +13,7 @@ import {
   fetchTimeline,
   loginWithGoogle,
   loginWithPassword,
+  safeHref,
   signOut,
   type AuditOrder,
   type ChatCustomer,
@@ -129,8 +130,8 @@ function Bubble({ item, onOpen }: { item: TimelineItem; onOpen: (v: Viewing) => 
       <div className="my-2 flex justify-center">
         <span className="flex max-w-[80%] items-center gap-2 rounded-full px-3 py-1 text-xs" style={{ background: "#fff3c4", color: "#4a3b00" }}>
           <span>{item.text}</span>
-          {item.link && (
-            <a href={item.link} target="_blank" rel="noreferrer" className="flex items-center gap-1 underline">
+          {safeHref(item.link) && (
+            <a href={safeHref(item.link)} target="_blank" rel="noreferrer" className="flex items-center gap-1 underline">
               Open in ERPNext <ExternalLink size={11} />
             </a>
           )}
@@ -167,19 +168,27 @@ function Bubble({ item, onOpen }: { item: TimelineItem; onOpen: (v: Viewing) => 
 
 function Thread({ phone, onOpenImage }: { phone: string; onOpenImage: (v: Viewing) => void }) {
   const [items, setItems] = useState<TimelineItem[]>([]);
+  const [earlier, setEarlier] = useState<TimelineItem[]>([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
+  const earlierLoaded = useRef(false);
 
   useEffect(() => {
     // The page gives this component a new key per customer, so it always starts from a clean state.
     let cancelled = false;
-    const run = () =>
+    let running = false; // a slow answer must not be overtaken (and overwritten) by the next poll
+    const run = () => {
+      if (running) return;
+      running = true;
       fetchTimeline(phone)
         .then((data) => {
           if (cancelled) return;
           setItems(data.items);
+          if (!earlierLoaded.current) setHasMore(data.has_more);
           setError(null);
           setLoading(false);
         })
@@ -187,7 +196,11 @@ function Thread({ phone, onOpenImage }: { phone: string; onOpenImage: (v: Viewin
           if (cancelled) return;
           setError((e as Error).message);
           setLoading(false);
+        })
+        .finally(() => {
+          running = false;
         });
+    };
     run();
     const t = setInterval(run, POLL_MS);
     return () => {
@@ -196,14 +209,38 @@ function Thread({ phone, onOpenImage }: { phone: string; onOpenImage: (v: Viewin
     };
   }, [phone]);
 
+  const all = useMemo(() => {
+    const seen = new Set<string>();
+    return [...earlier, ...items]
+      .filter((i) => (seen.has(i.id) ? false : (seen.add(i.id), true)))
+      .sort((a, b) => (a.at ?? "").localeCompare(b.at ?? ""));
+  }, [earlier, items]);
+
+  const loadEarlier = async () => {
+    const oldest = all[0]?.at;
+    if (!oldest) return;
+    setLoadingEarlier(true);
+    stickToBottom.current = false;
+    try {
+      const page = await fetchTimeline(phone, oldest);
+      earlierLoaded.current = true;
+      setEarlier((prev) => [...page.items, ...prev]);
+      setHasMore(page.has_more);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoadingEarlier(false);
+    }
+  };
+
   useEffect(() => {
     if (stickToBottom.current) bottomRef.current?.scrollIntoView();
-  }, [items]);
+  }, [all]);
 
   const withDays = useMemo(() => {
     const out: (TimelineItem | { id: string; day: string })[] = [];
     let last = "";
-    for (const it of items) {
+    for (const it of all) {
       const d = dayOf(it.at);
       if (d !== last) {
         out.push({ id: `day-${d}`, day: d });
@@ -212,11 +249,11 @@ function Thread({ phone, onOpenImage }: { phone: string; onOpenImage: (v: Viewin
       out.push(it);
     }
     return out;
-  }, [items]);
+  }, [all]);
 
   if (loading) return <div className="flex flex-1 items-center justify-center"><Loader2 className="animate-spin" /></div>;
   if (error) return <div className="p-6 text-sm text-red-500">{error}</div>;
-  if (items.length === 0) return <div className="p-6 text-sm opacity-60">No messages in the last 90 days.</div>;
+  if (all.length === 0) return <div className="p-6 text-sm opacity-60">No messages in the last 90 days.</div>;
   return (
     <div
       className="flex-1 overflow-y-auto px-4 py-3"
@@ -226,6 +263,17 @@ function Thread({ phone, onOpenImage }: { phone: string; onOpenImage: (v: Viewin
         stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
       }}
     >
+      {hasMore && (
+        <div className="mb-2 flex justify-center">
+          <button
+            disabled={loadingEarlier}
+            onClick={loadEarlier}
+            className="rounded-md bg-white/90 px-3 py-1 text-xs text-slate-700 shadow-sm disabled:opacity-60"
+          >
+            {loadingEarlier ? "Loading…" : "Load earlier messages"}
+          </button>
+        </div>
+      )}
       {withDays.map((it) =>
         "day" in it ? (
           <div key={it.id} className="my-3 flex justify-center">
@@ -336,11 +384,16 @@ export default function ChatsPage() {
     checkSession().then(setSignedIn);
   }, []);
 
+  const listSeq = useRef(0);
   const loadList = useCallback(async () => {
+    const mine = ++listSeq.current; // only the newest request may update the list
     try {
-      setCustomers(await fetchCustomers(query));
+      const rows = await fetchCustomers(query);
+      if (mine !== listSeq.current) return;
+      setCustomers(rows);
       setListError(null);
     } catch (e) {
+      if (mine !== listSeq.current) return;
       if (e instanceof DashboardAuthError) setSignedIn(false);
       setListError((e as Error).message);
     }

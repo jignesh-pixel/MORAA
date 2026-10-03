@@ -131,5 +131,30 @@ class ArchiveTests(_Base):
         self.assertEqual(len([c for c in drive.calls if "oauth2" in c[1]]), 1)
 
 
+class DeleteTests(unittest.TestCase):
+    def test_copies_are_deleted_and_an_already_gone_copy_counts(self):
+        seen = []
+
+        def handler(request):
+            if "oauth2" in str(request.url):
+                return httpx.Response(200, json={"access_token": "t"})
+            seen.append((request.method, str(request.url).split("?")[0]))
+            return httpx.Response(404 if str(request.url).endswith("gone") else 204)
+
+        real = httpx.Client
+
+        def factory(*a, **k):
+            k["transport"] = httpx.MockTransport(handler)
+            return real(*a, **k)
+
+        with patch.multiple(settings, **CFG), patch.object(httpx, "Client", side_effect=factory):
+            self.assertEqual(drive_archive.delete_files_sync(["a1", None, "gone"]), 2)
+        self.assertEqual(seen, [("DELETE", "https://www.googleapis.com/drive/v3/files/a1"),
+                                ("DELETE", "https://www.googleapis.com/drive/v3/files/gone")])
+
+    def test_nothing_happens_when_drive_is_off(self):
+        self.assertEqual(drive_archive.delete_files_sync(["a1"]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

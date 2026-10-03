@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, Optional
 
 from app.config import settings
 from app.services.erpnext_service import get_erpnext_service
-from app.utils.executors import run_cpu, run_io
+from app.utils.executors import run_cpu
 from app.utils.logger import logger, mask_phone
 _GSTIN_RE = re.compile(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]$")
 _PLACEHOLDER_NAMES = {"", "valued customer", "jewelry business", "there", "customer"}
@@ -46,8 +46,7 @@ async def _note_invoice(payment_id: str, phone: str, amount: int, status: str, i
     try:
         from app.services import chat_log
 
-        if chat_log.enabled():
-            await run_io(chat_log.upsert_invoice, payment_id, phone, amount, status, invoice)
+        chat_log.fire(chat_log.upsert_invoice, payment_id, phone, amount, status, invoice)
     except Exception:  # noqa: BLE001
         pass
 

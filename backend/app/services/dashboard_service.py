@@ -25,13 +25,14 @@ from app.models.wallet_transaction import WalletTransaction
 from app.models.whatsapp_ingestion import WhatsAppIngestion
 from app.utils.phone import normalize_phone
 
-MEDIA_LINK_SECONDS = 600
+MEDIA_LINK_SECONDS = 900          # a link is valid for 10 to 15 minutes
+MEDIA_LINK_WINDOW = 300           # expiry is rounded to 5-minute steps, so the address stays the same between refreshes
 
 
 def _aware(value: Optional[datetime]) -> Optional[datetime]:
     if value is None:
         return None
-    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
 def _iso(value: Optional[datetime]) -> Optional[str]:
@@ -52,7 +53,7 @@ def _mac(kind: str, media_id: str, expires: int) -> str:
 
 def sign_media(kind: str, media_id: str) -> str:
     """A path that serves one image for the next few minutes (a forwarded link soon stops working)."""
-    expires = int(time.time()) + MEDIA_LINK_SECONDS
+    expires = (int(time.time() + MEDIA_LINK_SECONDS) // MEDIA_LINK_WINDOW + 1) * MEDIA_LINK_WINDOW
     return f"/api/dashboard/media/{kind}/{media_id}?exp={expires}&sig={_mac(kind, media_id, expires)}"
 
 
@@ -111,13 +112,17 @@ def list_customers(db: Session, query: str = "", limit: int = 50, offset: int = 
         func.count(ChatMessage.id).label("n"),
     ).filter(ChatMessage.created_at >= since)
     if q:
-        like = f"%{q}%"
-        named = {normalize_phone(c.whatsapp_id) for c in db.query(Customer.whatsapp_id).filter(
-            or_(Customer.full_name.ilike(like), Customer.business_name.ilike(like),
-                Customer.whatsapp_id.like(f"%{normalize_phone(q) or q}%"))
-        ).all()}
-        base = base.filter(or_(ChatMessage.customer_phone.like(f"%{normalize_phone(q) or q}%"),
-                               ChatMessage.customer_phone.in_(named or {"-"})))
+        escaped = q.replace("\\", "\\\\").replace("%", "\%").replace("_", "\_")
+        like = f"%{escaped}%"
+        digits = "".join(ch for ch in q if ch.isdigit())          # a number search only when the search has digits
+        conditions = [Customer.full_name.ilike(like, escape="\\"), Customer.business_name.ilike(like, escape="\\")]
+        if digits:
+            conditions.append(Customer.whatsapp_id.like(f"%{digits}%"))
+        named = {normalize_phone(c.whatsapp_id) for c in db.query(Customer.whatsapp_id).filter(or_(*conditions)).limit(500).all()}
+        phone_filters = [ChatMessage.customer_phone.in_(named or {"-"})]
+        if digits:
+            phone_filters.append(ChatMessage.customer_phone.like(f"%{digits}%"))
+        base = base.filter(or_(*phone_filters))
     rows = base.group_by(ChatMessage.customer_phone).order_by(func.max(ChatMessage.created_at).desc()) \
         .limit(max(min(limit, 200), 1)).offset(max(offset, 0)).all()
     phones = [r.phone for r in rows]
@@ -129,9 +134,14 @@ def list_customers(db: Session, query: str = "", limit: int = 50, offset: int = 
         ).filter(ChatMessage.customer_phone.in_(phones), ChatMessage.created_at >= since).subquery()
         for msg in db.query(ChatMessage).join(ranked, ranked.c.id == ChatMessage.id).filter(ranked.c.rn == 1).all():
             latest[msg.customer_phone] = msg
+    variants = {v for p in phones for v in (p, f"+{p}", p[-10:])}
+    by_phone: Dict[str, Customer] = {}
+    if variants:
+        for c in db.query(Customer).filter(Customer.whatsapp_id.in_(variants)).all():
+            by_phone.setdefault(normalize_phone(c.whatsapp_id), c)
     out = []
     for r in rows:
-        customer = _customer_for(db, r.phone)
+        customer = by_phone.get(r.phone) or _customer_for(db, r.phone)
         last = latest.get(r.phone)
         out.append({
             "phone": r.phone,
@@ -158,8 +168,12 @@ _EVENT_TEXT = {
 
 
 def _invoice_url(name: Optional[str]) -> Optional[str]:
+    from urllib.parse import quote
+
     base = (settings.ERPNEXT_BASE_URL or "").rstrip("/")
-    return f"{base}/app/sales-invoice/{name}" if base and name else None
+    if not base or not name or not base.lower().startswith(("https://", "http://")):
+        return None                                  # never build a link from a non-web address
+    return f"{base}/app/sales-invoice/{quote(name, safe='')}"
 
 
 def _message_item(db: Session, m: ChatMessage, outputs: Dict[str, OrderOutput]) -> Dict[str, Any]:
@@ -176,37 +190,58 @@ def _message_item(db: Session, m: ChatMessage, outputs: Dict[str, OrderOutput]) 
 
 
 def timeline(db: Session, phone: str, before: Optional[datetime] = None, limit: int = 150) -> Dict[str, Any]:
+    """The newest ``limit`` items of the chat (messages plus payment and invoice notes) older than ``before``.
+
+    Each source is read newest-first up to ``limit`` rows. A source that hit its limit may have older rows we did not read,
+    so nothing older than the OLDEST row it returned is shown; otherwise a later "load earlier" request could skip rows.
+    ``cursor`` (the oldest time shown) is what to pass as ``before`` for the next page."""
     phone = normalize_phone(phone)
     since = history_start()
     upper = _aware(before) or datetime.now(timezone.utc) + timedelta(minutes=1)
     limit = max(min(limit, 500), 1)
+    lower_bounds = []                                  # one per source that may have more rows than it returned
+
     msgs = db.query(ChatMessage).filter(
         ChatMessage.customer_phone == phone, ChatMessage.created_at >= since, ChatMessage.created_at < upper
     ).order_by(ChatMessage.created_at.desc()).limit(limit).all()
+    if len(msgs) == limit:
+        lower_bounds.append(_aware(msgs[-1].created_at))
     output_ids = {m.output_id for m in msgs if m.output_id}
     outputs = {o.id: o for o in db.query(OrderOutput).filter(OrderOutput.id.in_(output_ids)).all()} if output_ids else {}
     items = [_message_item(db, m, outputs) for m in msgs]
 
     customer = _customer_for(db, phone)
     if customer is not None:
-        for t in db.query(WalletTransaction).filter(
+        txs = db.query(WalletTransaction).filter(
             WalletTransaction.customer_id == customer.id, WalletTransaction.created_at >= since,
             WalletTransaction.created_at < upper, WalletTransaction.kind != "opening_balance",
-        ).order_by(WalletTransaction.created_at.desc()).limit(limit).all():
+        ).order_by(WalletTransaction.created_at.desc()).limit(limit).all()
+        if len(txs) == limit:
+            lower_bounds.append(_aware(txs[-1].created_at))
+        for t in txs:
             template = _EVENT_TEXT.get(t.kind, "{kind} ₹{amt}")
             items.append({"id": f"tx-{t.id}", "type": "event", "event": "money", "text": template.format(
                 amt=f"{abs(int(t.amount)):,}", ref=t.ref or "", kind=t.kind), "at": _iso(t.created_at),
                 "ingestion_id": t.ingestion_id})
-    for inv in db.query(InvoiceRecord).filter(
+    invs = db.query(InvoiceRecord).filter(
         InvoiceRecord.customer_phone == phone, InvoiceRecord.created_at >= since, InvoiceRecord.created_at < upper
-    ).all():
+    ).order_by(InvoiceRecord.created_at.desc()).limit(limit).all()
+    if len(invs) == limit:
+        lower_bounds.append(_aware(invs[-1].created_at))
+    for inv in invs:
         label = {"sent": "🧾 Invoice sent", "failed": "⚠️ Invoice could not be sent yet (retrying)", "pending": "🧾 Invoice pending"}[inv.status]
         items.append({"id": f"inv-{inv.id}", "type": "event", "event": "invoice",
                       "text": f"{label}: ₹{inv.amount_rupees:,}" + (f" ({inv.erpnext_invoice})" if inv.erpnext_invoice else ""),
                       "at": _iso(inv.created_at), "link": _invoice_url(inv.erpnext_invoice)})
     items.sort(key=lambda i: i["at"] or "")
-    items = items[-limit:]
-    return {"phone": phone, "items": items, "has_more": len(msgs) == limit}
+    has_more = False
+    if lower_bounds:
+        floor = _iso(max(lower_bounds))
+        has_more = True
+        items = [i for i in items if (i["at"] or "") >= floor]
+    if len(items) > limit:
+        items, has_more = items[-limit:], True
+    return {"phone": phone, "items": items, "has_more": has_more, "cursor": items[0]["at"] if items else None}
 
 
 # ── profile ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -215,7 +250,8 @@ def profile(db: Session, phone: str) -> Optional[Dict[str, Any]]:
     phone = normalize_phone(phone)
     customer = _customer_for(db, phone)
     since = history_start()
-    first = db.query(func.min(ChatMessage.created_at)).filter(ChatMessage.customer_phone == phone).scalar()
+    first = db.query(func.min(ChatMessage.created_at)).filter(
+        ChatMessage.customer_phone == phone, ChatMessage.created_at >= since).scalar()
     if customer is None and first is None:
         return None
     result: Dict[str, Any] = {"phone": phone, "first_seen": _iso(first), "registered": False}

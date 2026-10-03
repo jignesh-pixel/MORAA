@@ -123,6 +123,36 @@ async def archive(kind: str, item_id: str) -> bool:
     return True
 
 
+def delete_files_sync(ids) -> int:
+    """(blocking) Delete archived copies from Drive (retention and erasure). Best effort: a file that is already gone
+    counts as deleted; any other failure is logged and that copy stays (the dashboard no longer lists it). Returns how
+    many are gone."""
+    ids = [i for i in ids if i]
+    if not ids or not configured():
+        return 0
+    deleted = 0
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            token = client.post(TOKEN_URL, data={
+                "client_id": settings.GOOGLE_DRIVE_CLIENT_ID, "client_secret": settings.GOOGLE_DRIVE_CLIENT_SECRET,
+                "refresh_token": settings.GOOGLE_DRIVE_REFRESH_TOKEN, "grant_type": "refresh_token",
+            })
+            if token.status_code != 200:
+                logger.warning("Drive copies could not be deleted: Google refused the credentials")
+                return 0
+            headers = {"Authorization": f"Bearer {token.json()['access_token']}"}
+            for file_id in ids:
+                response = client.delete(f"https://www.googleapis.com/drive/v3/files/{file_id}",
+                                         headers=headers, params={"supportsAllDrives": "true"})
+                if response.status_code in (200, 204, 404):
+                    deleted += 1
+                else:
+                    logger.warning(f"A Drive copy could not be deleted (HTTP {response.status_code})")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Drive copies could not be deleted ({type(e).__name__})")
+    return deleted
+
+
 def enqueue(kind: str, item_id: str) -> None:
     """(blocking) Ask the outbox to archive this file. Never raises."""
     if not configured():

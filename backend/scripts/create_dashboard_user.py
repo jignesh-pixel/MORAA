@@ -41,13 +41,14 @@ def main(argv=None) -> int:
                 print("A new account needs a password.")
                 return 2
             user = User(email=email, username=(args.username or email), hashed_password=hash_password(password),
-                        full_name=args.username or email, is_active=True)
+                        full_name=args.username or email, is_active=True, is_verified=True)
             db.add(user)
             print("Account created.")
         elif password:
             user.hashed_password = hash_password(password)
             print("Password changed.")
         user.is_admin = True
+        user.is_verified = True
         db.commit()
         print("This account can now use the dashboard.")
     return 0

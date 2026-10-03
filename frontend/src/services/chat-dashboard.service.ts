@@ -87,6 +87,17 @@ export function signOut() {
   setToken(null);
 }
 
+/** Only ever link to web addresses: a link coming from the server is never allowed to be a "javascript:" address. */
+export function safeHref(url: string | null | undefined): string | undefined {
+  if (!url) return undefined;
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" || u.protocol === "http:" ? u.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function absoluteMediaUrl(path: string): string {
   return path.startsWith("http") ? path : `${API_BASE_URL}${path}`;
 }
@@ -114,7 +125,12 @@ export async function loginWithPassword(username: string, password: string): Pro
   if (!res.ok) throw new Error(res.status === 401 ? "Wrong username or password" : `Sign-in failed (${res.status})`);
   const data = await res.json();
   setToken(data.access_token);
-  await request("/api/dashboard/me"); // makes sure this account may use the dashboard
+  try {
+    await request("/api/dashboard/me"); // makes sure this account may use the dashboard
+  } catch (e) {
+    setToken(null); // a login that may not open the dashboard must not leave its token behind
+    throw e;
+  }
 }
 
 export async function loginWithGoogle(idToken: string): Promise<void> {
@@ -126,7 +142,12 @@ export async function loginWithGoogle(idToken: string): Promise<void> {
   if (!res.ok) throw new Error(res.status === 403 ? "This Google account is not allowed" : `Sign-in failed (${res.status})`);
   const data = await res.json();
   setToken(data.access_token);
-  await request("/api/dashboard/me");
+  try {
+    await request("/api/dashboard/me");
+  } catch (e) {
+    setToken(null);
+    throw e;
+  }
 }
 
 export async function checkSession(): Promise<boolean> {
@@ -143,7 +164,7 @@ export const fetchCustomers = (q: string, offset = 0) =>
   request<{ customers: ChatCustomer[] }>(`/api/dashboard/customers?q=${encodeURIComponent(q)}&offset=${offset}&limit=50`).then((r) => r.customers);
 
 export const fetchTimeline = (phone: string, before?: string) =>
-  request<{ items: TimelineItem[]; has_more: boolean }>(
+  request<{ items: TimelineItem[]; has_more: boolean; cursor: string | null }>(
     `/api/dashboard/customers/${encodeURIComponent(phone)}/timeline?limit=150${before ? `&before=${encodeURIComponent(before)}` : ""}`,
   );
 
