@@ -15,6 +15,7 @@ import HistoryPage from "@/components/pages/HistoryPage";
 import ReportsPage from "@/components/pages/ReportsPage";
 import SettingsPage from "@/components/pages/SettingsPage";
 import ProfilePage from "@/components/pages/ProfilePage";
+import ChatsPage from "@/components/pages/ChatsPage";
 import FooterBar from "@/components/FooterBar";
 
 const pages: Record<string, React.ReactNode> = {
@@ -25,6 +26,7 @@ const pages: Record<string, React.ReactNode> = {
   "reports": <ReportsPage />,
   "settings": <SettingsPage />,
   "profile": <ProfilePage />,
+  "chats": <ChatsPage />,
 };
 
 const pageVariants = {

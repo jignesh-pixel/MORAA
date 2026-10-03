@@ -52,3 +52,19 @@ ERPNEXT_MODE_OF_PAYMENT=Razorpay
 ```
 With this on there is no local PDF fallback: if ERPNext is down, the customer still gets the "payment received" message and the invoice
 is retried automatically (6 tries over about two hours, then you get an alert).
+
+## WhatsApp chat dashboard
+```
+# who may open the dashboard (besides ADMIN_USERNAMES); Google sign-in needs a Google OAuth client id
+DASHBOARD_ALLOWED_EMAILS=you@gmail.com,partner@gmail.com
+GOOGLE_CLIENT_ID=<optional: Google OAuth client id for "Sign in with Google">
+# frontend (frontend/.env.local): NEXT_PUBLIC_API_URL=http://localhost:8000   NEXT_PUBLIC_GOOGLE_CLIENT_ID=<same client id>
+
+# Google Drive archive (optional, off until all are set); uses the Drive owner's account
+DRIVE_ENABLED=true
+GOOGLE_DRIVE_CLIENT_ID=<oauth client id>
+GOOGLE_DRIVE_CLIENT_SECRET=<oauth client secret>
+GOOGLE_DRIVE_REFRESH_TOKEN=<refresh token of the Drive owner's account>
+DRIVE_FOLDER_ID=<id of the Drive folder to archive into>
+```
+Create the first login with `python scripts/create_dashboard_user.py --email you@example.com` (it asks for the password on the keyboard).

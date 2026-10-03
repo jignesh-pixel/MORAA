@@ -1,6 +1,6 @@
 # WhatsApp chat dashboard: requirements captured 2026-10-03
 
-Source: owner's answers plus `gemvision-order-flow.html`. Status: not built; to be built after phase verification as a new phase.
+Source: owner's answers plus `gemvision-order-flow.html`. Status: BUILT 2026-10-03 on branch phase-7-dashboard (backend API + Next.js page "WhatsApp Chats"); see OPERATIONS_RUNBOOK section 15. Not yet verified by the gate or reviewed.
 
 - Users: the owner, the business partner and the developer. No staff roles. View only.
 - Login: Google sign-in if practical, otherwise email and password.

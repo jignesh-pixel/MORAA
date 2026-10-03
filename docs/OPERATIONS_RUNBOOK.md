@@ -128,3 +128,15 @@ is sent back as it finishes, and a failed photo is refunded on its own. The cust
 batch, so "pay Rs 1,000 then send 20 photos" is simply a wallet recharge followed by the photos. Settings: `BULK_ENABLED`,
 `BULK_WINDOW_SECONDS` (45), `BULK_QUIET_SECONDS` (8), `BULK_MAX_PHOTOS` (50), `BULK_CONCURRENCY` (4). Needs the outbox (migration 0016)
 and migration 0020. Team and trial customers keep the one-message-per-photo flow. Only the Clean Studio Shot is offered in bulk.
+
+## 15. WhatsApp chat dashboard
+
+Open the app's "WhatsApp Chats" page and sign in. It is read-only: customers on the left, the chat in the middle (customer messages on the left, ours on the right,
+images as pictures, payments and invoices as notes inside the chat), and the profile on the right when you click the customer's name or number
+(details as entered, wallet, payments, invoices, orders). "Weekly audit" lists orders with the photo the customer sent next to what they got back; filter to problems.
+Click any image to zoom; "Open in Drive" (when the Drive archive is on) opens the file in Google Drive for download; invoice notes link to ERPNext.
+- Everything is recorded as it happens (tables `chat_messages`, `order_outputs`, `invoice_records`, migration 0021). Only data from the day this was deployed exists; older chats cannot be rebuilt.
+- Chats and the images we produced are kept 90 days (`RETENTION_CHAT_DAYS`, deleted by the retention job when `RETENTION_ENABLED=true`); "DELETE MY DATA" removes a customer's chat record too.
+- Image links are signed and expire after 10 minutes. The dashboard needs an administrator login (`ADMIN_USERNAMES`, an `is_admin` user, or `DASHBOARD_ALLOWED_EMAILS`); with nobody configured it refuses everyone.
+- When the server is reached through a public address, the public-host guard answers 404 for everything but the two webhooks, dashboard included. Run the dashboard on the same machine, or ask the developer to add a private route before exposing it.
+- Fixed in passing: the start-up clean-up used to delete any `uploads/` folder without a matching photo record; it now keeps `uploads/outputs/`.

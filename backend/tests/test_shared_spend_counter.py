@@ -183,7 +183,10 @@ class ManagerIntegrationTests(_CounterBase):
             manager._get_provider_chain = lambda: ["gemini"]
             manager._get_provider = lambda name: Hangs()
             task = asyncio.ensure_future(manager.generate_image("p", {"request_id": "t"}))
-            await asyncio.sleep(0.2)
+            for _ in range(60):                                       # wait (up to 3 s) for the slot to be taken
+                await asyncio.sleep(0.05)
+                if self.used(igm._today()) == 1:
+                    break
             self.assertEqual(self.used(igm._today()), 1)             # the slot was taken
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):

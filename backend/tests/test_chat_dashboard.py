@@ -257,3 +257,18 @@ class ApiTests(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StartupCleanupTests(unittest.TestCase):
+    def test_the_orphan_clean_up_never_deletes_the_images_we_produced(self):
+        from app.utils.file_helpers import cleanup_orphaned_directories
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "outputs" / "i1").mkdir(parents=True)
+            (root / "outputs" / "i1" / "a.png").write_bytes(b"x")
+            (root / "stray-request").mkdir()
+            (root / "known").mkdir()
+            self.assertEqual(cleanup_orphaned_directories(root, {"known"}), 1)
+            self.assertTrue((root / "outputs" / "i1" / "a.png").exists())
+            self.assertFalse((root / "stray-request").exists())
