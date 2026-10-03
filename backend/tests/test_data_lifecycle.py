@@ -179,7 +179,7 @@ class CommandFlowTests(_Base):
     def test_a_customer_with_money_is_told_to_contact_support(self):
         self.make_customer(500)
         self.run_command("DELETE MY DATA")
-        self.assertIn("contact support", self.run_command("CONFIRM DELETE"))
+        self.assertIn("not refunded", self.run_command("CONFIRM DELETE"))
 
 
 if __name__ == "__main__":

@@ -189,17 +189,19 @@ class BillingDispatchTests(_ERPTestBase):
         kwargs = svc.create_paid_invoice_pdf.await_args.kwargs
         self.assertEqual((kwargs["customer_name"], kwargs["gstin"], kwargs["payment_id"]), ("Moraa Jewels", None, "pay_XYZ9"))
 
-    def test_erpnext_failure_falls_back_to_local_receipt(self):
+    def test_erpnext_failure_sends_no_local_invoice_and_asks_for_a_retry(self):
+        # ERPNext is the only source of invoice numbers: no second numbering series from a local PDF.
         for result, exc in ((None, None), (None, RuntimeError("boom"))):
             outcome, local, send, _ = self._dispatch(erp_result=result, erp_exc=exc)
-            self.assertEqual(outcome, "local")
-            local.assert_called_once_with(customer_name="Valued Customer", invoice_number="Invoice_MoraaStudio_XYZ9", amount=500)
-            self.assertEqual(send.await_args.kwargs["filename"], "Invoice_MoraaStudio_XYZ9.pdf")
+            self.assertEqual(outcome, "failed")
+            local.assert_not_called()
+            send.assert_not_awaited()
 
-    def test_send_failure_of_erpnext_pdf_falls_back(self):
+    def test_a_failed_whatsapp_send_of_the_erpnext_pdf_is_retried_not_replaced(self):
         outcome, local, send, _ = self._dispatch(erp_result=(PDF, "ACC-SINV-0001"), send_ok=False)
-        self.assertEqual(outcome, "failed")          # WhatsApp refused both sends: reported, so the outbox retries
-        self.assertEqual(send.await_count, 2)
+        self.assertEqual(outcome, "failed")
+        local.assert_not_called()
+        self.assertEqual(send.await_count, 1)
 
     def test_disabled_never_calls_erpnext(self):
         outcome, local, send, svc = self._dispatch(enabled=False)

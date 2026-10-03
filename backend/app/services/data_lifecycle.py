@@ -173,8 +173,8 @@ def erase_customer(db: Session, customer: Customer) -> Dict[str, int]:
         raise ErasureRefused("Team accounts are removed by the owner, not through this command.")
     if int(customer.wallet_balance or 0) > 0:
         raise ErasureRefused(
-            f"Your wallet still holds ₹{int(customer.wallet_balance):,}. Please contact support to settle it first, "
-            "then ask again."
+            f"Your wallet still holds ₹{int(customer.wallet_balance):,}. Wallet balances are not refunded, so please use "
+            "your balance for orders first, then ask again."
         )
     phone = customer.whatsapp_id
     photos = 0

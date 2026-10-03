@@ -50,9 +50,13 @@ async def dispatch_payment_invoice(
     local_pdf_fn: Callable[..., bytes],
     send_document_fn: Callable[..., Any],
 ) -> str:
-    """Send the invoice PDF for one captured payment. Returns "erpnext",
-    "local" or "failed". ``local_pdf_fn`` / ``send_document_fn`` are passed in
-    by the caller so its existing receipt behaviour is reused unchanged."""
+    """Send the invoice PDF for one captured payment. Returns "erpnext", "local" or "failed".
+
+    With ERPNext switched on, ERPNext is the ONLY source of invoice numbers (GST needs one consecutive series): if it
+    cannot produce or send the invoice the result is "failed" and the durable outbox retries later (ERPNext reuses
+    the invoice it already made for this payment id, so a retry never makes a second one). The customer has already
+    been sent the "payment received" message. With ERPNext off, the local payment receipt is sent as before.
+    ``local_pdf_fn`` / ``send_document_fn`` are passed in by the caller."""
     if settings.ERPNEXT_INVOICE_ENABLED:
         try:
             result = await get_erpnext_service().create_paid_invoice_pdf(
@@ -72,9 +76,12 @@ async def dispatch_payment_invoice(
                 ):
                     logger.info(f"ERPNext invoice {invoice_name} sent to {mask_phone(recipient_id)} (payment={payment_id})")
                     return "erpnext"
-                logger.warning(f"ERPNext invoice {invoice_name} could not be sent; sending local receipt")
+                logger.warning(f"ERPNext invoice {invoice_name} could not be sent; it will be retried")
+            else:
+                logger.warning(f"ERPNext produced no invoice for {payment_id}; it will be retried")
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"ERPNext invoice dispatch failed for {payment_id}: {e}; sending local receipt")
+            logger.warning(f"ERPNext invoice dispatch failed for {payment_id}: {e}; it will be retried")
+        return "failed"
 
     # Existing local ReportLab receipt (unchanged numbering and content).
     try:
