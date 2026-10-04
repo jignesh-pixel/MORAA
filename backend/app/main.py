@@ -20,6 +20,7 @@ from app.api.routes import earring_professional_shot
 from app.api.routes import earring_complementary_shot
 from app.api.routes import earring_ugc_style
 from app.api.routes import earring_macro_shot
+from app.api.routes import earring_stand_shot
 from app.api.routes import meta_webhook
 from app.api.routes import payment_routes
 from app.api.routes.health import router as health_router
@@ -271,6 +272,7 @@ app.include_router(earring_professional_shot.router)
 app.include_router(earring_complementary_shot.router)
 app.include_router(earring_ugc_style.router)
 app.include_router(earring_macro_shot.router)
+app.include_router(earring_stand_shot.router)
 app.include_router(meta_webhook.router)
 app.include_router(payment_routes.router)
 

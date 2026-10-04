@@ -1,4 +1,4 @@
-"""E-Com Pack 1: full 6-shot pack restored (development throttle lifted).
+"""E-Com Pack 1: the full 7-shot pack (six original shots + Stand Display; development throttle lifted).
 
 All network/AI calls are mocked; no credits are used.
 """
@@ -29,6 +29,7 @@ from app.services.earring_ecommerce_prompt import build_earring_ecommerce_prompt
 from app.services.earring_professional_shot_prompt import build_professional_shot_prompt
 from app.services.earring_scale_reference_prompt import build_scale_reference_prompt
 from app.services.earring_ugc_style_prompt import build_ugc_style_prompt
+from app.services.earring_on_stand_shot import build_stand_shot_prompt
 
 SENDER = "919000000002"
 EXPECTED = [
@@ -38,19 +39,21 @@ EXPECTED = [
     ("Professional Studio", "prompt_professional"),
     ("Lifestyle Shot", "prompt_complementary"),
     ("UGC Style", "prompt_ugc"),
+    ("Stand Display", "prompt_stand"),
 ]
 PROMPTS = [build_earring_ecommerce_prompt(), build_close_up_ears_prompt(), build_scale_reference_prompt(),
-           build_professional_shot_prompt(), build_complementary_shot_prompt(), build_ugc_style_prompt()]
+           build_professional_shot_prompt(), build_complementary_shot_prompt(), build_ugc_style_prompt(),
+           build_stand_shot_prompt()]
 
 
 class PackDefinitionTests(unittest.TestCase):
-    def test_exactly_six_shots_in_original_order(self):
+    def test_exactly_seven_shots_original_six_first_then_stand(self):
         self.assertEqual(mws.CATALOG_PACK_STYLES, EXPECTED)
 
     def test_throttle_lifted_by_default(self):
         self.assertIsNone(settings.MAX_STYLES_PER_PACK)
         self.assertIsNone(mws.MAX_STYLES_PER_PACK)
-        self.assertIn("all 6 styles", mws.CATALOG_PACK_ACK_TEMPLATE)
+        self.assertIn("all 7 styles", mws.CATALOG_PACK_ACK_TEMPLATE)
 
     def test_pack_price_unchanged(self):
         self.assertEqual(wallet_service.price_per_image(), 500)
@@ -58,7 +61,12 @@ class PackDefinitionTests(unittest.TestCase):
 
 class PackRunTests(unittest.TestCase):
     def setUp(self):
-        self.engine = make_engine()
+        # Several threads use the database during one pack: the worker on the event loop, plus the I/O pool that
+        # writes the provider cost log in the background (image_generation_manager._log_call_in_background) and
+        # the spend counter. One shared in-memory connection let a background commit/rollback land inside the
+        # worker's "processing -> generated" transaction and undo it, so the pack intermittently ended in
+        # 'processing'. A file database gives every session its own connection, as PostgreSQL does in production.
+        self.engine = make_engine(concurrent=True)
         Base.metadata.create_all(bind=self.engine)
         self.Session = sessionmaker(bind=self.engine)
         db = self.Session()
@@ -83,7 +91,7 @@ class PackRunTests(unittest.TestCase):
         self.oid = row.id
         db.close()
         self.text = AsyncMock(return_value=True)
-        self.upload = AsyncMock(side_effect=[f"media-{i}" for i in range(1, 7)])
+        self.upload = AsyncMock(side_effect=[f"media-{i}" for i in range(1, 8)])
         self.deliver = AsyncMock(side_effect=lambda **kw: len(kw["image_urls"]))
         from app.ai import image_generation_manager as igm
         igm._spend_day, igm._spend_count = None, 0  # fresh daily spend counter
@@ -113,7 +121,7 @@ class PackRunTests(unittest.TestCase):
         finally:
             s.close()
 
-    def test_all_six_shots_generated_once_each_and_delivered(self):
+    def test_all_seven_shots_generated_once_each_and_delivered(self):
         from app.ai.providers.image_base import ImageGenerationResult
 
         gen = AsyncMock(return_value=ImageGenerationResult(
@@ -122,13 +130,13 @@ class PackRunTests(unittest.TestCase):
             self.assertTrue(asyncio.run(mws.process_whatsapp_catalog_pack(self.oid)))
         # Exactly one manager call per shot (no extra call, no retry), same order, existing prompts,
         # the customer's own photo as the reference, existing 4:5 pack ratio.
-        self.assertEqual(gen.await_count, 6)
+        self.assertEqual(gen.await_count, 7)
         self.assertEqual(sorted(c.kwargs["prompt"] for c in gen.await_args_list), sorted(PROMPTS))
         for call in gen.await_args_list:
             self.assertEqual(call.kwargs["reference_image"], self.photo_bytes)
             self.assertEqual(call.kwargs["context"]["aspect_ratio"], "4:5")
-        self.assertEqual(self.upload.await_count, 6)
-        self.assertEqual(self.deliver.await_args.kwargs["image_urls"], [f"media-{i}" for i in range(1, 7)])
+        self.assertEqual(self.upload.await_count, 7)
+        self.assertEqual(self.deliver.await_args.kwargs["image_urls"], [f"media-{i}" for i in range(1, 8)])
         # Pack-level charge untouched: no extra debit, no refund.
         self.assertEqual(self._state(), ("delivered", 0, 0))
         self.text.assert_not_awaited()
@@ -149,24 +157,30 @@ class PackRunTests(unittest.TestCase):
         with patch.object(mws, "_generate_single_pack_style", AsyncMock(side_effect=results)):
             return asyncio.run(mws.process_whatsapp_catalog_pack(self.oid))
 
-    def test_six_of_six_is_delivered(self):
-        self.assertTrue(self._run_with([True] * 6))
+    def test_seven_of_seven_is_delivered(self):
+        self.assertTrue(self._run_with([True] * 7))
         self.assertEqual(self._state(), ("delivered", 0, 0))
         s = self.Session(); self.assertIsNone(s.get(WhatsAppIngestion, self.oid).error_message); s.close()
         self.text.assert_not_awaited()
 
-    def test_five_of_six_is_partial_not_delivered(self):
-        self.assertTrue(self._run_with([True, True, False, True, True, True]))
-        self.assertEqual(self.upload.await_count, 5)
+    def test_six_of_seven_is_partial_not_delivered(self):
+        self.assertTrue(self._run_with([True, True, False, True, True, True, True]))
+        self.assertEqual(self.upload.await_count, 6)
         # Existing partial status; no extra charge and no refund (existing rule).
         self.assertEqual(self._state(), ("delivered_partial", 0, 0))
-        s = self.Session(); self.assertEqual(s.get(WhatsAppIngestion, self.oid).error_message, "Delivered 5/6 images"); s.close()
-        self.assertIn("5 of 6 images", self.text.await_args.args[1])
+        s = self.Session(); self.assertEqual(s.get(WhatsAppIngestion, self.oid).error_message, "Delivered 6/7 images"); s.close()
+        self.assertIn("6 of 7 images", self.text.await_args.args[1])
 
-    def test_one_of_six_is_partial_not_delivered(self):
-        self.assertTrue(self._run_with([True] + [False] * 5))
+    def test_only_the_stand_shot_failing_is_partial_not_delivered(self):
+        self.assertTrue(self._run_with([True] * 6 + [False]))
+        self.assertEqual(self.upload.await_count, 6)
         self.assertEqual(self._state(), ("delivered_partial", 0, 0))
-        self.assertIn("1 of 6 images", self.text.await_args.args[1])
+        self.assertIn("6 of 7 images", self.text.await_args.args[1])
+
+    def test_one_of_seven_is_partial_not_delivered(self):
+        self.assertTrue(self._run_with([True] + [False] * 6))
+        self.assertEqual(self._state(), ("delivered_partial", 0, 0))
+        self.assertIn("1 of 7 images", self.text.await_args.args[1])
 
     # ── Daily spend cap (MAX_GENERATIONS_PER_DAY) ──
     def _real_generation(self, cap):
@@ -183,15 +197,23 @@ class PackRunTests(unittest.TestCase):
             ok = asyncio.run(mws.process_whatsapp_catalog_pack(self.oid))
         return ok, provider
 
-    def test_pack_runs_all_six_when_cap_allows(self):
+    def test_pack_runs_all_seven_when_cap_allows(self):
         from app.ai import image_generation_manager as igm
-        ok, provider = self._real_generation(cap=6)
+        ok, provider = self._real_generation(cap=7)
         self.assertTrue(ok)
-        self.assertEqual(provider.await_count, 6)
+        self.assertEqual(provider.await_count, 7)
         from app.services import spend_counter
         shared = spend_counter.used(igm.current_spend_day())      # the shared DB counter when it answers (PostgreSQL)
-        self.assertEqual(igm._spend_count if shared is None else shared, 6)
+        self.assertEqual(igm._spend_count if shared is None else shared, 7)
         self.assertEqual(self._state(), ("delivered", 0, 0))
+
+    def test_cap_of_the_old_six_shot_pack_now_blocks_the_whole_pack_and_refunds_once(self):
+        from app.ai import image_generation_manager as igm
+        ok, provider = self._real_generation(cap=6)
+        self.assertFalse(ok)
+        provider.assert_not_awaited()          # never a 6/7 pack: the reservation is all-or-nothing
+        self.assertEqual(igm._spend_count, 0)
+        self.assertEqual(self._state(), ("failed", 500, 1))
 
     def test_cap_too_small_blocks_whole_pack_before_any_call_and_refunds_once(self):
         from app.ai import image_generation_manager as igm

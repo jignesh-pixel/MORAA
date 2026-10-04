@@ -61,6 +61,8 @@ This gives you the following top-level structure:
 moraa-gemvision/
 ├── frontend/          # Next.js 16 web application
 ├── backend/           # FastAPI REST API
+├── ai-engine/         # (coming soon)
+├── shared/            # (coming soon)
 ├── docs/              # (coming soon)
 ├── docker/            # (coming soon)
 ├── package.json       # Root package (minimal)
@@ -197,6 +199,7 @@ CELERY_RESULT_BACKEND=redis://localhost:6379/0
 # ─── WhatsApp Onboarding (new customer registration flow) ──
 # false (DEFAULT) = the existing WhatsApp image pipeline is unchanged
 # true            = unregistered users are onboarded before using the service
+ENABLE_ONBOARDING_GATE=False
 # Gemini text model used ONLY to extract registration fields (strict JSON)
 ONBOARDING_PARSER_MODEL=gemini-1.5-flash
 
@@ -228,6 +231,7 @@ LOG_LEVEL=DEBUG
 | `AI_ENGINE_TYPE` | Which AI analysis engine to use: `mock` (random) or `vision` (real). |
 | `GEMINI_API_KEY` | Google Gemini API key (only needed if using Gemini-based analysis). |
 | `CELERY_TASK_ALWAYS_EAGER` | When `true`, tasks run synchronously — no Redis required. Set to `false` in production. |
+| `ENABLE_ONBOARDING_GATE` | When `true`, new WhatsApp users are onboarded (welcome → registration → recharge CTA) before using the service. `false` (default) leaves the existing WhatsApp pipeline exactly as it is. |
 | `ONBOARDING_PARSER_MODEL` | Gemini text model used only to extract registration fields from free-form WhatsApp messages (strict JSON). |
 | `WALLET_IMAGE_PRICE_RUPEES` | Price charged per generated image, in whole Rupees. The wallet-balance gate itself is always active and has no on/off toggle. |
 | `RECHARGE_PAYMENT_URL` | PSP-hosted payment page (e.g. a Razorpay link) used by the CTA URL button. Empty = fall back to the `recharge_500` reply button. |
@@ -777,6 +781,8 @@ moraa-gemvision/
 │   ├── requirements.txt
 │   └── README.md
 │
+├── ai-engine/                     # Standalone AI engine (coming soon)
+├── shared/                        # Shared types (coming soon)
 ├── docs/                          # Documentation (coming soon)
 ├── docker/                        # Docker config (coming soon)
 ├── HOW_TO_RUN.md                  # ← You are here

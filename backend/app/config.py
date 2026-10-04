@@ -18,7 +18,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Images in a WhatsApp Catalog Pack (CATALOG_PACK_STYLES in
 # meta_whatsapp_service.py); a daily cap below this cannot serve one Pack.
-_PACK_IMAGE_COUNT = 6
+# Kept equal to len(CATALOG_PACK_STYLES) by tests/test_earring_stand_shot.py.
+_PACK_IMAGE_COUNT = 7
 
 
 def _resolve_env_file() -> Optional[str]:
@@ -381,7 +382,7 @@ class Settings(BaseSettings):
     # Trial credits consumed per order (tier = TRIAL). A credit is one
     # complimentary order; the owner sets trial_credits_total per customer.
     TRIAL_CREDITS_PER_WHITE_BG: int = 1   # ₹50 Clean Studio Shot
-    TRIAL_CREDITS_PER_PACK_1: int = 1     # ₹500 E-Com Pack 1 (6 images)
+    TRIAL_CREDITS_PER_PACK_1: int = 1     # ₹500 E-Com Pack 1 (7 images)
 
     # Razorpay (or any PSP) payment-page URL used by the "Pay ₹<price>" CTA
     # URL button. Leave empty to fall back to the interactive reply button
@@ -514,8 +515,8 @@ class Settings(BaseSettings):
     # 350 s) and, with the Meta upload that follows (up to ~190 s), kept under the 10-minute stuck-order limit.
     PACK_GENERATION_DEADLINE_SECONDS: float = 360.0
 
-    # Styles generated per WhatsApp Earring Catalog Pack (6 styles exist).
-    # None = all styles (production: the full 6-shot E-Com Pack 1).
+    # Styles generated per WhatsApp Earring Catalog Pack (7 styles exist).
+    # None = all styles (production: the full 7-shot E-Com Pack 1).
     # Set a number (e.g. 1) only as a temporary testing throttle.
     MAX_STYLES_PER_PACK: Optional[int] = None
 

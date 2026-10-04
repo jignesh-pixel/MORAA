@@ -1,7 +1,7 @@
 """A global limit on simultaneous paid provider calls, with priority (Q-6).
 
 ``MAX_CONCURRENT_PROVIDER_CALLS`` calls may run at once (0 = no limit). When all slots are busy, waiting calls are
-served in priority order: a lower number goes first (a single Studio Shot, priority 0, is served before the six calls of
+served in priority order: a lower number goes first (a single Studio Shot, priority 0, is served before the seven calls of
 a Catalog Pack, priority 1), then first-come-first-served. Waiting here costs nothing: the daily-cap slot was reserved
 earlier, and the provider has not been called yet.
 

@@ -38,7 +38,9 @@ META_MEDIA_UPLOAD_URL = "https://graph.facebook.com/v21.0/{phone_number_id}/medi
 
 SUPPORTED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp"}
 
-# ─── 6-Style Earring Catalog Pack (ordered delivery 1..6) ─────────────────
+# ─── 7-Style Earring Catalog Pack (ordered delivery 1..7) ─────────────────
+# Every prompt_type here needs a builder in process_whatsapp_catalog_pack's style_prompt_builders; the pack size
+# (spend reservation, "all N styles" copy, partial-delivery count) follows the length of this list.
 CATALOG_PACK_STYLES: List[Tuple[str, str]] = [
     ("Clean E-Commerce", "prompt_ecommerce"),
     ("Close-up on Ear", "prompt_close_up"),
@@ -46,6 +48,7 @@ CATALOG_PACK_STYLES: List[Tuple[str, str]] = [
     ("Professional Studio", "prompt_professional"),
     ("Lifestyle Shot", "prompt_complementary"),
     ("UGC Style", "prompt_ugc"),
+    ("Stand Display", "prompt_stand"),
 ]
 
 # ─── Styles per pack (settings.MAX_STYLES_PER_PACK, default 1) ─────────────
@@ -858,7 +861,7 @@ async def send_catalog_pack_images_to_whatsapp(
         return 0
 
     # Caption counts reflect what is actually delivered, so the throttled
-    # single-style test pack does not claim to be a complete 6-style pack.
+    # single-style test pack does not claim to be a complete pack.
     total = len(image_urls)
     known_styles = len(CATALOG_PACK_STYLES)
     sent_count = 0
@@ -1512,7 +1515,7 @@ def _bytes_to_data_url(
     return f"data:{resolved_mime};base64,{encoded}"
 
 
-# ─── 6-Style Catalog Pack generation orchestrator ────────────────────────
+# ─── Catalog Pack generation orchestrator (one style per CATALOG_PACK_STYLES entry) ───
 
 
 async def _generate_single_pack_style(
@@ -1569,7 +1572,7 @@ async def _generate_and_upload_style(
 ) -> Tuple[bool, Optional[str]]:
     """Generate one style, then upload it to Meta AT ONCE and let go of the bytes (PERF-5).
 
-    Holding all six finished images (each several MB) until the last style completes is what made memory grow
+    Holding every finished image (each several MB) until the last style completes is what made memory grow
     with every concurrent Pack; now each image lives only from "generated" to "uploaded". Returns
     ``(generated, media_id)``: ``(False, None)`` = the style failed, ``(True, None)`` = generated but the
     Meta upload failed, so the worker can still tell those two failures apart.
@@ -1642,7 +1645,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
     """Generate the catalog styles in parallel and deliver them to WhatsApp.
 
     The number of styles is capped by ``MAX_STYLES_PER_PACK`` (1 during the
-    development throttle) instead of always fanning out to all 6 styles.
+    development throttle) instead of always fanning out to every style in CATALOG_PACK_STYLES.
     """
     from app.database import SessionLocal
     from app.models.image import Image
@@ -1653,6 +1656,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
     from app.services.earring_professional_shot_prompt import build_professional_shot_prompt
     from app.services.earring_complementary_shot_prompt import build_complementary_shot_prompt
     from app.services.earring_ugc_style_prompt import build_ugc_style_prompt
+    from app.services.earring_on_stand_shot import build_stand_shot_prompt
     from app.models.customer import Customer
 
     style_prompt_builders = {
@@ -1662,6 +1666,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         "prompt_professional": build_professional_shot_prompt,
         "prompt_complementary": build_complementary_shot_prompt,
         "prompt_ugc": build_ugc_style_prompt,
+        "prompt_stand": build_stand_shot_prompt,
     }
 
     started_at = time.monotonic()
@@ -1747,7 +1752,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
 
         # Daily spend cap: reserve every style of this paid pack up front. The
         # pack either fits under MAX_GENERATIONS_PER_DAY as a whole or fails
-        # (and is refunded) before any provider call -- never a 1/6 pack.
+        # (and is refunded) before any provider call -- never a partial pack.
         from app.services import entitlement_service as ent
         from app.services.wallet_service import find_customer_by_phone as _find_cust
 
