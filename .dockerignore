@@ -1,0 +1,15 @@
+﻿.env
+.env.*
+*.bak*
+backend/app/uploads/
+backend/app/reports/
+app/uploads/
+app/reports/
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+node_modules/
+.next/
+.git/
+Claude outputs/
