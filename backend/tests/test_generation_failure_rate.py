@@ -11,6 +11,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+
+from tests.db_support import make_engine
 import app.models  # noqa: F401 — register every model with Base.metadata
 from app.database import Base
 from app.models.whatsapp_ingestion import WhatsAppIngestion
@@ -18,11 +20,7 @@ from app.services.generation_metrics import compute_generation_failure_rate
 
 
 def _make_engine_and_session():
-    engine = create_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
+    engine = make_engine()
     Base.metadata.create_all(bind=engine)
     return engine, sessionmaker(bind=engine)()
 

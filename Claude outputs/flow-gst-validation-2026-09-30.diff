@@ -1,0 +1,78 @@
+diff --git a/backend/app/api/routes/meta_webhook.py b/backend/app/api/routes/meta_webhook.py
+index b86a5eb..5c9f8c9 100644
+--- a/backend/app/api/routes/meta_webhook.py
++++ b/backend/app/api/routes/meta_webhook.py
+@@ -65,6 +65,7 @@ from app.services.meta_whatsapp_service import (
+ )
+ from app.services.razorpay_service import create_recharge_payment_link
+ from app.services.gst_service import (
++    gst_check_pending,
+     handle_gst_button,
+     handle_gstin_reply,
+     is_awaiting_gstin,
+@@ -482,7 +483,19 @@ async def _handle_registration_flow(db: Session, event: Dict[str, Any]) -> bool:
+         _flow_field(data, "business_name", "brand_name", "business", "brand"), 255
+     ) or full_name
+     address = _flow_text(_flow_field(data, "address", "city")) or "N/A"
+-    gst_number = _normalize_gst(_flow_field(data, "gst_number", "gstin", "gst"))
++    # Raw GSTIN exactly as the Flow sent it, under any Flow Builder key
++    # (screen_0_GSTIN_3, gstin, gst_number...). It is what the GST step
++    # validates; the stored value stays "N/A" until that step resolves it.
++    raw_gst = _flow_field(data, "gst_number", "gstin", "gst", "gst_no", "gstin_number")
++    if raw_gst is None:
++        # Flow Builder labels like "GSTIN (Optional)" become keys such as
++        # screen_0_GSTIN_Optional_3: accept any remaining key naming GST.
++        raw_gst = next((v for k, v in data.items() if "gst" in str(k).lower()), None)
++    gst_number = _normalize_gst(raw_gst)
++    # A non-empty GSTIN must pass the GST step before registration completes:
++    # an invalid one leaves the profile saved as a draft (is_registered=False)
++    # and sends the Re-enter / Skip buttons.
++    registered_now = not gst_check_pending(raw_gst)
+ 
+     dedupe_key = _flow_dedupe_key(message_id) if message_id else None
+     if dedupe_key and _flow_already_processed(db, dedupe_key):
+@@ -517,7 +530,7 @@ async def _handle_registration_flow(db: Session, event: Dict[str, Any]) -> bool:
+                 cust.business_name = business_name
+                 cust.gst_number = gst_number
+                 cust.address = address
+-                cust.is_registered = True
++                cust.is_registered = registered_now
+             else:
+                 cust = Customer(
+                     whatsapp_id=sender.lstrip("+").strip(),
+@@ -526,7 +539,7 @@ async def _handle_registration_flow(db: Session, event: Dict[str, Any]) -> bool:
+                     gst_number=gst_number,
+                     address=address,
+                     wallet_balance=0,
+-                    is_registered=True,
++                    is_registered=registered_now,
+                 )
+                 db.add(cust)
+             if dedupe_key:
+@@ -561,7 +574,7 @@ async def _handle_registration_flow(db: Session, event: Dict[str, Any]) -> bool:
+     # GST first: "You're all set" is sent only once the GSTIN is resolved
+     # (verified, accepted, skipped, or none given / check disabled).
+     await verify_after_registration(
+-        db, sender, data.get("gst_number"),
++        db, sender, raw_gst,
+         on_complete=lambda: _send_registration_confirmation(db, sender, cust, full_name),
+     )
+     return True
+diff --git a/backend/app/services/gst_service.py b/backend/app/services/gst_service.py
+index c5c7aa5..deb1062 100644
+--- a/backend/app/services/gst_service.py
++++ b/backend/app/services/gst_service.py
+@@ -211,6 +211,13 @@ def verification_enabled() -> bool:
+     return bool(getattr(settings, "GST_VERIFICATION_ENABLED", False))
+ 
+ 
++def gst_check_pending(raw_gstin: Any) -> bool:
++    """True when a submitted GSTIN still has to go through process_gstin
++    (verification on and a non-empty answer), i.e. registration must NOT be
++    marked complete yet. Empty / "NA" / "skip" answers return False."""
++    return verification_enabled() and str(raw_gstin or "").strip().lower() not in _NO_GST_ANSWERS
++
++
+ def _session(db, whatsapp_id: str, create: bool = False):
+     from app.models.onboarding_session import OnboardingSession
+ 

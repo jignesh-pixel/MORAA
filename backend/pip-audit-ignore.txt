@@ -1,0 +1,44 @@
+# Accepted pip-audit findings (baseline). CI fails on any advisory NOT listed here.
+# One advisory id per line; text after # is ignored. Remove a line when its package is upgraded.
+# Generated from `pip-audit -r constraints.txt --no-deps --disable-pip` - see PRODUCTION_READINESS_ASSESSMENT.md SEC-04.
+
+# cryptography 49.0.0: transitive of python-jose; no direct use in app code
+PYSEC-2026-3552  # fixed in: 50.0.0
+
+# ecdsa 0.19.2: pulled in by python-jose; ECDSA not used; no upstream fix
+PYSEC-2026-1325  # fixed in: no fix released
+
+# pillow 11.0.0: parses customer photos; fix needs Pillow 12 (major) + image-output regression check -> separate decision
+PYSEC-2026-165  # fixed in: 12.2.0
+PYSEC-2026-2249  # fixed in: 12.1.1
+PYSEC-2026-2250  # fixed in: 12.2.0
+PYSEC-2026-2252  # fixed in: 12.2.0
+PYSEC-2026-2253  # fixed in: 12.3.0
+PYSEC-2026-2254  # fixed in: 12.3.0
+PYSEC-2026-2255  # fixed in: 12.3.0
+PYSEC-2026-2256  # fixed in: 12.3.0
+PYSEC-2026-2257  # fixed in: 12.3.0
+PYSEC-2026-2874  # fixed in: 12.2.0
+PYSEC-2026-3451  # fixed in: 12.3.0
+PYSEC-2026-3453  # fixed in: 12.3.0
+PYSEC-2026-3454  # fixed in: 12.3.0
+PYSEC-2026-3493  # fixed in: 12.3.0
+PYSEC-2026-3494  # fixed in: 12.3.0
+PYSEC-2026-3495  # fixed in: 12.3.0
+PYSEC-2026-3496  # fixed in: 12.3.0
+
+# pytest 8.3.4: dev/test tooling only, never installed in production
+PYSEC-2026-1845  # fixed in: 9.0.3
+
+# python-dotenv 1.0.1: only read by tooling/scripts; application config uses pydantic-settings
+PYSEC-2026-2270  # fixed in: 1.2.2
+
+# python-jose 3.3.0: HS256 only, no JWE/ECDSA used; replace with PyJWT in the security phase
+PYSEC-2024-232  # fixed in: 3.4.0
+PYSEC-2024-233  # fixed in: 3.4.0
+PYSEC-2025-185  # fixed in: no fix released
+
+# urllib3 2.7.0: transitive (razorpay/requests); minor upgrade queued for the dependency pass
+PYSEC-2026-4175  # fixed in: 2.8.0
+PYSEC-2026-4176  # fixed in: 2.8.0
+PYSEC-2026-4177  # fixed in: 2.8.0

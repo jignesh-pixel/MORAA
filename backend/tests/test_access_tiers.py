@@ -17,6 +17,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+
+from tests.db_support import make_engine
 from app.config import settings
 from app.database import Base
 from app.models.audit_log import AuditLog
@@ -391,8 +393,7 @@ class RegistrationConfirmationTests(TierWebhookBase):
 # ═══ 4. Workers: metering, exhaustion alert, cap bypass ════════════════════
 class TierWorkerBase(unittest.TestCase):
     def setUp(self):
-        self.engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False},
-                                    poolclass=StaticPool)
+        self.engine = make_engine()
         Base.metadata.create_all(bind=self.engine)
         self.Session = sessionmaker(bind=self.engine)
         self.tmp = tempfile.TemporaryDirectory()
