@@ -117,6 +117,22 @@ class RecoverySweepTests(RecoveryBase):
         self.make_ingestion(status="received")                          # just arrived
         self.assertEqual(asyncio.run(mws.recover_interrupted_photos(timedelta(minutes=10))), 0)
 
+    def test_a_photo_cut_off_while_processing_is_closed_and_the_customer_asked_to_resend(self):
+        customer = self.make_customer(1000)
+        ingestion = self.make_ingestion(status="received")
+        self.age(ingestion)
+        self.assertEqual(asyncio.run(mws.recover_interrupted_photos(timedelta(minutes=10))), 1)
+        self.assertEqual(asyncio.run(mws.recover_interrupted_photos(timedelta(minutes=10))), 0)
+        self.db.expire_all()
+        self.assertEqual(self.db.get(WhatsAppIngestion, ingestion.id).status, "rejected")
+        self.assertEqual(self.db.get(Customer, customer.id).wallet_balance, 1000)
+        self.assertIn("nothing was charged", mws.send_whatsapp_text.await_args.args[1])
+
+    def test_a_photo_still_being_processed_is_left_alone(self):
+        self.make_customer(1000)
+        self.make_ingestion(status="received")                          # just arrived
+        self.assertEqual(asyncio.run(mws.recover_interrupted_photos(timedelta(minutes=10))), 0)
+
     def test_stuck_paid_order_is_failed_and_refunded_exactly_once(self):
         customer = self.make_customer(1000)
         ingestion = self.paid_order(customer, "pack_queued", price=500)
