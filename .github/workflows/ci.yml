@@ -87,7 +87,7 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
-        run: npm --prefix frontend ci
+        run: npm --prefix frontend install
 
       - name: Type check
         run: npx --prefix frontend tsc --noEmit
