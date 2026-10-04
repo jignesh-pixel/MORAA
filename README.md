@@ -12,8 +12,6 @@ MORAA GemVision is a full-stack application that uses AI to analyze jewellery im
 moraa-gemvision/
 ├── frontend/          # Next.js 16 + React 19 web application
 ├── backend/           # FastAPI REST API with Celery task queue
-├── ai-engine/         # AI analysis engine (coming soon)
-├── shared/            # Shared type definitions (coming soon)
 ├── docs/              # Project documentation (coming soon)
 └── docker/            # Docker / Compose configuration (coming soon)
 ```
@@ -61,7 +59,7 @@ venv\Scripts\activate       # Windows
 #source venv/bin/activate      # Linux/Mac
 
 # Install dependencies
-pip install -r requirements.txt
+pip install -r requirements-dev.txt -c constraints.txt
 
 # Run database migrations
 alembic upgrade head
@@ -114,7 +112,7 @@ cd ../backend
 python -m venv venv
 source venv/bin/activate      # Linux/Mac
 # venv\Scripts\activate       # Windows
-pip install -r requirements.txt
+pip install -r requirements-dev.txt -c constraints.txt
 alembic upgrade head
 ```
 
@@ -146,7 +144,7 @@ Open **two separate terminal windows**:
 
 - [ ] Frontend dependencies installed (`cd frontend && npm install`)
 - [ ] Backend virtual environment created (`cd backend && python -m venv venv`)
-- [ ] Backend dependencies installed (`pip install -r requirements.txt`)
+- [ ] Backend dependencies installed (`pip install -r requirements-dev.txt -c constraints.txt`)
 - [ ] Backend `.env` file configured (see example below)
 - [ ] Database migrations applied (`alembic upgrade head`)
 - [ ] Frontend running on port **3000**

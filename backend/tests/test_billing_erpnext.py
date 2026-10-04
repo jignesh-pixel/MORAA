@@ -189,17 +189,19 @@ class BillingDispatchTests(_ERPTestBase):
         kwargs = svc.create_paid_invoice_pdf.await_args.kwargs
         self.assertEqual((kwargs["customer_name"], kwargs["gstin"], kwargs["payment_id"]), ("Moraa Jewels", None, "pay_XYZ9"))
 
-    def test_erpnext_failure_falls_back_to_local_receipt(self):
+    def test_erpnext_failure_sends_no_local_invoice_and_asks_for_a_retry(self):
+        # ERPNext is the only source of invoice numbers: no second numbering series from a local PDF.
         for result, exc in ((None, None), (None, RuntimeError("boom"))):
             outcome, local, send, _ = self._dispatch(erp_result=result, erp_exc=exc)
-            self.assertEqual(outcome, "local")
-            local.assert_called_once_with(customer_name="Valued Customer", invoice_number="Invoice_MoraaStudio_XYZ9", amount=500)
-            self.assertEqual(send.await_args.kwargs["filename"], "Invoice_MoraaStudio_XYZ9.pdf")
+            self.assertEqual(outcome, "failed")
+            local.assert_not_called()
+            send.assert_not_awaited()
 
-    def test_send_failure_of_erpnext_pdf_falls_back(self):
+    def test_a_failed_whatsapp_send_of_the_erpnext_pdf_is_retried_not_replaced(self):
         outcome, local, send, _ = self._dispatch(erp_result=(PDF, "ACC-SINV-0001"), send_ok=False)
-        self.assertEqual(outcome, "local")
-        self.assertEqual(send.await_count, 2)
+        self.assertEqual(outcome, "failed")
+        local.assert_not_called()
+        self.assertEqual(send.await_count, 1)
 
     def test_disabled_never_calls_erpnext(self):
         outcome, local, send, svc = self._dispatch(enabled=False)
@@ -219,7 +221,7 @@ class RazorpayWebhookBillingTests(FundedSlotGateTestCase):
 
     def _payload(self, pay_id="pay_WEBHOOK1"):
         return {"event": "payment.captured", "payload": {"payment": {"entity": {
-            "id": pay_id, "amount": 50000, "notes": {"sender_id": SENDER}}}}}
+            "id": pay_id, "amount": 50000, "currency": "INR", "notes": {"sender_id": SENDER}}}}}
 
     def test_webhook_credits_then_sends_erpnext_invoice_once(self):
         _make_customer(self.session, balance=100)
@@ -254,3 +256,34 @@ class RazorpayWebhookBillingTests(FundedSlotGateTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InterStateTaxTests(_ERPTestBase):
+    """PRIV-4: a buyer in another state is billed IGST and the place of supply is sent."""
+
+    def _bill(self, gstin, **cfg):
+        fake = FakeERPNext()
+        with patch.multiple(settings, **cfg):
+            self._run(fake, lambda: _service().create_paid_invoice_pdf(SENDER, "Buyer", gstin, 500, "pay_IGST1"))
+        return fake.posts("/api/resource/Sales Invoice")[0][3], fake
+
+    def test_other_state_buyer_gets_the_igst_template_and_place_of_supply(self):
+        inv, fake = self._bill("24AAAPS1234C1Z5", ERPNEXT_COMPANY_STATE_CODE="27",
+                               ERPNEXT_TAX_TEMPLATE_INTERSTATE="Output IGST 18% - M")
+        self.assertEqual(inv["taxes_and_charges"], "Output IGST 18% - M")
+        self.assertEqual(inv["place_of_supply"], "24-Gujarat")
+
+    def test_same_state_buyer_keeps_the_default_template(self):
+        inv, _ = self._bill("27AAAPS1234C1Z5", ERPNEXT_COMPANY_STATE_CODE="27",
+                            ERPNEXT_TAX_TEMPLATE_INTERSTATE="Output IGST 18% - M")
+        self.assertEqual(inv["taxes_and_charges"], "Output GST 18% - M")
+        self.assertEqual(inv["place_of_supply"], "27-Maharashtra")
+
+    def test_nothing_changes_until_the_interstate_settings_are_configured(self):
+        inv, _ = self._bill("24AAAPS1234C1Z5", ERPNEXT_COMPANY_STATE_CODE="", ERPNEXT_TAX_TEMPLATE_INTERSTATE="")
+        self.assertEqual(inv["taxes_and_charges"], "Output GST 18% - M")
+
+    def test_a_buyer_without_a_gstin_is_sold_as_in_state(self):
+        inv, _ = self._bill(None, ERPNEXT_COMPANY_STATE_CODE="27", ERPNEXT_TAX_TEMPLATE_INTERSTATE="Output IGST 18% - M")
+        self.assertEqual(inv["taxes_and_charges"], "Output GST 18% - M")
+        self.assertNotIn("place_of_supply", inv)

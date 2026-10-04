@@ -127,7 +127,7 @@ class DisabledTests(unittest.TestCase):
 class WebhookEndToEnd(_Patched):
     def _post(self, msg):
         body = {"object": "whatsapp_business_account", "entry": [_entry(msg)]}
-        with patch.object(settings, "META_APP_SECRET", ""), patch.object(settings, "DEBUG", True):
+        with patch.object(settings, "META_APP_SECRET", ""), patch.object(settings, "ALLOW_UNSIGNED_WEBHOOKS", True):
             return TestClient(app).post("/api/meta/webhook", json=body, headers={"host": NGROK})
 
     def test_team_text_forwarded_and_customer_logic_skipped(self):
@@ -186,3 +186,28 @@ class ForwardTests(_Patched):
         with patch.object(ops_forward.httpx, "AsyncClient",
                           lambda **kw: real(transport=httpx.MockTransport(boom), **kw)):
             asyncio.run(ops_forward.forward_to_ops({"id": "m1"}))  # must not raise
+
+
+class ExplicitPrefixTests(_Patched):
+    cfg = {**OPS_ON, "OPS_EXPLICIT_PREFIX": True}
+
+    def test_a_plain_ops_word_from_the_team_is_a_customer_message(self):
+        bt, e = MagicMock(), _entry(text("919699899825", "start"))
+        self.assertIs(ops_forward.divert_ops_messages(e, bt), e)
+        bt.add_task.assert_not_called()
+
+    def test_ops_start_is_diverted_and_the_word_ops_is_removed(self):
+        bt = MagicMock()
+        out = ops_forward.divert_ops_messages(_entry(text("919699899825", "Ops start day")), bt)
+        self.assertEqual(out["changes"][0]["value"]["messages"], [])
+        forwarded = bt.add_task.call_args.args[1]
+        self.assertEqual(forwarded["text"]["body"], "start day")
+
+    def test_ops_word_before_something_that_is_not_a_command_is_not_diverted(self):
+        bt, e = MagicMock(), _entry(text("919699899825", "ops hello there"))
+        self.assertIs(ops_forward.divert_ops_messages(e, bt), e)
+
+    def test_a_caption_works_the_same_way(self):
+        bt = MagicMock()
+        ops_forward.divert_ops_messages(_entry(image("919699899825", "ops 💸 450 chai")), bt)
+        self.assertEqual(bt.add_task.call_args.args[1]["image"]["caption"], "💸 450 chai")

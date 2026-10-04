@@ -32,6 +32,10 @@ class AuditLog(Base):
                 "action IN ('razorpay_payment_captured', 'whatsapp_generation_refund')"
             ),
         ),
+        # Lookups like "was this payment / refund / alert already recorded?" (action + resource id, or action + time)
+        # run inside webhook handling; the partial unique index above only covers two actions (DATA-3, migration 0014).
+        Index("ix_audit_logs_action_resource", "action", "resource_id"),
+        Index("ix_audit_logs_action_created", "action", "created_at"),
     )
 
     id: Mapped[str] = mapped_column(

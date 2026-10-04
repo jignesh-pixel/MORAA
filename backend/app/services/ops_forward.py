@@ -30,6 +30,17 @@ OPS_PREFIXES = (
 )
 
 
+_EXPLICIT_WORD = "ops "
+
+
+def _strip_explicit(text: str) -> Optional[str]:
+    """The text without the leading "ops " word, or None when it does not start with it."""
+    t = (text or "").lstrip()
+    if t[: len(_EXPLICIT_WORD)].lower() == _EXPLICIT_WORD:
+        return t[len(_EXPLICIT_WORD):].lstrip()
+    return None
+
+
 def has_ops_prefix(text: str) -> bool:
     """Stripped, case-insensitive prefix match. Word prefixes must end at a
     non-letter so "expensive ring" / "helpful" / "fixed" are NOT ops."""
@@ -60,10 +71,30 @@ def is_ops_message(msg: Dict[str, Any]) -> bool:
     """Text or image/document caption from a team number that starts with an ops prefix."""
     msg_type = msg.get("type")
     if msg_type == "text":
-        return has_ops_prefix((msg.get("text") or {}).get("body") or "")
-    if msg_type in ("image", "document"):
-        return has_ops_prefix((msg.get(msg_type) or {}).get("caption") or "")
-    return False
+        text = (msg.get("text") or {}).get("body") or ""
+    elif msg_type in ("image", "document"):
+        text = (msg.get(msg_type) or {}).get("caption") or ""
+    else:
+        return False
+    if settings.OPS_EXPLICIT_PREFIX:
+        rest = _strip_explicit(text)
+        return rest is not None and has_ops_prefix(rest)
+    return has_ops_prefix(text)
+
+
+def _without_explicit_word(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """A copy of the message with the leading "ops " word removed (only when OPS_EXPLICIT_PREFIX is on)."""
+    if not settings.OPS_EXPLICIT_PREFIX:
+        return msg
+    clean = copy.deepcopy(msg)
+    msg_type = clean.get("type")
+    holder = clean.get("text") if msg_type == "text" else clean.get(msg_type)
+    key = "body" if msg_type == "text" else "caption"
+    if isinstance(holder, dict):
+        rest = _strip_explicit(holder.get(key) or "")
+        if rest is not None:
+            holder[key] = rest
+    return clean
 
 
 async def forward_to_ops(message: Dict[str, Any]) -> None:
@@ -79,6 +110,40 @@ async def forward_to_ops(message: Dict[str, Any]) -> None:
             logger.error("[ops] inbound forward failed: {} {}", r.status_code, r.text[:300])
     except Exception as e:
         logger.error("[ops] inbound forward error: {}", e)
+
+
+async def forward_to_ops_checked(message: Dict[str, Any]) -> bool:
+    """Like ``forward_to_ops`` but reports failure (False) so the outbox retries it. Never raises."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                settings.OPS_INBOUND_URL,
+                json={"message": message},
+                headers={"x-ops-secret": settings.OPS_SECRET},
+            )
+        if r.status_code >= 300:
+            logger.error("[ops] inbound forward failed: {} {}", r.status_code, r.text[:300])
+            return False
+        return True
+    except Exception as e:
+        logger.error("[ops] inbound forward error: {}", e)
+        return False
+
+
+def _queue_forward(msg: Dict[str, Any], background_tasks: BackgroundTasks) -> None:
+    """Record the forward in the outbox (survives a restart) and give it a first try now; fall back to a plain
+    background task if the outbox is off or the database cannot record it."""
+    if settings.OUTBOX_ENABLED:
+        from app.services import outbox
+
+        outcome = outbox.enqueue_status("ops_forward", {"message": msg}, f"ops:{msg.get('id') or id(msg)}")
+        if outcome == outbox.QUEUED:
+            outbox.ensure_default_handlers()
+            background_tasks.add_task(outbox.drain_once)
+            return
+        if outcome == outbox.DUPLICATE:
+            return                                # Meta re-delivered a message already forwarded: do not forward twice
+    background_tasks.add_task(forward_to_ops, msg)
 
 
 def divert_ops_messages(entry: Dict[str, Any], background_tasks: BackgroundTasks) -> Dict[str, Any]:
@@ -108,7 +173,7 @@ def divert_ops_messages(entry: Dict[str, Any], background_tasks: BackgroundTasks
             keep = []
             for msg in msgs:
                 if msg.get("id", "") in diverted and _digits(msg.get("from")) in team and is_ops_message(msg):
-                    background_tasks.add_task(forward_to_ops, msg)
+                    _queue_forward(_without_explicit_word(msg), background_tasks)
                     logger.info("[ops] diverted team message {} to ops", msg.get("id", ""))
                 else:
                     keep.append(msg)

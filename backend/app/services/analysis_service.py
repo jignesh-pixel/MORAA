@@ -16,7 +16,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.models.analysis import Analysis
 from app.models.history import HistoryEntry
@@ -261,12 +261,22 @@ class AnalysisService:
             "version_number": analysis.version_number,
         }
 
-    def get_analysis_history(self, user_id: Optional[str] = None) -> List[AnalysisResponse]:
-        """Get all completed analyses."""
+    def get_analysis_history(
+        self, user_id: Optional[str] = None, limit: int = 100, offset: int = 0
+    ) -> List[AnalysisResponse]:
+        """Completed analyses, newest first, one page at a time (DATA-4).
+
+        The images are loaded in ONE extra query (selectinload) instead of one query per row, and the list is
+        capped (default 100, at most 500) so it cannot grow without limit as the table does."""
+        query = self.db.query(Analysis).options(selectinload(Analysis.image)).filter(Analysis.status == "completed")
         if user_id:
-            analyses = self.analysis_repo.find_by(user_id=user_id, status="completed")
-        else:
-            analyses = self.analysis_repo.find_by(status="completed")
+            query = query.filter(Analysis.user_id == user_id)
+        analyses = (
+            query.order_by(Analysis.analyzed_at.desc())
+            .limit(max(1, min(int(limit), 500)))
+            .offset(max(int(offset), 0))
+            .all()
+        )
         return [self._to_response(a) for a in analyses]
 
     def get_timeline(self, analysis_id: str) -> List[Dict[str, Any]]:

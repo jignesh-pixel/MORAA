@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_db
 from app.schemas.auth import (
+    GoogleLoginRequest,
     LoginRequest,
     LoginResponse,
     RefreshTokenRequest,
@@ -13,7 +14,7 @@ from app.schemas.auth import (
     TokenResponse,
     UserResponse,
 )
-from app.services.auth_service import AuthService
+from app.services.auth_service import AuthService, verify_google_id_token
 from app.utils.logger import logger
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
@@ -26,7 +27,7 @@ router = APIRouter(prefix="/api/auth", tags=["Authentication"])
     summary="Register a new user",
     description="Create a new user account with email, username, and password.",
 )
-async def signup(request: SignupRequest, db: Session = Depends(get_db)):
+def signup(request: SignupRequest, db: Session = Depends(get_db)):
     """Register a new user account."""
     if not settings.ALLOW_SIGNUP:
         raise HTTPException(
@@ -51,7 +52,7 @@ async def signup(request: SignupRequest, db: Session = Depends(get_db)):
     summary="User login",
     description="Authenticate with username and password to receive JWT tokens.",
 )
-async def login(request: LoginRequest, db: Session = Depends(get_db)):
+def login(request: LoginRequest, db: Session = Depends(get_db)):
     """Authenticate user and return JWT tokens."""
     service = AuthService(db)
     try:
@@ -65,12 +66,31 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)):
 
 
 @router.post(
+    "/google",
+    response_model=LoginResponse,
+    summary="Sign in with Google (dashboard)",
+    description="Exchange a Google ID token for our tokens. Only emails in DASHBOARD_ALLOWED_EMAILS are accepted.",
+)
+async def google_login(request: GoogleLoginRequest, db: Session = Depends(get_db)):
+    if not settings.GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Google sign-in is not configured")
+    email = await verify_google_id_token(request.id_token)
+    allowed = {e.strip().lower() for e in (settings.DASHBOARD_ALLOWED_EMAILS or "").split(",") if e.strip()}
+    if not email or email.lower() not in allowed:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This Google account is not allowed")
+    try:
+        return AuthService(db).login_with_verified_email(email)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+
+@router.post(
     "/refresh",
     response_model=TokenResponse,
     summary="Refresh access token",
     description="Get a new access token using a valid refresh token.",
 )
-async def refresh_token(request: RefreshTokenRequest, db: Session = Depends(get_db)):
+def refresh_token(request: RefreshTokenRequest, db: Session = Depends(get_db)):
     """Refresh an expired access token."""
     service = AuthService(db)
     try:
@@ -81,3 +101,14 @@ async def refresh_token(request: RefreshTokenRequest, db: Session = Depends(get_
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(e),
         )
+
+
+@router.post(
+    "/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Log out",
+    description="Revoke a refresh token so it can never be used again. Always succeeds.",
+)
+def logout(request: RefreshTokenRequest, db: Session = Depends(get_db)):
+    """Revoke the given refresh token (the short-lived access token simply expires)."""
+    AuthService(db).logout(request.refresh_token)

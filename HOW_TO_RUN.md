@@ -106,17 +106,22 @@ source venv/bin/activate
 ### 4.3 Install Backend Dependencies
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-dev.txt -c constraints.txt
 ```
 
-This installs all packages listed in `backend/requirements.txt`, including:
+This installs the runtime packages in `backend/requirements.txt` plus the development tools in
+`backend/requirements-dev.txt` (pytest, ruff, pip-audit, pgserver). `constraints.txt` pins every
+package to the exact version the tests run against. On a production server install only the
+runtime set: `pip install -r requirements.txt -c constraints.txt`.
+
+Runtime packages include:
 - FastAPI, Uvicorn (web server)
 - SQLAlchemy, Alembic (database ORM & migrations)
 - Celery, Redis (task queue)
-- python-jose, passlib (authentication)
+- python-jose, bcrypt (authentication)
 - Pillow, ReportLab (image processing & PDFs)
-- google-generativeai (optional Gemini integration)
-- httpx, pytest (testing)
+- google-generativeai, google-genai, openai (AI providers)
+- httpx (HTTP client)
 
 ### 4.4 Configure Environment Variables
 
@@ -139,10 +144,16 @@ Paste the following into `backend/.env`:
 # ─── Application ───────────────────────────────────────────
 APP_NAME=MORAA GemVision
 APP_VERSION=1.0.0
+# development | production. Production refuses to start without SECRET_KEY (32+ chars),
+# META_APP_SECRET, RAZORPAY_WEBHOOK_SECRET and a non-SQLite DATABASE_URL.
+ENVIRONMENT=development
+# DEBUG only controls SQL echo and verbose output. It never relaxes a security check.
 DEBUG=true
+# Development only: accept webhooks with no signature while their secret is unset.
+# ALLOW_UNSIGNED_WEBHOOKS=true
 
 # ─── Server ────────────────────────────────────────────────
-HOST=0.0.0.0
+HOST=127.0.0.1
 PORT=8000
 
 # ─── Database (SQLite for development — no external DB needed)
@@ -257,7 +268,7 @@ The project does not include a seed script — the database starts empty. You ca
 Make sure your virtual environment is still activated, then run:
 
 ```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 **Expected output:**
@@ -265,7 +276,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 INFO:     Started server process [12345]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
-INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
 ```
 
 ### 5.2 Verify the Backend is Running
@@ -392,13 +403,13 @@ Open **two separate terminal windows**:
 | `cd backend` | `cd frontend` |
 | `venv\Scripts\activate` (Windows) | `npm run dev` |
 | or `source venv/bin/activate` (Linux/Mac) | |
-| `uvicorn app.main:app --reload --host 0.0.0.0 --port 8000` | |
+| `uvicorn app.main:app --reload --host 127.0.0.1 --port 8000` | |
 
 ### Windows PowerShell Example
 
 | Terminal 1 — Backend | Terminal 2 — Frontend |
 |---|---|
-| ```powershell<br>cd backend<br>.\venv\Scripts\Activate.ps1<br>uvicorn app.main:app --reload --host 0.0.0.0 --port 8000<br>``` | ```powershell<br>cd frontend<br>npm run dev<br>``` |
+| ```powershell<br>cd backend<br>.\venv\Scripts\Activate.ps1<br>uvicorn app.main:app --reload --host 127.0.0.1 --port 8000<br>``` | ```powershell<br>cd frontend<br>npm run dev<br>``` |
 
 ---
 
@@ -479,7 +490,7 @@ cd backend
 venv\Scripts\activate      # Windows
 # source venv/bin/activate  # Linux/Mac
 
-celery -A celery_worker worker -l info -Q analysis --autoreload
+celery -A celery_worker worker -l info -Q analysis
 ```
 
 Now you have three processes running:
@@ -528,7 +539,7 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 pip install --upgrade pip
 
 # Then retry
-pip install -r requirements.txt
+pip install -r requirements-dev.txt -c constraints.txt
 
 # If a specific package fails, install it individually
 pip install <package-name>
@@ -602,13 +613,45 @@ python --version
 
 ---
 
+## 11b. Going live: security settings (Phase 0)
+
+- **Bind to localhost.** Start uvicorn with `--host 127.0.0.1`. ngrok connects to localhost, so it still
+  reaches the two webhooks. The dashboard routes answer only to a request that really comes from this
+  machine; a `Host: localhost` header sent from elsewhere gets 404.
+- **Do not use `--reload` for live traffic.** Every saved file restarts the server mid-order.
+- **Start the server from `backend/`.** Uploads and reports are stored under relative paths, and the
+  server logs a warning if it was started elsewhere. `.env` itself is found by absolute path.
+- **`ENVIRONMENT=production`** makes the server refuse to start when a secret is missing, when `DEBUG`
+  is on, when the database is SQLite, or when the `uq_audit_logs_money_once` index is missing
+  (run `alembic upgrade head`).
+- **`SECRET_KEY`** must be set (32+ characters). Generate one with
+  `python -c "import secrets; print(secrets.token_urlsafe(48))"`.
+- **`MAX_GENERATIONS_PER_DAY`** is the daily ceiling on image generations per server process
+  (about 6 per Pack). The server warns at start-up if it is below one Pack.
+- **Dashboard password (optional).** Set `DASHBOARD_PASSWORD` (and optionally `DASHBOARD_USER`,
+  default `admin`) in the frontend environment to make the browser ask for a login on every page and on
+  `/api/gemini/analyze`. Leave it unset for local development.
+- **Opening the dashboard from another machine** needs both `LOCAL_API_HOSTS` (the name or IP in the
+  browser's address bar) and `LOCAL_PEER_ADDRESSES` (that machine's IP) in `backend/.env`; either one
+  alone is not enough. Leave both at their defaults for localhost-only use.
+- **The database schema belongs to Alembic.** The server no longer creates tables on start. In production
+  it refuses to start unless the database is at the latest revision: run `alembic upgrade head` before
+  every deploy that includes a new migration. In development on SQLite it migrates itself on start.
+  Never run `alembic downgrade base` on a live database: migration 0002's downgrade drops `customers`
+  (wallet balances).
+- **CI** (`.github/workflows/ci.yml`) runs lint, the full test suite on SQLite and on PostgreSQL, the
+  dependency audit (`backend/pip-audit-ignore.txt` lists the advisories that are known and deferred) and
+  the frontend type check on every pull request.
+- **Tests never read `backend/.env`.** They set `MORAA_ENV_FILE=""` and use temporary folders.
+  Set `MORAA_ENV_FILE` to a file path to run against a specific env file on purpose.
+
 ## 12. Useful Commands
 
 ### Backend
 
 ```bash
 # Start the API server (with auto-reload)
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 
 #To run the terminaal 
@@ -627,15 +670,24 @@ alembic downgrade -1
 # Check current migration status
 alembic current
 
-# Run tests
+# Run tests (SQLite, no setup needed)
 cd backend
-pytest
-pytest -v     # verbose
-pytest -k "test_name"    # run specific test
+python -m pytest -q
+python -m pytest -k "test_name"    # run specific test
+
+# Run the same suite on a real, throw-away PostgreSQL (starts one automatically via pgserver)
+set MORAA_TEST_DB=postgres            # PowerShell: $env:MORAA_TEST_DB = "postgres"
+python -m pytest -q
+# or against a PostgreSQL you run yourself (loopback only; never a hosted/production database)
+# set TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/moraa_test
+
+# Lint and dependency audit (the same checks CI runs)
+ruff check .
+pip-audit -r constraints.txt --no-deps --disable-pip --strict
 
 # Start Celery worker (if Redis is running)
 cd backend
-celery -A celery_worker worker -l info -Q analysis --autoreload
+celery -A celery_worker worker -l info -Q analysis
 ```
 
 ### Frontend
@@ -749,7 +801,8 @@ moraa-gemvision/
 │  1. Clone the repository                                │
 │  2. cd frontend && npm install                          │
 │  3. cd ../backend && python -m venv venv                │
-│  4. Activate venv && pip install -r requirements.txt    │
+│  4. Activate venv && pip install -r requirements-dev.txt │
+│     -c constraints.txt                                  │
 │  5. Create backend/.env with your configuration         │
 │  6. alembic upgrade head                                │
 └─────────────────────────────────────────────────────────┘
@@ -775,7 +828,7 @@ moraa-gemvision/
 │  • Check backend health at http://localhost:8000/health   │
 │  • Explore API at http://localhost:8000/docs             │
 │  • Register a user, upload an image, run an analysis     │
-│  • Run tests: cd backend && pytest                       │
+│  • Run tests: cd backend && python -m pytest             │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -823,15 +876,15 @@ The frontend also supports **direct Gemini API analysis** via `/api/gemini/analy
 
 | Task | Command |
 |---|---|
-| Backend setup | `cd backend && python -m venv venv && pip install -r requirements.txt` |
+| Backend setup | `cd backend && python -m venv venv && pip install -r requirements-dev.txt -c constraints.txt` |
 | Activate venv (Windows CMD) | `venv\Scripts\activate` |
 | Activate venv (PowerShell) | `.\venv\Scripts\Activate.ps1` |
 | Activate venv (Linux/Mac) | `source venv/bin/activate` |
 | Run migrations | `cd backend && alembic upgrade head` |
-| Start backend | `cd backend && uvicorn app.main:app --reload --host 0.0.0.0 --port 8000` |
+| Start backend | `cd backend && uvicorn app.main:app --reload --host 127.0.0.1 --port 8000` |
 | Frontend setup | `cd frontend && npm install` |
 | Start frontend | `cd frontend && npm run dev` |
-| Run backend tests | `cd backend && pytest` |
+| Run backend tests | `cd backend && python -m pytest -q` |
 | Run frontend lint | `cd frontend && npm run lint` |
 | API docs | `http://localhost:8000/docs` |
 | Health check | `http://localhost:8000/health` |

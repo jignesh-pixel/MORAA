@@ -74,3 +74,9 @@ class RefreshTokenRequest(BaseModel):
     """Refresh token request."""
 
     refresh_token: str = Field(..., description="Valid refresh token")
+
+
+class GoogleLoginRequest(BaseModel):
+    """The ID token Google's sign-in button gives the dashboard page."""
+
+    id_token: str = Field(..., min_length=20, max_length=4096)

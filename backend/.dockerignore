@@ -1,0 +1,15 @@
+venv
+venv-local
+**/__pycache__
+*.pyc
+.env
+.env.*
+!.env.example
+data
+logs
+backups
+tests
+task*_outputs
+prompt_experiment_outputs
+task*.py
+prompt_experiment*.py

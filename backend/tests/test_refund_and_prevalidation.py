@@ -40,6 +40,7 @@ class RefundOnFailedGenerationTests(unittest.TestCase):
         self.ingestion = WhatsAppIngestion(
             external_user_id=SENDER, external_message_id="wamid.r1", external_media_id="m1",
             channel="whatsapp", image_id=img.id, status="pack_queued",
+            amount_charged=PRICE,       # a real paid order always records what was debited
         )
         self.db.add(self.ingestion)
         self.db.commit()

@@ -1,0 +1,14 @@
+{
+  "_comment": "Locked load-harness verdicts. The phase gate fails if any scenario gets WORSE than its entry (PASS > WARN > FAIL) and reports any improvement so this file can be tightened. Phase 2 fixed f (MON-10); Phase 3 runtime hardening fixed c, e, h, i and k (provider timeouts and 429 handling, event-loop CPU pools, raw-bytes memory, connection release).",
+  "a": "PASS",
+  "b": "PASS",
+  "c": "PASS",
+  "d": "PASS",
+  "e": "PASS",
+  "f": "PASS",
+  "g": "PASS",
+  "h": "PASS",
+  "i": "PASS",
+  "k": "PASS",
+  "l": "PASS"
+}

@@ -22,6 +22,7 @@ from urllib.parse import quote
 
 import httpx
 
+from app.services.gst_places import is_inter_state, place_of_supply
 from app.utils.logger import logger
 
 
@@ -387,7 +388,7 @@ class ERPNextService:
             if invoice is None:
                 customer = await self._upsert_billing_customer(client, whatsapp_id, customer_name, gstin)
                 invoice_name = await self._create_submitted_invoice(
-                    client, customer, item_code, amount, payment_id
+                    client, customer, item_code, amount, payment_id, gstin=gstin
                 )
             else:
                 invoice_name = invoice["name"]
@@ -501,7 +502,8 @@ class ERPNextService:
         return rows
 
     async def _create_submitted_invoice(
-        self, client: httpx.AsyncClient, customer: str, item_code: str, amount: float, payment_id: str
+        self, client: httpx.AsyncClient, customer: str, item_code: str, amount: float, payment_id: str,
+        gstin: Optional[str] = None,
     ) -> str:
         if not customer:
             raise ERPNextError("customer upsert returned no name")
@@ -514,6 +516,12 @@ class ERPNextService:
             "docstatus": 1,  # insert + submit in one request (rolled back together on error)
         }
         template = str(_cfg("ERPNEXT_TAX_TEMPLATE")).strip()
+        pos = place_of_supply(gstin)
+        if pos:
+            doc["place_of_supply"] = pos         # the buyer's state, from the first two digits of their GSTIN
+        interstate = str(_cfg("ERPNEXT_TAX_TEMPLATE_INTERSTATE")).strip()
+        if interstate and is_inter_state(str(_cfg("ERPNEXT_COMPANY_STATE_CODE")), gstin):
+            template = interstate                # IGST for a buyer in another state
         if template:
             doc["taxes_and_charges"] = template
             doc["taxes"] = await self._tax_rows(client, template)

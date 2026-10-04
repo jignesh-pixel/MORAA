@@ -27,6 +27,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+
+from tests.db_support import make_engine
 import app.models  # noqa: F401 — register every model with Base.metadata
 from app.config import settings
 from app.database import Base, get_db
@@ -292,11 +294,7 @@ class RazorpayWebhookRouteTests(unittest.TestCase):
         self.webhook_module = webhook_module
         self.app = app
 
-        engine = create_engine(
-            "sqlite:///:memory:",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
+        engine = make_engine()
         Base.metadata.create_all(bind=engine)
         self.engine = engine
         self.session = sessionmaker(bind=engine)()
@@ -405,7 +403,7 @@ class RazorpayWebhookRouteTests(unittest.TestCase):
     # ── normal lifecycle ───────────────────────────────────────────────
 
     def test_unrelated_events_are_ignored(self):
-        response = self._post({"event": "refund.processed", "payload": {}})
+        response = self._post({"event": "payment.authorized", "payload": {}})
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "ignored")
@@ -416,6 +414,98 @@ class RazorpayWebhookRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "missing_phone"})
         self.assertEqual(self.session.query(Customer).count(), 0)
+
+    def test_formatted_payer_phone_credits_the_existing_wallet(self):
+        """Spaces/hyphens in the payer's number must not create a second wallet."""
+        self.session.add(Customer(
+            whatsapp_id="919000000004", full_name="Test", business_name="Test Gems",
+            gst_number="N/A", address="Surat", wallet_balance=100, is_registered=True,
+        ))
+        self.session.commit()
+        response = self._post(_payment_captured_payload(notes={"sender_id": "+91 90000-00004"}))
+
+        self.assertEqual(response.json(), {"status": "ok"})
+        self.session.expire_all()
+        self.assertEqual(wallet_service.get_balance(self.session, "919000000004"), 600)
+        self.assertEqual(self.session.query(Customer).count(), 1)
+
+    def _audits(self, action):
+        return (
+            self.session.query(AuditLog)
+            .filter(AuditLog.action == action, AuditLog.resource_id == PAYMENT_ID)
+            .all()
+        )
+
+    def test_payment_without_phone_is_recorded_for_manual_credit_once(self):
+        for _ in range(3):  # Razorpay re-delivers the same event
+            response = self._post(_payment_captured_payload())
+            self.assertEqual(response.json(), {"status": "missing_phone"})
+
+        rows = self._audits("razorpay_payment_unmatched")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].status, "pending")
+        self.assertEqual(json.loads(rows[0].details)["amount_paid"], 500)
+        self.assertEqual(self._audits("razorpay_payment_captured"), [])
+
+    def test_phoneless_event_after_credit_is_not_flagged_unmatched(self):
+        self._post(_payment_captured_payload(notes={"sender_id": SENDER}))
+        response = self._post(_payment_captured_payload())
+
+        self.assertEqual(response.json(), {"status": "already_processed"})
+        self.assertEqual(self._audits("razorpay_payment_unmatched"), [])
+
+    def test_transient_credit_failure_returns_503_and_retry_credits_once(self):
+        self.session.add(Customer(
+            whatsapp_id=SENDER, full_name="Test", business_name="Test Gems",
+            gst_number="N/A", address="Surat", wallet_balance=100, is_registered=True,
+        ))
+        self.session.commit()
+        payload = _payment_captured_payload(notes={"sender_id": SENDER})
+
+        with patch.object(self.webhook_module, "credit_wallet", side_effect=RuntimeError("db blip")):
+            response = self._post(payload)
+        self.assertEqual(response.status_code, 503)
+        self.session.expire_all()
+        self.assertEqual(self._audits("razorpay_payment_captured"), [])  # claim rolled back
+        self.assertEqual(wallet_service.get_balance(self.session, SENDER), 100)
+
+        retry = self._post(payload)  # Razorpay's automatic retry
+        self.assertEqual((retry.status_code, retry.json()), (200, {"status": "ok"}))
+        self.assertEqual(wallet_service.get_balance(self.session, SENDER), 600)
+        self.assertEqual(len(self._audits("razorpay_payment_captured")), 1)
+
+        again = self._post(payload)
+        self.assertEqual(again.json(), {"status": "already_processed"})
+        self.assertEqual(wallet_service.get_balance(self.session, SENDER), 600)
+        # The failure record from the first attempt is closed by the credit.
+        self.assertEqual({r.status for r in self._audits("razorpay_payment_credit_failed")}, {"resolved"})
+
+    def test_unmatched_alert_resolved_when_a_later_event_credits(self):
+        self._post(_payment_captured_payload())  # no phone: pending alert row
+        self.assertEqual([r.status for r in self._audits("razorpay_payment_unmatched")], ["pending"])
+
+        credited = self._post(_payment_captured_payload(notes={"sender_id": SENDER}))
+        self.assertEqual(credited.json(), {"status": "ok"})
+        self.session.expire_all()
+        self.assertEqual([r.status for r in self._audits("razorpay_payment_unmatched")], ["resolved"])
+
+    def test_permanent_credit_failure_stops_retrying_after_the_cap(self):
+        self.session.add(Customer(
+            whatsapp_id=SENDER, full_name="Test", business_name="Test Gems",
+            gst_number="N/A", address="Surat", wallet_balance=100, is_registered=True,
+        ))
+        self.session.commit()
+        payload = _payment_captured_payload(notes={"sender_id": SENDER})
+        cap = self.webhook_module.MAX_CREDIT_ATTEMPTS
+
+        with patch.object(self.webhook_module, "credit_wallet", side_effect=RuntimeError("always broken")):
+            codes = [self._post(payload).status_code for _ in range(cap)]
+        self.assertEqual(codes[:-1], [503] * (cap - 1))
+        self.assertEqual(codes[-1], 200)  # Razorpay stops retrying; ALERT for manual credit
+        self.session.expire_all()
+        self.assertEqual(len(self._audits("razorpay_payment_credit_failed")), cap)
+        self.assertEqual(self._audits("razorpay_payment_captured"), [])
+        self.assertEqual(wallet_service.get_balance(self.session, SENDER), 100)
 
     def test_successful_payment_creates_customer_and_credits_wallet(self):
         response = self._post(
@@ -498,11 +588,7 @@ class WalletCreditStillWorksTests(unittest.TestCase):
     """Guard the downstream helper the webhook relies on."""
 
     def setUp(self):
-        engine = create_engine(
-            "sqlite:///:memory:",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
+        engine = make_engine()
         Base.metadata.create_all(bind=engine)
         self.engine = engine
         self.session = sessionmaker(bind=engine)()

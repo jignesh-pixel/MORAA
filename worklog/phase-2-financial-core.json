@@ -1,0 +1,109 @@
+{
+  "project": "MORAA GemVision",
+  "phase": "Phase 2 Financial Core",
+  "why": "Customers pay real money into a prepaid wallet and every image order takes money out of it. The audit found that payments could be lost or kept after a refund (the Razorpay webhook answered OK even when crediting failed, and refunds or chargebacks never left the wallet), that balances had no ledger to prove them, that a customer could be charged twice for one order or credited twice for one payment under a race, and that the daily spending limit was applied only after the customer had been charged. Without this phase the business could not prove what any customer owes or is owed, and one bad day (a retry storm, a crash at the wrong moment) could silently move money.",
+  "approach": "Every wallet change now writes exactly one ledger row in the same database transaction, and a check proves the sum of the ledger equals each balance. Payments, refunds and chargebacks go through one guarded path that moves money at most once. Money events that cannot be applied are parked for a person instead of being lost. Orders are declined BEFORE charging when today's generation limit leaves no room.",
+  "decisions": [
+    {
+      "decision": "Add a wallet ledger table (wallet_transactions) and keep the balance column, with a database check that they agree.",
+      "why": "A ledger gives every rupee a reason and a timestamp, and the invariant 'sum of ledger = balance' can be tested on every scenario. The balance column stays so reads remain fast and old code keeps working.",
+      "alternatives": [
+        { "option": "Compute the balance from the ledger on every read", "why_not": "Slower, and a bigger rewrite of every place that reads the balance." },
+        { "option": "Keep only the balance column and the audit log", "why_not": "The audit log is optional text; it cannot prove the balance." }
+      ],
+      "tasks": "1.1, 1.2"
+    },
+    {
+      "decision": "Claim a payment or refund FIRST with a unique audit row (one per payment, one per refunded order), then move the money.",
+      "why": "A unique database index decides the winner when two requests race, so money moves at most once even if Razorpay retries or two workers run at the same moment.",
+      "alternatives": [
+        { "option": "Check 'was it already processed?' and then credit", "why_not": "Two simultaneous requests can both pass the check." },
+        { "option": "In-memory lock", "why_not": "Does not work across restarts or more than one server process." }
+      ],
+      "tasks": "2.1, 2.3"
+    },
+    {
+      "decision": "When a refund or chargeback is larger than the balance left, take what is there and flag the rest for review (owner's Option A).",
+      "why": "The owner chose this. A negative wallet would break the rule that balances are never negative; flagging keeps the money trail honest and asks a person to decide.",
+      "alternatives": [
+        { "option": "Allow a negative balance", "why_not": "Breaks the database rule and hides the problem." },
+        { "option": "Refuse the clawback entirely", "why_not": "Lets a customer keep money that was returned to them by the card network." }
+      ],
+      "tasks": "2.1"
+    },
+    {
+      "decision": "No refund for a result the customer merely dislikes; refund only when we failed to deliver.",
+      "why": "The owner's rule: poor input photos give poor output. Automatic refunds cover failures, not taste.",
+      "alternatives": [
+        { "option": "Refund on request for any dissatisfaction", "why_not": "Rejected by the owner: cost and abuse risk." }
+      ],
+      "tasks": "2.2"
+    },
+    {
+      "decision": "Decline an order before charging when today's generation limit has no room (peek, then reserve at generation).",
+      "why": "Previously the customer was charged and then refunded after the limit blocked the order. Declining first never takes money it will have to give back.",
+      "alternatives": [
+        { "option": "Charge first and refund on block", "why_not": "A refund is a second money movement that can itself fail or be delayed." }
+      ],
+      "tasks": "3.1"
+    }
+  ],
+  "errors": [
+    {
+      "error": "Refund processed before the credit it reverses (retry within the same payment)",
+      "cause": "A refund event could arrive before the payment-captured event had been credited.",
+      "fix": "The refund handler answers 'retry later' (503) for up to six hours until the credit exists, then takes the money back exactly once.",
+      "task": "2.1"
+    },
+    {
+      "error": "test_postgres_semantics flaky: expected waiter in pg_stat_activity but none found",
+      "cause": "The test polled the database inside one transaction, so it saw a frozen snapshot and never saw the other connection waiting.",
+      "fix": "Poll with autocommit so every look sees the current state. A test fix, not a product bug.",
+      "task": "4.1"
+    },
+    {
+      "error": "WhatsApp Pay and Razorpay could both credit the same recharge",
+      "cause": "Both channels can report the same rupees for the same customer at about the same time.",
+      "fix": "WhatsApp Pay skips its own credit only when the Razorpay path will really credit; the pending row is closed either way.",
+      "task": "2.4"
+    }
+  ],
+  "domains": [
+    {
+      "name": "Wallet ledger",
+      "goal": "Every rupee in or out has exactly one reason row.",
+      "tasks": [
+        { "title": "Every wallet change writes one ledger row in the same transaction, and the sum of the ledger equals each customer's balance", "status": "done", "files": ["backend/app/models/wallet_transaction.py", "backend/app/services/wallet_service.py", "backend/alembic/versions/0009*.py"], "verify": "Run backend/scripts/wallet_negative_check.py (read-only). Expect: no customer with a negative balance and no customer whose balance differs from the ledger. The automated tests assert this after every money scenario." },
+        { "title": "Opening balances of existing customers are written into the ledger by the migration", "status": "done", "files": ["backend/alembic/versions/0009*.py"], "verify": "After the migration, pick any customer in the database: their opening_balance ledger row equals their balance before the migration. Not yet applied to production (waiting for the owner's go-ahead)." },
+        { "title": "A phone number written two different ways is one customer", "status": "done", "files": ["backend/app/utils/phone.py"], "verify": "Recharge from +91 98123 45678 and from 919812345678: the money lands in one wallet." }
+      ]
+    },
+    {
+      "name": "Payments and refunds",
+      "goal": "Money moves at most once and is never lost.",
+      "tasks": [
+        { "title": "A payment is credited once even if Razorpay sends it several times at the same moment", "status": "done", "files": ["backend/app/api/routes/payment_routes.py"], "verify": "In Razorpay test mode send the same payment event five times quickly: the wallet rises once." },
+        { "title": "Refunds and chargebacks take the money back from the wallet (Option A for amounts over the balance)", "status": "done", "files": ["backend/app/api/routes/payment_routes.py", "backend/app/services/wallet_service.py"], "verify": "Refund a test payment: balance drops by the refunded amount; a refund bigger than the balance empties the wallet and shows a 'pending review' row, never a negative balance." },
+        { "title": "A payment with no usable phone number is parked in pending_payments and raised, never lost", "status": "done", "files": ["backend/app/services/pending_payment_service.py", "backend/app/models/pending_payment.py"], "verify": "Send a test payment without a phone: a pending row appears; crediting it later with the right phone adds the money once." },
+        { "title": "Missed in-chat (WhatsApp Pay) and payment-link payments are found and credited by background checks", "status": "done", "files": ["backend/app/services/whatsapp_pay_service.py", "backend/app/services/razorpay_link_reconcile.py"], "verify": "Stop the webhook, pay a test link, restart: within a few minutes the wallet is credited once." },
+        { "title": "The webhook answers an error (so Razorpay retries) when crediting really failed", "status": "done", "files": ["backend/app/api/routes/payment_routes.py"], "verify": "Force a database error during a test payment: the response is not 200 OK, and the retry credits it." }
+      ]
+    },
+    {
+      "name": "Orders and limits",
+      "goal": "A customer is charged only for an order that can run.",
+      "tasks": [
+        { "title": "An order is declined before charging when the daily generation limit or kill switch leaves no room", "status": "done", "files": ["backend/app/api/routes/meta_webhook.py", "backend/app/ai/image_generation_manager.py"], "verify": "Set MAX_GENERATIONS_PER_DAY very low, tap Catalog Pack: reply says nothing was charged and the wallet is unchanged; the photo can be chosen again later." },
+        { "title": "A duplicate WhatsApp message is handled once (processed_messages)", "status": "done", "files": ["backend/app/services/message_dedupe.py"], "verify": "Replay the same webhook body twice: one reply only." },
+        { "title": "A very large recharge request is refused with a clear message", "status": "done", "files": ["backend/app/api/routes/meta_webhook.py"], "verify": "Type 'recharge 999999': the bot refuses and names the maximum." }
+      ]
+    },
+    {
+      "name": "Proof and safety nets",
+      "tasks": [
+        { "title": "Tests run on SQLite and PostgreSQL and a phase gate re-checks everything with one command", "status": "done", "files": ["backend/scripts/phase_gate.py", "backend/tests/"], "verify": "Run backend/venv-local/Scripts/python.exe backend/scripts/phase_gate.py --phase \"Phase 2\" --live-readonly. Every step passes except 'live database up to date', which fails by design until production is upgraded." },
+        { "title": "Production database upgraded through migrations 0009-0013 and the write-freeze steps followed", "status": "blocked", "blocked_by": "The owner's go-ahead for the production upgrade (docs/PHASE_2_DEPLOY_RUNBOOK.md)." }
+      ]
+    }
+  ]
+}

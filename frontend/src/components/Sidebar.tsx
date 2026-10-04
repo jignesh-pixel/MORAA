@@ -11,12 +11,14 @@ import {
   Settings,
   User,
   Gem,
+  MessageCircle,
 } from "lucide-react";
 
 // History & Reports are temporarily hidden from the sidebar (their pages
 // remain registered in app/page.tsx for easy restoration).
 const navItems = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
+  { id: "chats", label: "WhatsApp Chats", icon: MessageCircle },
   { id: "new-analysis", label: "New Analysis", icon: PlusCircle },
   { id: "prompt-editor", label: "Prompt Editor", icon: PenLine },
   { id: "settings", label: "Settings", icon: Settings },

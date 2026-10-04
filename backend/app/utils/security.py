@@ -4,23 +4,34 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
+import bcrypt
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 
 from app.config import settings
 
-# Password hashing context using bcrypt
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# bcrypt only reads the first 72 bytes of a password. passlib (used before)
+# truncated silently; bcrypt>=5 raises instead. Truncating the same way keeps
+# every existing $2b$ hash verifiable and long passwords usable.
+_BCRYPT_MAX_BYTES = 72
+
+
+def _password_bytes(password: str) -> bytes:
+    return password.encode("utf-8")[:_BCRYPT_MAX_BYTES]
 
 
 def hash_password(password: str) -> str:
-    """Hash a plain text password."""
-    return pwd_context.hash(password)
+    """Hash a plain text password (bcrypt, $2b$ format)."""
+    return bcrypt.hashpw(_password_bytes(password), bcrypt.gensalt()).decode("ascii")
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify a plain text password against a hashed password."""
-    return pwd_context.verify(plain_password, hashed_password)
+    """Verify a plain text password against a bcrypt hash; False on any malformed input."""
+    if not plain_password or not hashed_password:
+        return False
+    try:
+        return bcrypt.checkpw(_password_bytes(plain_password), hashed_password.encode("ascii"))
+    except (ValueError, TypeError, UnicodeEncodeError):
+        return False
 
 
 def create_access_token(

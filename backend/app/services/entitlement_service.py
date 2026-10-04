@@ -16,7 +16,10 @@ Wallet money is never touched here.
 """
 
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, List, Optional
+
+from sqlalchemy import and_, or_
 
 from app.config import settings
 from app.utils.logger import logger
@@ -32,6 +35,11 @@ PRODUCT_LABELS = {"WHITE_BG": "Clean Studio Shot", "PACK_1": "Full Catalog Pack"
 TRIAL_CREDIT_AUDIT_ACTION = "trial_credit_used"
 # Orders that are paid by a trial credit but not finished yet.
 _PENDING_STATUSES = ("white_queued", "pack_queued", "processing", "generated")
+# Delivered orders whose credit is only counted once record_trial_success has written its audit row.
+# Metering runs right after delivery, so the reservation only needs to bridge that moment; it is bounded
+# so an order that was never metered (or one delivered long before metering existed) cannot hold a credit forever.
+_DELIVERED_STATUSES = ("delivered", "delivered_partial")
+_DELIVERED_RESERVATION = timedelta(minutes=15)
 
 EXHAUSTED_TEMPLATE = (
     "You have used all your complimentary test credits ({used}/{total}). To continue "
@@ -113,17 +121,48 @@ def trial_credits_available(db, customer: Any, product_code: str, exclude_ingest
     (so two quick taps cannot spend the same last credit)."""
     if not trial_can_use(customer, product_code):
         return False
+    from app.models.customer import Customer
     from app.models.whatsapp_ingestion import WhatsAppIngestion
 
+    # Lock this customer's row until the caller commits the order status. Two taps for the same
+    # customer now run one after the other: the second waits here, then counts the first order as
+    # pending, so the last credit can be given to only one of them (PostgreSQL; SQLite has one writer).
+    # The remaining credits are re-read AFTER the lock, so a concurrent delivery is also counted.
+    row = (
+        db.query(Customer.trial_credits_total, Customer.trial_credits_used)
+        .filter(Customer.id == customer.id)
+        .with_for_update()
+        .first()
+    )
+    remaining = trial_remaining(customer)
+    if row is not None:
+        remaining = max(int(row[0] or 0) - int(row[1] or 0), 0)
+
+    from app.models.audit_log import AuditLog
+
+    # A delivered order keeps its credit reserved until the metering row exists, so there is no gap
+    # between "delivered" and "credit counted" in which another tap could take the same credit.
+    already_metered = (
+        db.query(AuditLog.id)
+        .filter(AuditLog.action == TRIAL_CREDIT_AUDIT_ACTION, AuditLog.resource_id == WhatsAppIngestion.id)
+        .exists()
+    )
     query = db.query(WhatsAppIngestion.product_code).filter(
         WhatsAppIngestion.external_user_id == customer.whatsapp_id,
         WhatsAppIngestion.amount_charged == 0,
-        WhatsAppIngestion.status.in_(_PENDING_STATUSES),
+        or_(
+            WhatsAppIngestion.status.in_(_PENDING_STATUSES),
+            and_(
+                WhatsAppIngestion.status.in_(_DELIVERED_STATUSES),
+                WhatsAppIngestion.updated_at >= datetime.now(timezone.utc) - _DELIVERED_RESERVATION,
+                ~already_metered,
+            ),
+        ),
     )
     if exclude_ingestion_id:
         query = query.filter(WhatsAppIngestion.id != exclude_ingestion_id)
     pending = sum(credit_cost(code or "") for (code,) in query.all())
-    return trial_remaining(customer) - pending >= credit_cost(product_code)
+    return remaining - pending >= credit_cost(product_code)
 
 
 async def record_trial_success(db, ingestion: Any) -> None:

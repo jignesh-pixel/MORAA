@@ -11,7 +11,7 @@ lifecycle. Part 3 will read this record to connect ingestion → generation.
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Integer, String, Text
+from sqlalchemy import DateTime, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -31,6 +31,13 @@ class WhatsAppIngestion(Base):
     """
 
     __tablename__ = "whatsapp_ingestions"
+    # The recovery sweeps, the failure-rate check and the metrics all filter on status (+ a time): without these
+    # they scan the whole table, inside webhook-time queries (DATA-3, migration 0014).
+    __table_args__ = (
+        Index("ix_whatsapp_ingestions_status_updated", "status", "updated_at"),
+        Index("ix_whatsapp_ingestions_created_at", "created_at"),
+        Index("ix_whatsapp_ingestions_user_status", "external_user_id", "status"),
+    )
 
     id: Mapped[str] = mapped_column(
         String(36),
@@ -99,6 +106,11 @@ class WhatsAppIngestion(Base):
         Integer,
         nullable=True,
         comment="Downloaded file size in bytes",
+    )
+
+    group_id: Mapped[str] = mapped_column(
+        String(36), nullable=True, index=True,
+        comment="Bulk order group this photo was gathered into (UX-1); NULL for an ordinary single photo",
     )
 
     # ── Processing state ───────────────────────────────────────────────

@@ -29,9 +29,10 @@ import asyncio
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import httpx
+from sqlalchemy import and_, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -39,9 +40,12 @@ from app.config import settings
 from app.models.audit_log import AuditLog
 from app.models.whatsapp_payment_order import WhatsAppPaymentOrder
 from app.services.meta_whatsapp_service import _post_message_payload, send_whatsapp_text
+from app.models.wallet_transaction import KIND_CREDIT_WHATSAPP_PAY
 from app.services.wallet_service import credit_wallet, find_customer_by_phone, get_balance
-from app.utils.logger import logger
-
+from app.services.pending_payment_service import mark_pending_credited
+from app.utils.executors import run_io
+from app.utils.logger import logger, mask_phone
+from app.utils.phone import normalize_phone
 _plog = logger.bind(category="payments")
 
 GRAPH_BASE = "https://graph.facebook.com/v21.0"
@@ -73,8 +77,8 @@ def _allowlisted(phone: str) -> bool:
     raw = (settings.WHATSAPP_PAY_ALLOWLIST or "").strip()
     if not raw:
         return True
-    wanted = {_digits(p)[-10:] for p in raw.split(",") if p.strip()}
-    return _digits(phone)[-10:] in wanted
+    wanted = {normalize_phone(p) for p in raw.split(",") if p.strip()}
+    return normalize_phone(phone) in wanted
 
 
 def _importer_address() -> Optional[Dict[str, str]]:
@@ -113,7 +117,7 @@ def is_native_pay_active(phone: str) -> bool:
 
 
 def _log_native_skip(recipient_id: str, site: str, reason: str) -> None:
-    msg = f"WhatsApp Pay native skipped: site={site} recipient={recipient_id} reason={reason}"
+    msg = f"WhatsApp Pay native skipped: site={site} recipient={mask_phone(recipient_id)} reason={reason}"
     # Gate 1 is the normal "feature off" state: INFO. Everything else means
     # the feature is on but this prompt will not be native: WARNING.
     if reason.startswith("gate1_"):
@@ -250,7 +254,7 @@ async def try_send_native_recharge(
             recipient_id, customer.whatsapp_id, order.reference_id, amount, body_text, expires_at
         )
         _plog.info(
-            f"WhatsApp Pay native attempt: site={site} recipient={recipient_id} "
+            f"WhatsApp Pay native attempt: site={site} recipient={mask_phone(recipient_id)} "
             f"ref={order.reference_id} amount_rupees={amount} config={order.configuration_name}")
         meta_error: Dict[str, Any] = {}
         sent = await _post_message_payload(
@@ -271,14 +275,14 @@ async def try_send_native_recharge(
             logger.info(f"WhatsApp Pay native sent: site={site} ref={order.reference_id}")
         else:
             _plog.warning(
-                f"WhatsApp Pay native dispatch failed: site={site} recipient={recipient_id} "
+                f"WhatsApp Pay native dispatch failed: site={site} recipient={mask_phone(recipient_id)} "
                 f"ref={order.reference_id} code={meta_error.get('code')} subcode={meta_error.get('subcode')} "
                 f"message={meta_error.get('message')!r} details={meta_error.get('details')!r} "
                 f"timeout={bool(meta_error.get('timeout'))}")
         return bool(sent)
     except Exception as e:
         db.rollback()
-        logger.error(f"WhatsApp Pay dispatch error: site={site} recipient={recipient_id}: {e}")
+        logger.error(f"WhatsApp Pay dispatch error: site={site} recipient={mask_phone(recipient_id)}: {e}")
         return False
 
 
@@ -298,12 +302,12 @@ async def send_payment_unavailable(
         return False
     _plog.error(
         f"ALERT WhatsApp Pay strict: native recharge not sent, no link emitted: "
-        f"site={site} recipient={recipient_id}")
+        f"site={site} recipient={mask_phone(recipient_id)}")
     text = f"{body_text}\n\n{PAYMENT_UNAVAILABLE_MESSAGE}" if body_text else PAYMENT_UNAVAILABLE_MESSAGE
     try:
         await send_whatsapp_text(recipient_id, text, reply_to_message_id=reply_to_message_id)
     except Exception as e:
-        logger.error(f"WhatsApp Pay strict notice failed for {recipient_id}: {e}")
+        logger.error(f"WhatsApp Pay strict notice failed for {mask_phone(recipient_id)}: {e}")
     return True
 
 
@@ -421,17 +425,28 @@ async def reconcile_order(db: Session, order: WhatsAppPaymentOrder) -> str:
     """Confirm one order with Meta and credit the wallet at most once."""
     if order.credited:
         return "already_credited"
-    payment = await lookup_payment(order.configuration_name, order.reference_id)
+    configuration_name, reference_id = order.configuration_name, order.reference_id
+    # Release the database connection before the slow Meta call (the order reloads on next use).
+    db.commit()
+    payment = await lookup_payment(configuration_name, reference_id)
     if payment is None:
         return "lookup_failed"
 
     now = datetime.now(timezone.utc)
     if payment.get("status") != "captured":
-        expires_at = order.expires_at
-        if expires_at is not None and expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        order.status = "expired" if expires_at and now > expires_at else "pending"
-        db.commit()
+        # Only a live order moves between sent / pending / expired. An order that already ended as
+        # failed / dispatch_failed / expired keeps that status: it is re-checked only in case the
+        # customer paid anyway, and a not-yet-paid answer must not rewrite its history.
+        if order.status in ("sent", "pending", "created"):
+            expires_at = order.expires_at
+            if expires_at is not None and expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            past_expiry = bool(expires_at and now > expires_at)
+            if past_expiry:
+                order.status = "expired"
+            elif order.status != "created":
+                order.status = "pending"          # a "created" order stays created: Meta may never have shown it
+            db.commit()
         return order.status
 
     tx = _successful_transaction(payment)
@@ -473,9 +488,18 @@ async def reconcile_order(db: Session, order: WhatsAppPaymentOrder) -> str:
         return "already_credited"
 
     try:
-        if credit_wallet(db, order.whatsapp_id, order.amount_rupees, commit=False) != 1:
+        if credit_wallet(
+            db, order.whatsapp_id, order.amount_rupees, commit=False,
+            kind=KIND_CREDIT_WHATSAPP_PAY, ref=pay_id,
+        ) != 1:
             raise RuntimeError("customer row not updated")
         order.status, order.credited = "captured", True
+        # If the Razorpay webhook parked this payment for review earlier (the order was in a state that
+        # would not be credited), close those rows in the same transaction so nobody credits it again by hand.
+        mark_pending_credited(db, pay_id, order.whatsapp_id)
+        db.query(AuditLog).filter(
+            AuditLog.action == "razorpay_payment_unmatched", AuditLog.resource_id == pay_id, AuditLog.status == "pending"
+        ).update({AuditLog.status: "resolved"}, synchronize_session=False)
         db.commit()
     except Exception as e:
         db.rollback()
@@ -483,31 +507,94 @@ async def reconcile_order(db: Session, order: WhatsAppPaymentOrder) -> str:
         return "credit_failed"
 
     logger.info(
-        f"WhatsApp Pay credited ₹{order.amount_rupees} to {order.whatsapp_id} "
+        f"WhatsApp Pay credited ₹{order.amount_rupees} to {mask_phone(order.whatsapp_id)} "
         f"(ref={order.reference_id}, payment={pay_id})"
     )
     await _send_receipt(db, order)
     return "credited"
 
 
-async def reconcile_pending_orders(db: Session, older_than_seconds: int = 120, limit: int = 50) -> Dict[str, int]:
-    """Sweep orders whose payment webhook may have been missed."""
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)
-    rows: List[WhatsAppPaymentOrder] = (
-        db.query(WhatsAppPaymentOrder)
-        .filter(
-            WhatsAppPaymentOrder.status.in_(("sent", "pending")),
-            WhatsAppPaymentOrder.credited.is_(False),
-            WhatsAppPaymentOrder.created_at <= cutoff,
-        )
-        .order_by(WhatsAppPaymentOrder.created_at)
-        .limit(limit)
-        .all()
-    )
-    results: Dict[str, int] = {}
-    for order in rows:
+# Orders that ended without a credit (Meta rejected the message, the payment failed, or it expired) are still
+# re-checked for this long, in case the customer paid anyway and the webhook was lost.
+RECHECK_WINDOW = timedelta(hours=24)
+# "created" is included: an order whose send crashed before its status was updated may still have reached the customer.
+_LIVE_STATUSES = ("created", "sent", "pending")
+_ENDED_STATUSES = ("dispatch_failed", "failed", "expired")
+# A check that finds nothing schedules the next one later and later (2 min, 4, 8 ... up to 1 hour), so old
+# orders stop crowding out new ones and Meta is not asked about the same order every few minutes.
+RECHECK_BACKOFF_BASE_SECONDS = 120
+RECHECK_BACKOFF_CAP_SECONDS = 3600
+_FINISHED_OUTCOMES = frozenset({"credited", "already_credited", "amount_mismatch", "captured"})
+
+
+def next_check_delay(attempts: int) -> timedelta:
+    """Wait before the next look at an order that has been checked ``attempts`` times without result."""
+    return timedelta(seconds=min(RECHECK_BACKOFF_BASE_SECONDS * (2 ** min(max(attempts, 0), 12)), RECHECK_BACKOFF_CAP_SECONDS))
+
+
+async def _reconcile_one(db: Session, order_id: str, results: Dict[str, int]) -> None:
+    """Check one order and schedule its next check. Never raises."""
+    try:
+        order = db.get(WhatsAppPaymentOrder, order_id)
+        if order is None or order.credited:
+            return
         outcome = await reconcile_order(db, order)
         results[outcome] = results.get(outcome, 0) + 1
+        order = db.get(WhatsAppPaymentOrder, order_id)
+        if order is not None and not order.credited and outcome not in _FINISHED_OUTCOMES:
+            order.check_attempts = int(order.check_attempts or 0) + 1
+            order.next_check_at = datetime.now(timezone.utc) + next_check_delay(order.check_attempts)
+            db.commit()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"WhatsApp Pay reconcile of order {order_id} failed: {e}")
+
+
+async def reconcile_pending_orders(
+    db: Session,
+    older_than_seconds: int = 120,
+    limit: int = 50,
+    session_factory: Optional[Callable[[], Session]] = None,
+) -> Dict[str, int]:
+    """Sweep orders whose payment webhook may have been missed.
+
+    Picks live (sent / pending) orders and, for ``RECHECK_WINDOW``, ended ones (dispatch_failed / failed /
+    expired) that are due (``next_check_at`` empty or passed), never-checked orders first. With a
+    ``session_factory`` every order is handled in its own short session, so one slow Meta answer never holds a
+    database connection across the other orders.
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=older_than_seconds)
+    due = or_(WhatsAppPaymentOrder.next_check_at.is_(None), WhatsAppPaymentOrder.next_check_at <= now)
+    ids = [
+        row[0]
+        for row in db.query(WhatsAppPaymentOrder.id)
+        .filter(
+            WhatsAppPaymentOrder.credited.is_(False),
+            WhatsAppPaymentOrder.created_at <= cutoff,
+            due,
+            or_(
+                WhatsAppPaymentOrder.status.in_(_LIVE_STATUSES),
+                and_(
+                    WhatsAppPaymentOrder.status.in_(_ENDED_STATUSES),
+                    WhatsAppPaymentOrder.created_at >= now - RECHECK_WINDOW,
+                ),
+            ),
+        )
+        .order_by(WhatsAppPaymentOrder.next_check_at.asc().nulls_first(), WhatsAppPaymentOrder.created_at)
+        .limit(limit)
+        .all()
+    ]
+    db.commit()          # the listing is done: free the connection before the slow lookups
+    results: Dict[str, int] = {}
+    for order_id in ids:
+        if session_factory is not None:
+            with session_factory() as order_db:
+                await _reconcile_one(order_db, order_id, results)
+        else:
+            await _reconcile_one(db, order_id, results)
     return results
 
 
@@ -529,8 +616,12 @@ async def run_reconcile_sweep_forever() -> None:
         if not settings.WHATSAPP_PAY_ENABLED:
             continue
         try:
+            from app.services.scheduler_lease import holds_lease
+
+            if not await holds_lease("whatsapp_pay_reconcile", interval * 2 + 30):
+                continue                          # another process owns this job right now (ARC-2)
             with SessionLocal() as db:
-                results = await reconcile_pending_orders(db)
+                results = await reconcile_pending_orders(db, session_factory=SessionLocal)
             if results:
                 logger.info(f"WhatsApp Pay reconcile sweep: {results}")
         except asyncio.CancelledError:
@@ -577,13 +668,42 @@ async def _send_receipt(db: Session, order: WhatsAppPaymentOrder) -> None:
                 "full_name": getattr(customer, "full_name", None),
                 "business_name": getattr(customer, "business_name", None),
                 "gst_number": getattr(customer, "gst_number", None),
+                "is_gst_verified": bool(getattr(customer, "is_gst_verified", False)),
                 "address": getattr(customer, "address", None),
             },
             local_pdf_fn=generate_invoice_pdf,
             send_document_fn=send_document_to_whatsapp,
         )
         if settings.ERPNEXT_INVOICE_ENABLED:
-            task = asyncio.get_running_loop().create_task(job)
+            queued = False
+            if settings.OUTBOX_ENABLED:
+                from app.services import outbox
+
+                outcome = await run_io(
+                    outbox.enqueue_status,
+                    "payment_invoice",
+                    {
+                        "recipient_id": order.whatsapp_id,
+                        "payment_id": order.pg_payment_id or order.reference_id,
+                        "amount": order.amount_rupees,
+                        "customer_name": getattr(customer, "full_name", None) or "Valued Customer",
+                        "customer_snapshot": {
+                            "full_name": getattr(customer, "full_name", None),
+                            "business_name": getattr(customer, "business_name", None),
+                            "gst_number": getattr(customer, "gst_number", None),
+                "is_gst_verified": bool(getattr(customer, "is_gst_verified", False)),
+                            "address": getattr(customer, "address", None),
+                        },
+                    },
+                    f"inv:{order.pg_payment_id or order.reference_id}",
+                )
+                queued = outcome in (outbox.QUEUED, outbox.DUPLICATE)   # a duplicate is already queued or sent
+            if queued:                       # the durable job replaces the in-memory one
+                job.close()
+                outbox.ensure_default_handlers()
+                task = asyncio.get_running_loop().create_task(outbox.drain_once())
+            else:
+                task = asyncio.get_running_loop().create_task(job)
             _BACKGROUND_TASKS.add(task)
             task.add_done_callback(_BACKGROUND_TASKS.discard)
         else:

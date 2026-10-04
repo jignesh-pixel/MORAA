@@ -18,8 +18,9 @@ UPDATE for charges, so a concurrent delivery can never overspend or drive
 the balance negative).
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 import asyncio
+import hmac
 import json
 from datetime import datetime, timedelta, timezone
 import re
@@ -27,10 +28,11 @@ import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.responses import PlainTextResponse
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import require_auth
+from app.api.dependencies import require_admin
 from app.config import settings
 from app.database import get_db
 from app.models.audit_log import AuditLog
@@ -80,6 +82,7 @@ from app.services.whatsapp_pay_service import (
     try_send_native_recharge,
 )
 from app.services import entitlement_service as ent
+from app.models.wallet_transaction import KIND_DEBIT_ORDER, WalletTransaction
 from app.services.wallet_service import (
     charge_customer_balance,
     find_customer_by_phone,
@@ -87,9 +90,13 @@ from app.services.wallet_service import (
     get_balance,
     get_customer,
     price_per_image,
-    refund_generation_charge,
 )
-from app.utils.logger import logger
+from app.services import bulk_orders, chat_log, consent_service, data_lifecycle, eta_service
+from app.utils.logger import logger, mask_phone
+from app.ai.image_generation_manager import generation_capacity_blocked
+from app.utils.executors import run_cpu, run_io
+from app.utils.phone import same_phone
+from app.services.message_dedupe import claim_message, release_messages
 
 router = APIRouter(prefix="/api/meta", tags=["Meta WhatsApp Webhook"])
 
@@ -143,14 +150,14 @@ def _ensure_wallet_row(db: Session, sender: str) -> Optional[Customer]:
         )
         db.add(cust)
         db.commit()
-        logger.info(f"Created unregistered wallet row for native pay: sender={sender}")
+        logger.info(f"Created unregistered wallet row for native pay: sender={mask_phone(sender)}")
         return cust
     except IntegrityError:
         db.rollback()  # concurrent create won; read it back
         return find_customer_by_phone(db, sender)
     except Exception as e:
         db.rollback()
-        logger.error(f"Wallet row creation failed for {sender}: {e}")
+        logger.error(f"Wallet row creation failed for {mask_phone(sender)}: {e}")
         return None
 
 
@@ -191,15 +198,6 @@ def _save_feedback(db: Session, sender: str, button_id: str) -> None:
     except Exception as e:
         db.rollback()
         logger.error(f"Feedback persistence failed: {e}")
-
-
-def _refund_pack_charge(db: Session, customer: Optional[Customer]) -> None:
-    """Refund a single pack charge after a post-deduction failure."""
-    if customer is None:
-        return
-    price = price_per_image()
-    refund_generation_charge(db, customer.whatsapp_id, price)
-    db.refresh(customer)
 
 
 # ─── Background generation trigger ──────────────────────────────────────
@@ -504,7 +502,7 @@ async def _handle_registration_flow(db: Session, event: Dict[str, Any]) -> bool:
 
     if not full_name:
         logger.warning(
-            f"Registration Flow missing name: sender={sender} keys={sorted(data)}"
+            f"Registration Flow missing name: sender={mask_phone(sender)} keys={sorted(data)}"
         )
         await send_whatsapp_text(sender, REGISTRATION_REQUEST_MESSAGE)
         return False
@@ -565,10 +563,10 @@ async def _handle_registration_flow(db: Session, event: Dict[str, Any]) -> bool:
             cust = None
         except Exception as e:
             db.rollback()
-            logger.error(f"Registration Flow save failed for {sender}: {e}")
+            logger.error(f"Registration Flow save failed for {mask_phone(sender)}: {e}")
             return False
     if cust is None:
-        logger.error(f"Registration Flow could not be saved for {sender}")
+        logger.error(f"Registration Flow could not be saved for {mask_phone(sender)}")
         return False
 
     # GST first: "You're all set" is sent only once the GSTIN is resolved
@@ -585,6 +583,16 @@ ALREADY_CHOSEN_MESSAGE = (
     "Send the photo again if you want to place another order."
 )
 UNKNOWN_CHOICE_MESSAGE = "Sorry, we couldn't find that photo. Please send it again."
+# Largest wallet recharge a customer can ask for in one message (MON-12).
+MAX_RECHARGE_RUPEES = 50_000
+CAPACITY_MESSAGE = (
+    "We can't generate new images right now, so nothing was charged. "
+    "Your photo is saved, so you can tap your choice again once generation is available 🙏"
+)
+INFLIGHT_MESSAGE = (
+    "You already have {n} orders being prepared, so nothing was charged. "
+    "Please wait for one to arrive, then tap your choice on this photo again 🙏"
+)
 UNREADABLE_IMAGE_MESSAGE = (
     "Sorry, we couldn't read this photo. Please send a clear JPG, PNG or WebP photo of the earring."
 )
@@ -604,9 +612,7 @@ def _product_price(product_code: str) -> int:
 
 
 def _same_sender(stored: str, sender: str) -> bool:
-    a = (stored or "").strip().lstrip("+")
-    b = (sender or "").strip().lstrip("+")
-    return bool(a) and bool(b) and (a == b or a[-10:] == b[-10:])
+    return same_phone(stored, sender)
 
 
 async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Optional[str]:
@@ -619,6 +625,10 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
     media_id = event.get("media_id", "")
     caption = event.get("caption", "")
     timestamp = event.get("timestamp", "")
+
+    # Nothing about this customer or photo is stored until they have agreed to the data notice (PRIV-2).
+    if await _consent_gate(db, sender, message_id):
+        return None
 
     # CLAIM the message first. external_message_id is UNIQUE, so a Meta retry
     # or a concurrent copy of this delivery stops here and never reaches the
@@ -675,7 +685,13 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
         )
         return None
 
-    # Fetch, validate and AI pre-check once per photo -- before any charge.
+    # Fetch, validate and AI pre-check once per photo -- before any charge. Take what the rest of this
+    # function needs out of the ORM objects and end the transaction first: the download and AI pre-check
+    # below take seconds, and a connection held that long is what exhausts the pool under photo bursts (PERF-1).
+    new_ingestion_id = ingestion.id
+    customer_wallet_id = customer.whatsapp_id
+    db.commit()
+
     media_url = await get_media_url(media_id)
     download_result: Optional[Tuple[bytes, str]] = await download_media(media_url) if media_url else None
     if not download_result:
@@ -683,7 +699,7 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
         await send_whatsapp_text(sender, UNREADABLE_IMAGE_MESSAGE, reply_to_message_id=message_id)
         return None
     image_bytes, content_type = download_result
-    is_valid, validation_error = validate_image(image_bytes, content_type)
+    is_valid, validation_error = await run_cpu(validate_image, image_bytes, content_type)   # PIL decode: off the loop
     if not is_valid:
         _reject(f"Invalid image: {validation_error}")
         await send_whatsapp_text(sender, UNREADABLE_IMAGE_MESSAGE, reply_to_message_id=message_id)
@@ -713,25 +729,294 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
         )
         return None
 
+    chat_log.fire(chat_log.attach_photo, message_id, sender, new_ingestion_id, upload_result.id)
     ingestion.image_id = upload_result.id
     ingestion.file_size = len(image_bytes)
     ingestion.mime_type = content_type
     ingestion.status = "awaiting_choice"
     db.commit()
 
+    # A photo that follows another waiting photo is part of a burst: hold its buttons back, the customer gets ONE
+    # "N photos, Rs X: confirm?" message when they stop sending (UX-1). Paying customers only.
+    if (
+        bulk_orders.is_enabled()
+        and not _mws.DRY_RUN_IMAGE_MODE
+        and not (ent.is_admin(customer) or ent.has_trial_credits(customer))
+        and bulk_orders.is_burst(db, ingestion)
+    ):
+        ingestion.group_id = bulk_orders.HELD         # held back until the group prompt (or released to normal buttons)
+        db.commit()
+        if await bulk_orders.schedule_prompt(sender, new_ingestion_id):
+            return new_ingestion_id
+        ingestion.group_id = None                     # could not schedule the group prompt: ordinary buttons below
+        db.commit()
+
     # Re-read the balance at send time: download + AI pre-check can take
     # ~10 s, and a payment or another order may have committed meanwhile.
+    current_balance = get_balance(db, customer_wallet_id)
+    db.commit()           # the Meta send below must not hold a connection
     sent = await send_product_selection_buttons(
         recipient_id=sender,
-        ingestion_id=ingestion.id,
+        ingestion_id=new_ingestion_id,
         white_price=white_price,
         pack_price=pack_price,
-        balance=get_balance(db, customer.whatsapp_id),
+        balance=current_balance,
         reply_to_message_id=message_id,
     )
     if not sent:
-        logger.error(f"Product selection buttons NOT sent: ingestion_id={ingestion.id}")
-    return ingestion.id
+        logger.error(f"Product selection buttons NOT sent: ingestion_id={new_ingestion_id}")
+    return new_ingestion_id
+
+
+# ingestion id -> outbox job id, for orders recorded in the outbox but not yet handed to a background task.
+_recorded_runs: Dict[str, int] = {}
+
+
+async def _run_bulk_jobs(runs: List[Tuple[Any, str, Optional[int]]]) -> None:
+    """Run a bulk order's photos a few at a time (BULK_CONCURRENCY), so 50 photos never hold 50 database connections
+    and provider calls at once. Each photo is still its own order with its own refund path."""
+    from app.services import outbox
+
+    gate = asyncio.Semaphore(max(int(settings.BULK_CONCURRENCY), 1))
+
+    async def one(worker: Any, ingestion_id: str, job_id: Optional[int]) -> None:
+        async with gate:
+            try:
+                if job_id is not None:
+                    await outbox.run_job_now(job_id)
+                else:
+                    await worker(ingestion_id)
+            except Exception as e:  # noqa: BLE001 -- the worker records its own failure and refund
+                logger.error(f"Bulk photo {ingestion_id} raised: {type(e).__name__}: {e}")
+
+    await asyncio.gather(*(one(*run) for run in runs))
+
+
+def _queue_bulk_runs(background_tasks: BackgroundTasks, jobs: List[Tuple[Any, str]]) -> None:
+    """Start a confirmed bulk order: each photo recorded in the outbox (so a restart cannot strand it) and then run
+    through the bounded runner above as one background task."""
+    runs: List[Tuple[Any, str, Optional[int]]] = []
+    for worker, ingestion_id in jobs:
+        job_id = None
+        if settings.OUTBOX_ENABLED:
+            from app.services import outbox
+
+            # A long delay: the bounded runner below starts these; the outbox sweep must not start them all at once.
+            job_id = _recorded_runs.pop(ingestion_id, None) or outbox.enqueue_order_run(
+                "white", ingestion_id, delay_seconds=900)
+        runs.append((worker, ingestion_id, job_id))
+    background_tasks.add_task(_run_bulk_jobs, runs)
+
+
+BULK_CANCELLED_MESSAGE = "Cancelled. Nothing was charged. Send your photos again whenever you are ready."
+BULK_GONE_MESSAGE = "These photos have already been handled."
+
+
+async def _handle_bulk_choice(db: Session, sender: str, button: str, group_id: str) -> List[Tuple[Any, str]]:
+    """Confirm or cancel a bulk order (UX-1). Returns the (worker, ingestion_id) jobs to start.
+
+    Confirming claims every photo of the group with one guarded UPDATE, checks capacity and funds BEFORE any money moves,
+    then debits each photo's price (one ledger row per photo, so a later refund is per photo exactly as for a single
+    order) in ONE transaction together with the status change: all photos are charged and queued, or none is."""
+    group = (
+        db.query(WhatsAppIngestion)
+        .filter(WhatsAppIngestion.group_id == group_id, WhatsAppIngestion.status == "awaiting_choice")
+        .all()
+    )
+    group = [g for g in group if _same_sender(g.external_user_id, sender)]
+    if not group:
+        await send_whatsapp_text(sender, BULK_GONE_MESSAGE)
+        return []
+    ids = [g.id for g in group]
+
+    if button == bulk_orders.BULK_NO:
+        db.query(WhatsAppIngestion).filter(
+            WhatsAppIngestion.id.in_(ids), WhatsAppIngestion.status == "awaiting_choice"
+        ).update({WhatsAppIngestion.status: "rejected", WhatsAppIngestion.error_message: "Bulk order cancelled"},
+                 synchronize_session=False)
+        db.commit()
+        await send_whatsapp_text(sender, BULK_CANCELLED_MESSAGE)
+        return []
+
+    if button == bulk_orders.BULK_EACH:
+        db.commit()
+        freed = await run_io(bulk_orders.release_held_photos, sender, group_id)
+        if freed:
+            await bulk_orders.send_single_buttons(sender, freed)
+        return []
+
+    # Claim each photo on its own with a guarded UPDATE and keep exactly the ones THIS tap took, so a concurrent tap
+    # (or another server process) can never have its claimed photos handed back or charged twice.
+    mine: List[str] = []
+    for photo_id in ids:
+        took = db.query(WhatsAppIngestion).filter(
+            WhatsAppIngestion.id == photo_id, WhatsAppIngestion.status == "awaiting_choice"
+        ).update({WhatsAppIngestion.status: "choice_claimed", WhatsAppIngestion.product_code: PRODUCT_WHITE_BG},
+                 synchronize_session=False)
+        if took == 1:
+            mine.append(photo_id)
+    db.commit()
+    if len(mine) != len(ids):
+        db.query(WhatsAppIngestion).filter(
+            WhatsAppIngestion.id.in_(mine), WhatsAppIngestion.status == "choice_claimed",
+            WhatsAppIngestion.amount_charged.is_(None),
+        ).update({WhatsAppIngestion.status: "awaiting_choice", WhatsAppIngestion.product_code: None},
+                 synchronize_session=False)
+        db.commit()
+        await send_whatsapp_text(sender, BULK_GONE_MESSAGE)
+        return []
+
+    def release() -> None:
+        db.rollback()
+        db.query(WhatsAppIngestion).filter(
+            WhatsAppIngestion.id.in_(ids), WhatsAppIngestion.status == "choice_claimed"
+        ).update({WhatsAppIngestion.status: "awaiting_choice", WhatsAppIngestion.product_code: None},
+                 synchronize_session=False)
+        db.commit()
+
+    count = len(ids)
+    price = _product_price(PRODUCT_WHITE_BG)
+    total = count * price
+    customer = find_customer_by_phone(db, sender)
+
+    if not _mws.DRY_RUN_IMAGE_MODE:
+        db.commit()
+        no_capacity = await run_io(generation_capacity_blocked, count)
+        if no_capacity:
+            logger.warning(f"Bulk order {group_id} declined before charging: {no_capacity}")
+            release()
+            await send_whatsapp_text(sender, CAPACITY_MESSAGE)
+            return []
+
+    balance = get_balance(db, customer.whatsapp_id) if customer else 0
+    if customer is None or balance < total:
+        release()
+        body = _hold_body(total, balance, f"{count} Clean Studio Shots")
+        top_up = max(total - balance, 500)
+        if await try_send_native_recharge(db, sender, top_up, body, site="bulk_choice"):
+            return []
+        if await send_payment_unavailable(sender, "bulk_choice", body_text=body):
+            return []
+        await send_whatsapp_text(sender, _hold_message(total, balance, f"{count} Clean Studio Shots"))
+        return []
+
+    try:
+        for ingestion in db.query(WhatsAppIngestion).filter(
+            WhatsAppIngestion.id.in_(ids), WhatsAppIngestion.status == "choice_claimed"
+        ).all():
+            charged, _balance_after = charge_customer_balance(db, customer, price, ingestion_id=ingestion.id, commit=False)
+            if not charged:
+                raise RuntimeError("wallet could not cover every photo")
+            ingestion.amount_charged = price
+            ingestion.status = "white_queued"
+        db.commit()                      # every debit + ledger row + status change in ONE transaction
+    except Exception as e:  # noqa: BLE001
+        db.rollback()
+        # The commit may have reached the database before the error: if every photo has its debit row the order IS
+        # charged, so finish it from the ledger instead of telling the customer nothing was charged.
+        debited = db.query(WalletTransaction.ingestion_id).filter(
+            WalletTransaction.ingestion_id.in_(ids), WalletTransaction.kind == KIND_DEBIT_ORDER).count()
+        if debited == len(ids):
+            db.query(WhatsAppIngestion).filter(WhatsAppIngestion.id.in_(ids)).update(
+                {WhatsAppIngestion.amount_charged: price, WhatsAppIngestion.status: "white_queued"},
+                synchronize_session=False)
+            db.commit()
+            logger.error(f"Bulk order {group_id}: commit error after the debits were stored; completed from the ledger")
+        else:
+            logger.error(f"Bulk order {group_id}: nothing charged ({type(e).__name__}: {e})")
+            release()
+            await send_whatsapp_text(sender, "Sorry, we could not start your bulk order, so nothing was charged. Please tap Confirm again.")
+            return []
+
+    logger.info(f"Bulk order queued: group={group_id} photos={count} total={total}")
+    ahead = await _orders_ahead_released(db, ids[0])
+    suffix = eta_service.ack_suffix("white_bg", ahead + count, _parallel_orders(1), "Your images will arrive here one by one.")
+    await send_whatsapp_text(
+        sender, f"✨ Processing your {count} Clean Studio Shots (₹{total:,}). {suffix}"
+    )
+    return [(process_whatsapp_white_bg, i) for i in ids]
+
+
+async def _consent_gate(db: Session, sender: str, reply_to_message_id: Optional[str] = None) -> bool:
+    """True when this number has not yet agreed to the data notice: the notice was (re)sent and the caller must stop
+    here, collecting nothing (PRIV-2). Always False while the consent step is switched off."""
+    if not consent_service.is_active():
+        return False
+    if consent_service.has_consented(db, sender):
+        return False
+    if not await consent_service.ask_for_consent(sender, reply_to_message_id):
+        logger.warning(f"Consent notice could not be sent to {mask_phone(sender)}")
+    return True
+
+
+async def _handle_erasure_command(db: Session, sender: str, raw_text: str) -> None:
+    """"DELETE MY DATA" asks for confirmation; "CONFIRM DELETE" within 15 minutes erases (PRIV-3)."""
+    customer = find_customer_by_phone(db, sender)
+    if customer is None:
+        await send_whatsapp_text(sender, data_lifecycle.ERASURE_NOTHING_MESSAGE)
+        return
+    if data_lifecycle.is_erasure_request(raw_text):
+        data_lifecycle.request_erasure(db, customer)
+        await send_whatsapp_text(sender, data_lifecycle.ERASURE_ASK_MESSAGE)
+        return
+    if not data_lifecycle.erasure_requested_recently(db, customer):
+        await send_whatsapp_text(sender, data_lifecycle.ERASURE_EXPIRED_MESSAGE)
+        return
+    customer_id = customer.id
+    db.commit()                          # end this transaction: the erasure below uses its own connection
+    try:
+        await run_io(data_lifecycle.erase_customer_by_id, customer_id)
+    except data_lifecycle.ErasureRefused as refused:
+        await send_whatsapp_text(sender, str(refused))
+        return
+    await send_whatsapp_text(sender, data_lifecycle.ERASURE_DONE_MESSAGE)
+
+
+def _queue_order_run(background_tasks: BackgroundTasks, job: Tuple[Any, str]) -> None:
+    """Start a paid order. With the outbox on, the order is first recorded in the database (so a crash or deploy
+    before it starts does not strand it: the sweep starts it) and then run right here as before."""
+    worker, ingestion_id = job
+    if settings.OUTBOX_ENABLED:
+        from app.services import outbox
+
+        job_id = _recorded_runs.pop(ingestion_id, None)       # recorded when the order was queued (see above)
+        if job_id is None:
+            kind = "white" if worker is process_whatsapp_white_bg else "pack"
+            job_id = outbox.enqueue_order_run(kind, ingestion_id)
+        if job_id is not None:
+            background_tasks.add_task(outbox.run_job_now, job_id)
+            return
+    background_tasks.add_task(worker, ingestion_id)
+
+
+def _orders_ahead(ingestion_id: str) -> int:
+    """Paid orders currently in progress, from every customer, other than this one (sync; own session)."""
+    from app.database import SessionLocal
+    from app.services.meta_whatsapp_service import STUCK_PAID_STATUSES
+
+    try:
+        with SessionLocal() as session:
+            return int(session.query(func.count(WhatsAppIngestion.id)).filter(
+                WhatsAppIngestion.status.in_(STUCK_PAID_STATUSES), WhatsAppIngestion.id != ingestion_id
+            ).scalar() or 0)
+    except Exception:  # noqa: BLE001 -- an estimate must never block an order
+        return 0
+
+
+async def _orders_ahead_released(db: Session, ingestion_id: str) -> int:
+    """``_orders_ahead`` after ending this request's transaction: the count uses its own connection, and holding two per
+    order exhausts the pool under bursts (PERF-1)."""
+    try:
+        db.commit()
+    except Exception:  # noqa: BLE001 -- an estimate must never fail an order that is already paid and queued
+        db.rollback()
+    return await run_io(_orders_ahead, ingestion_id)
+
+
+def _parallel_orders(calls_per_order: int) -> Optional[int]:
+    """How many orders the server works on at once (None = no limit configured, so nobody waits in line)."""
+    limit = int(getattr(settings, "MAX_CONCURRENT_PROVIDER_CALLS", 0) or 0)
+    return max(limit // max(calls_per_order, 1), 1) if limit > 0 else None
 
 
 async def _handle_product_choice(
@@ -756,7 +1041,7 @@ async def _handle_product_choice(
 
     ingestion = db.query(WhatsAppIngestion).filter(WhatsAppIngestion.id == ingestion_id).first()
     if ingestion is None or not _same_sender(ingestion.external_user_id, sender):
-        logger.warning(f"Product choice for unknown/foreign ingestion: id={ingestion_id} sender={sender}")
+        logger.warning(f"Product choice for unknown/foreign ingestion: id={ingestion_id} sender={mask_phone(sender)}")
         await send_whatsapp_text(recipient_id=sender, message_text=UNKNOWN_CHOICE_MESSAGE)
         return None
     quote_id = ingestion.external_message_id
@@ -781,6 +1066,50 @@ async def _handle_product_choice(
     price = _product_price(product)
     dry_run = product == PRODUCT_WHITE_BG and bool(_mws.DRY_RUN_IMAGE_MODE)
     customer = find_customer_by_phone(db, sender)
+
+    # Capacity BEFORE any money moves (UX-4): if today's generation limit (or the kill switch) leaves no room
+    # for this order, decline it now with nothing charged and keep the photo choosable. Team (ADMIN) orders
+    # are not counted against the daily cap, and dry-run makes no provider calls.
+    if not _mws.DRY_RUN_IMAGE_MODE and not (customer is not None and ent.is_admin(customer)):
+        needed = 1 if product == PRODUCT_WHITE_BG else _mws.pack_generation_count()
+        db.commit()           # end this transaction first: the counter lookup below needs its own connection
+        no_capacity = await run_io(generation_capacity_blocked, needed)
+        if no_capacity:
+            logger.warning(f"Order {ingestion_id} declined before charging: {no_capacity}")
+            db.query(WhatsAppIngestion).filter(
+                WhatsAppIngestion.id == ingestion_id,
+                WhatsAppIngestion.status == "choice_claimed",
+            ).update(
+                {WhatsAppIngestion.status: "awaiting_choice", WhatsAppIngestion.product_code: None},
+                synchronize_session=False,
+            )
+            db.commit()
+            await send_whatsapp_text(sender, CAPACITY_MESSAGE, reply_to_message_id=quote_id)
+            return None
+
+    # At most N paid orders per customer in progress at once (Q-6), decided BEFORE any money moves. Team (ADMIN)
+    # orders are exempt.
+    cap = int(getattr(settings, "MAX_INFLIGHT_ORDERS_PER_CUSTOMER", 0) or 0)
+    if cap > 0 and not (customer is not None and ent.is_admin(customer)):
+        from app.services.meta_whatsapp_service import STUCK_PAID_STATUSES
+
+        in_flight = db.query(func.count(WhatsAppIngestion.id)).filter(
+            WhatsAppIngestion.external_user_id == ingestion.external_user_id,
+            WhatsAppIngestion.status.in_(STUCK_PAID_STATUSES),
+            WhatsAppIngestion.id != ingestion_id,
+        ).scalar() or 0
+        if in_flight >= cap:
+            logger.info(f"Order {ingestion_id} declined before charging: {in_flight} orders already in progress")
+            db.query(WhatsAppIngestion).filter(
+                WhatsAppIngestion.id == ingestion_id,
+                WhatsAppIngestion.status == "choice_claimed",
+            ).update(
+                {WhatsAppIngestion.status: "awaiting_choice", WhatsAppIngestion.product_code: None},
+                synchronize_session=False,
+            )
+            db.commit()
+            await send_whatsapp_text(sender, INFLIGHT_MESSAGE.format(n=in_flight), reply_to_message_id=quote_id)
+            return None
 
     # Tiered access (entitlement_service): ADMIN is free; a TRIAL customer
     # with credits for this product is free (a credit is used only when the
@@ -819,9 +1148,14 @@ async def _handle_product_choice(
         # Same balance rule, but no money moves in dry-run.
         charged = get_balance(db, customer.whatsapp_id) >= price
     else:
-        charged, _balance_after = charge_customer_balance(db, customer, price)
+        # commit=False: the debit and its ledger row are committed TOGETHER with the order status
+        # below, so a crash can never leave money taken with the order unrecorded.
+        charged, _balance_after = charge_customer_balance(
+            db, customer, price, ingestion_id=ingestion_id, commit=False,
+        )
 
     if not charged:
+        db.rollback()                    # discard any half-applied debit before releasing the claim
         db.query(WhatsAppIngestion).filter(
             WhatsAppIngestion.id == ingestion_id,
             WhatsAppIngestion.status == "choice_claimed",
@@ -847,10 +1181,61 @@ async def _handle_product_choice(
         )
         return None
 
-    db.refresh(ingestion)
-    ingestion.amount_charged = 0 if (dry_run or free_access) else price
-    ingestion.status = "white_queued" if product == PRODUCT_WHITE_BG else "pack_queued"
-    db.commit()
+    try:
+        db.refresh(ingestion)
+        ingestion.amount_charged = 0 if (dry_run or free_access) else price
+        ingestion.status = "white_queued" if product == PRODUCT_WHITE_BG else "pack_queued"
+        db.commit()                      # debit + ledger row + status in ONE transaction
+    except Exception:
+        db.rollback()
+        debited = (
+            not (dry_run or free_access)
+            and db.query(WalletTransaction.id)
+            .filter(WalletTransaction.ingestion_id == ingestion_id, WalletTransaction.kind == KIND_DEBIT_ORDER)
+            .first()
+            is not None
+        )
+        if debited:
+            # The commit reached the server before the error: the money IS taken. Finish the order.
+            db.query(WhatsAppIngestion).filter(
+                WhatsAppIngestion.id == ingestion_id,
+                WhatsAppIngestion.status == "choice_claimed",
+            ).update(
+                {
+                    WhatsAppIngestion.amount_charged: price,
+                    WhatsAppIngestion.status: "white_queued" if product == PRODUCT_WHITE_BG else "pack_queued",
+                },
+                synchronize_session=False,
+            )
+            db.commit()
+            logger.error(f"Order {ingestion_id}: commit error after the debit was stored; order completed from the ledger")
+        else:
+            # Nothing was taken; release the claim so the customer can tap again.
+            db.query(WhatsAppIngestion).filter(
+                WhatsAppIngestion.id == ingestion_id,
+                WhatsAppIngestion.status == "choice_claimed",
+            ).update(
+                {WhatsAppIngestion.status: "awaiting_choice", WhatsAppIngestion.product_code: None},
+                synchronize_session=False,
+            )
+            db.commit()
+            raise
+
+    # Ties the webhook request (the id on every line of this request AND of the background job it starts) to the
+    # order, so a paid order can be followed from the customer's tap to its delivery (OBS-6).
+    logger.info(f"Order queued: ingestion_id={ingestion_id} product={product} free_access={free_access or 'no'}")
+
+    # Record the paid order in the durable outbox NOW, before anything else can fail (the acknowledgement message, the
+    # queue-depth lookup): from here on a crash or deploy cannot strand it, the outbox sweep starts it (Q-1).
+    if settings.OUTBOX_ENABLED:
+        from app.services import outbox
+
+        db.commit()                      # end this transaction: the outbox write below uses its own connection
+        run_id = await run_io(outbox.enqueue_order_run, "white" if product == PRODUCT_WHITE_BG else "pack", ingestion_id)
+        if run_id is not None:
+            if len(_recorded_runs) > 1000:
+                _recorded_runs.clear()
+            _recorded_runs[ingestion_id] = run_id
 
     if product == PRODUCT_WHITE_BG:
         if free_access == "trial":
@@ -861,17 +1246,25 @@ async def _handle_product_choice(
             cost_note = ", test mode - no charge"
         else:
             cost_note = f", ₹{price}"
+        ahead = await _orders_ahead_released(db, ingestion_id)
+        suffix = eta_service.ack_suffix("white_bg", ahead, _parallel_orders(1), "Please allow 20-30 seconds.")
         await send_whatsapp_text(
             sender,
             "✨ Processing your Clean Studio Shot (1 image"
             + cost_note
-            + ")... Please allow 20-30 seconds.",
+            + ")... "
+            + suffix,
             reply_to_message_id=quote_id,
         )
-        return process_whatsapp_white_bg, ingestion.id
-    # Existing Pack 1 acknowledgement + existing Pack 1 worker, unchanged.
-    await send_whatsapp_text(sender, CATALOG_PACK_ACK_TEMPLATE, reply_to_message_id=quote_id)
-    return process_whatsapp_catalog_pack, ingestion.id
+        return process_whatsapp_white_bg, ingestion_id
+    # Pack 1 acknowledgement + worker. The time estimate is measured from recent orders (UX-2); until some have
+    # been measured the original wording is sent unchanged.
+    ahead = await _orders_ahead_released(db, ingestion_id)
+    default_tail = "Please allow 20-30 seconds."
+    suffix = eta_service.ack_suffix("pack", ahead, _parallel_orders(_mws.pack_generation_count()), default_tail)
+    ack = CATALOG_PACK_ACK_TEMPLATE if suffix == default_tail else CATALOG_PACK_ACK_TEMPLATE.replace(default_tail, suffix)
+    await send_whatsapp_text(sender, ack, reply_to_message_id=quote_id)
+    return process_whatsapp_catalog_pack, ingestion_id
 
 
 @router.get("/webhook", summary="Meta webhook verification")
@@ -887,7 +1280,13 @@ async def verify_webhook(
     hub_mode = query.get("hub.mode") or hub_mode
     hub_verify_token = query.get("hub.verify_token") or hub_verify_token
     hub_challenge = query.get("hub.challenge") or hub_challenge
-    if hub_mode != "subscribe" or not hub_verify_token or hub_verify_token != settings.META_VERIFY_TOKEN:
+    if (
+        hub_mode != "subscribe"
+        or not hub_verify_token
+        or not hmac.compare_digest(
+            hub_verify_token.encode("utf-8"), (settings.META_VERIFY_TOKEN or "").encode("utf-8")
+        )
+    ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid verification token or mode",
@@ -902,36 +1301,60 @@ async def verify_webhook(
     return PlainTextResponse(content=hub_challenge)
 
 
+def _message_claims(db: Session = Depends(get_db)) -> Iterator[List[str]]:
+    """The message ids this request claimed. If handling fails part-way, the claims are given back so
+    Meta's retry of the message is handled instead of skipped."""
+    claimed: List[str] = []
+    try:
+        yield claimed
+    except BaseException:
+        release_messages(db, claimed)
+        raise
+
+
 @router.post("/webhook", summary="Receive WhatsApp webhook events")
 async def receive_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
+    claimed: List[str] = Depends(_message_claims),
 ) -> Dict[str, Any]:
+    if not isinstance(claimed, list):
+        # Called directly (not through FastAPI, e.g. the load harness): nothing tracks the claims, so a
+        # failure part-way cannot give them back. Duplicate protection itself still works.
+        claimed = []
     try:
         raw_body = await request.body()
-        if not raw_body:
-            return {"status": "ignored", "message": "Empty body"}
+    except Exception as e:
+        logger.error("Failed to read webhook body: {}", e)
+        return {"status": "error", "message": "Invalid JSON payload"}
+    if not raw_body:
+        return {"status": "ignored", "message": "Empty body"}
+
+    # Verify the signature on the raw bytes BEFORE parsing: an unsigned sender
+    # must not be able to make the server parse arbitrary JSON.
+    if (settings.META_APP_SECRET or "").strip():
+        signature = request.headers.get("X-Hub-Signature-256")
+        if not verify_webhook_signature(raw_body, signature):
+            return {"status": "error", "message": "Invalid signature"}
+    elif not settings.ALLOW_UNSIGNED_WEBHOOKS:
+        # Fail closed: with no META_APP_SECRET an unsigned payload is only
+        # accepted under the explicit development flag (refused at boot in
+        # production). DEBUG no longer relaxes this check.
+        logger.error(
+            "Webhook rejected: META_APP_SECRET is not configured and "
+            "ALLOW_UNSIGNED_WEBHOOKS is off -- refusing an unsigned payload."
+        )
+        return {"status": "error", "message": "Webhook not configured"}
+
+    try:
         payload = json.loads(raw_body.decode("utf-8"))
     except Exception as e:
         logger.error("Failed to parse webhook JSON payload: {}", e)
         return {"status": "error", "message": "Invalid JSON payload"}
-
-    if settings.META_APP_SECRET:
-        signature = request.headers.get("X-Hub-Signature-256")
-        if not verify_webhook_signature(raw_body, signature):
-            return {"status": "error", "message": "Invalid signature"}
-    elif not settings.DEBUG:
-        # Fail closed outside DEBUG mode: an unconfigured META_APP_SECRET in
-        # a non-dev deployment must not silently accept unsigned webhook
-        # payloads. DEBUG defaults to True and stays True for local/dev use,
-        # so this does not change behavior there -- it only refuses unsigned
-        # traffic once DEBUG is turned off for a real deployment.
-        logger.error(
-            "Webhook rejected: META_APP_SECRET is not configured and DEBUG "
-            "is False -- refusing to accept an unsigned payload."
-        )
-        return {"status": "error", "message": "Webhook not configured"}
+    if not isinstance(payload, dict):
+        logger.warning("Webhook JSON body is not an object: {}", type(payload).__name__)
+        return {"status": "ignored", "message": "Unexpected payload shape"}
 
     if payload.get("object") == "whatsapp_business_account" and "entry" not in payload:
         return {"status": "ok"}
@@ -952,6 +1375,10 @@ async def receive_webhook(
         events = parse_webhook_entry(entry)
 
         for event in events:
+            chat_log.fire(chat_log.write_in, event)          # the dashboard's record of what the customer sent
+            # Only the message being handled right now may be given back if handling fails: messages
+            # finished earlier in this payload already had their effect and must not be repeated on retry.
+            claimed.clear()
             event_type = event.get("type", "")
 
             if event_type == "payment_status":
@@ -961,11 +1388,22 @@ async def receive_webhook(
             if event_type == "status":
                 continue
 
+            # Meta re-delivers a message it did not get a fast answer for. Text, button and form replies
+            # are handled once per message id (photos have their own unique-id guard further down).
+            if event_type in ("text", "interactive"):
+                message_id = event.get("message_id", "")
+                if not claim_message(db, message_id):
+                    logger.info("Duplicate delivery of a {} message ignored", event_type)
+                    continue
+                if message_id:
+                    claimed.append(message_id)
+
             if event_type == "text":
                 sender = event.get("sender", "")
                 raw_text = event.get("body", "").strip()
                 lower_text = raw_text.lower()
-                logger.info("Text message received: sender={} text='{}'", sender, raw_text)
+                # Never log the body: registration replies carry name, GSTIN and address.
+                logger.info("Text message received: sender={} chars={}", mask_phone(sender), len(raw_text or ""))
 
                 # After "Re-enter GSTIN" the next text is the GSTIN itself
                 # (always False unless GST_VERIFICATION_ENABLED).
@@ -974,6 +1412,8 @@ async def receive_webhook(
                     continue
 
                 if "name:" in lower_text and any(k in lower_text for k in ("business", "brand", "gst", "city", "address")):
+                    if await _consent_gate(db, sender):
+                        continue
                     parsed = _parse_registration_text(raw_text)
                     user_name = parsed["name"]
                     biz_name = parsed["business"]
@@ -994,7 +1434,15 @@ async def receive_webhook(
                     )
                     continue
 
+                if settings.ERASURE_COMMAND_ENABLED and (
+                    data_lifecycle.is_erasure_request(raw_text) or data_lifecycle.is_erasure_confirmation(raw_text)
+                ):
+                    await _handle_erasure_command(db, sender, raw_text)
+                    continue
+
                 if re.search(r"\b(hi|hii|hello|hey|start)\b", lower_text):
+                    if await _consent_gate(db, sender):
+                        continue
                     # Two separate messages: welcome first, then the form.
                     # New / unregistered senders get the registration Flow;
                     # when it is not configured or Meta rejects it (and for
@@ -1006,7 +1454,7 @@ async def receive_webhook(
                             continue
                         logger.warning(
                             "Registration Flow not sent (unconfigured or rejected by Meta) — "
-                            "falling back to text registration: sender={}", sender
+                            "falling back to text registration: sender={}", mask_phone(sender)
                         )
                     await send_whatsapp_text(sender, REGISTRATION_REQUEST_MESSAGE)
                     continue
@@ -1018,6 +1466,13 @@ async def receive_webhook(
                         await send_whatsapp_text(
                             sender,
                             "Minimum recharge amount is ₹500 ⚠️\nPlease enter an amount of ₹500 or more."
+                        )
+                        continue
+                    if requested_amount > MAX_RECHARGE_RUPEES:
+                        await send_whatsapp_text(
+                            sender,
+                            f"The maximum recharge amount is ₹{MAX_RECHARGE_RUPEES:,} ⚠️\n"
+                            f"Please enter an amount of ₹{MAX_RECHARGE_RUPEES:,} or less."
                         )
                         continue
 
@@ -1063,13 +1518,28 @@ async def receive_webhook(
                 if await handle_gst_button(db, sender, b_id, on_complete=_confirmation_for(db, sender)):
                     continue
 
+                if b_id in (consent_service.CONSENT_YES, consent_service.CONSENT_NO):
+                    if b_id == consent_service.CONSENT_YES:
+                        consent_service.record_consent(db, sender)
+                        await send_whatsapp_text(sender, consent_service.AGREED_MESSAGE)
+                    else:
+                        await send_whatsapp_text(sender, consent_service.DECLINED_MESSAGE)
+                    continue
+
+                bulk_choice = bulk_orders.parse_bulk_button_id(b_id)
+                if bulk_choice:
+                    jobs = await _handle_bulk_choice(db, sender, *bulk_choice)
+                    if jobs:
+                        _queue_bulk_runs(background_tasks, jobs)
+                    continue
+
                 product_choice = parse_product_button_id(b_id)
                 if product_choice:
                     job = await _handle_product_choice(db, sender, *product_choice)
                     if job:
                         # Ecommerce Shot -> process_whatsapp_white_bg,
                         # Pack 1 -> existing process_whatsapp_catalog_pack.
-                        background_tasks.add_task(*job)
+                        _queue_order_run(background_tasks, job)
                     continue
 
                 if b_id.startswith("feedback_"):
@@ -1087,6 +1557,7 @@ async def receive_webhook(
             if event_type == "image":
                 image_events.append(event)
 
+    claimed.clear()     # every text / button message above is finished
     if not image_events:
         return {"status": "ok", "images_processed": 0}
 
@@ -1133,10 +1604,10 @@ async def receive_webhook(
         "Re-runs the 7-style catalog pack and attempts delivery again."
     ),
 )
-async def retry_delivery(
+def retry_delivery(
     ingestion_id: str,
     background_tasks: BackgroundTasks,
-    current_user: Any = Depends(require_auth),
+    current_user: Any = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """Retry a failed WhatsApp ingestion.
@@ -1169,10 +1640,53 @@ async def retry_delivery(
             "message": f"Cannot retry ingestion in status '{ingestion.status}'",
         }
 
-    # Reset status so the catalog pack will be re-processed.
-    ingestion.status = "stored"
-    ingestion.error_message = None
+    # A retry re-runs a billable generation WITHOUT charging again, so it is only allowed while the
+    # customer's payment is still held by this order: never after the money went back to the wallet,
+    # and never for an order that no product was chosen (and so nothing charged) for.
+    from app.models.wallet_transaction import KIND_REFUND_ORDER
+
+    refunded = (
+        db.query(AuditLog.id)
+        .filter(AuditLog.action == _mws.REFUND_AUDIT_ACTION, AuditLog.resource_id == ingestion.id)
+        .first()
+        is not None
+        or db.query(WalletTransaction.id)
+        .filter(WalletTransaction.ingestion_id == ingestion.id, WalletTransaction.kind == KIND_REFUND_ORDER)
+        .first()
+        is not None
+    )
+    if refunded:
+        return {
+            "status": "error",
+            "message": "This order was already refunded to the customer's wallet; ask them to send the photo again.",
+        }
+    if not ingestion.product_code and not ingestion.amount_charged:
+        return {"status": "error", "message": "No product was chosen and nothing was charged for this photo, so there is nothing to retry."}
+
+    # Reset status atomically so two simultaneous retries cannot both dispatch a worker.
+    reset = (
+        db.query(WhatsAppIngestion)
+        .filter(
+            WhatsAppIngestion.id == ingestion.id,
+            WhatsAppIngestion.status == ingestion.status,
+        )
+        .update({WhatsAppIngestion.status: "stored", WhatsAppIngestion.error_message: None}, synchronize_session=False)
+    )
     db.commit()
+    if reset != 1:
+        return {"status": "error", "message": "The order changed while retrying; check its status and try again."}
+    # A refund may have been committed between the check above and the reset: if so, undo the reset.
+    if (
+        db.query(AuditLog.id)
+        .filter(AuditLog.action == _mws.REFUND_AUDIT_ACTION, AuditLog.resource_id == ingestion_id)
+        .first()
+        is not None
+    ):
+        db.query(WhatsAppIngestion).filter(WhatsAppIngestion.id == ingestion_id).update(
+            {WhatsAppIngestion.status: "failed"}, synchronize_session=False)
+        db.commit()
+        return {"status": "error", "message": "This order was refunded while retrying; ask the customer to resend the photo."}
+    db.refresh(ingestion)
 
     # Dispatch by the STORED product chosen with the reply button.
     # NULL / PACK_1 -> Pack 1 catalog worker, exactly as before.
@@ -1183,7 +1697,7 @@ async def retry_delivery(
 
     logger.info(
         f"Retry triggered: ingestion_id={ingestion_id} "
-        f"user={ingestion.external_user_id}"
+        f"user={mask_phone(ingestion.external_user_id)}"
     )
 
     return {
@@ -1200,8 +1714,9 @@ async def retry_delivery(
     "/webhook/status/{ingestion_id}",
     summary="Check ingestion status",
 )
-async def get_ingestion_status(
+def get_ingestion_status(
     ingestion_id: str,
+    current_user: Any = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """Get the current status of a WhatsApp ingestion."""
@@ -1220,7 +1735,7 @@ async def get_ingestion_status(
         "request_id": ingestion.request_id,
         "status": ingestion.status,
         "channel": ingestion.channel,
-        "external_user_id": ingestion.external_user_id,
+        "external_user_id": mask_phone(ingestion.external_user_id),
         "image_id": ingestion.image_id,
         "file_size": ingestion.file_size,
         "error_message": ingestion.error_message,
@@ -1252,9 +1767,9 @@ async def webhook_health() -> Dict[str, Any]:
         "included. Target ceiling: 15%."
     ),
 )
-async def get_generation_failure_rate(
+def get_generation_failure_rate(
     window_hours: int = 24,
-    current_user: Any = Depends(require_auth),
+    current_user: Any = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     report = compute_generation_failure_rate(db, window_hours=window_hours)

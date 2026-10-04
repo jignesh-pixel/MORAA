@@ -4,34 +4,92 @@ import logging
 import os
 import secrets
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _config_logger = logging.getLogger(__name__)
 
+# backend/ -- .env and logs resolve against this folder, never against the
+# process working directory (a start from another folder used to silently
+# skip .env and run on unsafe defaults).
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Images in a WhatsApp Catalog Pack (CATALOG_PACK_STYLES in
+# meta_whatsapp_service.py); a daily cap below this cannot serve one Pack.
+# Kept equal to len(CATALOG_PACK_STYLES) by tests/test_earring_stand_shot.py.
+_PACK_IMAGE_COUNT = 7
+
+
+def _resolve_env_file() -> Optional[str]:
+    """Absolute path of backend/.env.
+
+    MORAA_ENV_FILE overrides it (a relative value resolves against backend/);
+    an empty MORAA_ENV_FILE loads no file at all (tests and the load harness
+    use this so live secrets are never read). A named file that does not
+    exist is an error, never a silent fall back to defaults.
+    """
+    override = os.environ.get("MORAA_ENV_FILE")
+    if override is not None:
+        if not override.strip():
+            return None
+        path = Path(override)
+        if not path.is_absolute():
+            path = BASE_DIR / path
+        if not path.is_file():
+            raise RuntimeError(f"MORAA_ENV_FILE points at a missing file: {path}")
+        return str(path)
+    default = BASE_DIR / ".env"
+    if not default.is_file():
+        _config_logger.warning(
+            f"No env file at {default}: running on built-in defaults "
+            "(ENVIRONMENT=development, SQLite, no webhook secrets)."
+        )
+    return str(default)
+
+
+ENV_FILE: Optional[str] = _resolve_env_file()
+
+# Production JWT signing keys shorter than this are refused at boot.
+_BUILTIN_RECHARGE_PAYMENT_URL = "https://rzp.io/rzp/FbuLh9je"
+_MIN_SECRET_KEY_LENGTH = 32
+_MIN_SECRET_KEY_DISTINCT_CHARS = 10
+
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables/.env file."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=ENV_FILE,
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        # A refused boot must never echo setting values (secrets) to logs.
+        hide_input_in_errors=True,
     )
 
     # Application
     APP_NAME: str = "MORAA GemVision"
     APP_VERSION: str = "1.0.0"
     APP_DESCRIPTION: str = "AI-Powered Jewellery Image Analysis Platform"
-    DEBUG: bool = True
+    # "production" refuses to boot on unsafe config (see _enforce_safe_runtime).
+    ENVIRONMENT: Literal["development", "production"] = "development"
+    # DEBUG only controls verbose tracebacks in logs. It never relaxes a security check.
+    DEBUG: bool = False
+    # Separate, explicit developer switches (they used to ride on DEBUG, so one flag changed three unrelated
+    # things): print every SQL statement, and restart the server when code changes.
+    SQL_ECHO: bool = False
+    DEV_RELOAD: bool = False
+    # Development-only escape hatch: accept Meta/Razorpay webhooks that carry
+    # no signature when the matching secret is unset. Refused in production.
+    ALLOW_UNSIGNED_WEBHOOKS: bool = False
 
     # Server
-    HOST: str = "0.0.0.0"
+    HOST: str = "127.0.0.1"
     PORT: int = 8000
-    WORKERS: int = 4
+    # (WORKERS was removed: nothing read it, so a value in .env gave a false sense of running several workers.
+    # The number of worker processes is set where the server is started, e.g. WEB_CONCURRENCY with gunicorn.)
 
     # Database
     DATABASE_URL: str = "sqlite:///./data/moraa_gemvision.db"
@@ -59,6 +117,14 @@ class Settings(BaseSettings):
     RATE_LIMIT_ENABLED: bool = True
     RATE_LIMIT_REQUESTS: int = 100
     RATE_LIMIT_WINDOW_SECONDS: int = 60
+    # The public webhook paths get their own, much larger per-IP budget:
+    # Meta and Razorpay send from few IPs (several status callbacks per
+    # message), so the dashboard limit would drop real traffic, but an
+    # unlimited public endpoint invites floods and verify-token guessing.
+    WEBHOOK_RATE_LIMIT_REQUESTS: int = 3000
+    # Largest webhook body accepted from a public client (3 MB; Meta/Razorpay send
+    # small JSON; media arrive by id, not inline).
+    MAX_WEBHOOK_BODY_BYTES: int = 3_000_000
 
     # --- Public host guard ---
     # Requests arriving through a public tunnel/host (e.g. ngrok) may only
@@ -67,6 +133,12 @@ class Settings(BaseSettings):
     # Hosts treated as local (comma-separated). Add a LAN IP here if the
     # dashboard is opened from another machine on the network.
     LOCAL_API_HOSTS: str = "localhost,127.0.0.1,::1,0.0.0.0"
+    # Extra socket peer addresses treated as this machine (loopback is always
+    # local). A request is local only when its real peer qualifies -- the Host
+    # header alone is never trusted (anyone can send "Host: localhost"). Add
+    # a LAN IP here, alongside LOCAL_API_HOSTS, to open the dashboard from
+    # another machine.
+    LOCAL_PEER_ADDRESSES: str = "127.0.0.1,::1"
 
     # --- Auth ---
     # Public self-signup is off by default; set ALLOW_SIGNUP=true to enable.
@@ -89,13 +161,15 @@ class Settings(BaseSettings):
     FALLBACK_AI_PROVIDER: str = "local_vision"
 
     # --- API Keys for AI Providers ---
+    # (GEMINI_API_KEY used to be declared twice, the second time from os.getenv; one declaration is enough:
+    # pydantic reads it from the environment / .env itself.)
     GEMINI_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
     ANTHROPIC_API_KEY: str = ""
 
-    # Google Gemini (Primary AI)
-    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = "gemini-2.5-flash"
+    # Google Gemini (Primary AI). The previous default, gemini-2.5-flash, answers 404 "no longer available to
+    # new users"; Google's own error names gemini-3.6-flash as the replacement.
+    GEMINI_MODEL: str = "gemini-3.6-flash"
 
     # --- Model Settings ---
     # Model name for OpenAI Vision API (e.g. "gpt-4o", "gpt-4o-mini")
@@ -115,7 +189,7 @@ class Settings(BaseSettings):
     # which delivers significantly better reference-image fidelity than the
     # deprecated "gemini-2.5-flash-image" (Nano Banana v1). Must support
     # image output via generate_content with response_modalities=["IMAGE"].
-    GEMINI_IMAGE_MODEL: str = "gemini-2.5-flash-image"
+    GEMINI_IMAGE_MODEL: str = "gemini-3.1-flash-image"
 
     # Model name for OpenAI image generation. Default "gpt-image-1" is the
     # ChatGPT image model — it supports reference-image editing
@@ -185,6 +259,14 @@ class Settings(BaseSettings):
     OPS_TEAM: str = ""  # JSON: {"name": "91XXXXXXXXXX", ...}
     OPS_SECRET: str = ""  # shared with the Next.js app (x-ops-secret header)
     OPS_INBOUND_URL: str = ""
+    # When True a team message is an ops command only if it starts with the word "ops " ("ops start", "ops help"); the
+    # word is removed before the message is forwarded. Plain "start" / "help" from a team number then reach the customer
+    # flow like any other message (EXT-8). Off by default so the team's current habits keep working.
+    OPS_EXPLICIT_PREFIX: bool = False
+
+    # The photo download link Meta returns must point at Meta's own hosts before the access token is sent to it (SEC-11).
+    META_MEDIA_HOST_CHECK: bool = True
+    META_MEDIA_HOST_SUFFIXES: str = ".facebook.com,.fbsbx.com,.fbcdn.net,.whatsapp.net,.whatsapp.com"
 
     # --- WhatsApp Pay (native in-chat order_details, India) ---
     # OFF by default: while False nothing below is used and every recharge
@@ -222,6 +304,9 @@ class Settings(BaseSettings):
     # Background sweep for orders whose payment webhook was missed (seconds;
     # 0 disables). Runs only while WHATSAPP_PAY_ENABLED is true.
     WHATSAPP_PAY_RECONCILE_INTERVAL_SECONDS: int = 300
+    # Seconds between sweeps that ask Razorpay about recharge links whose payment webhook never arrived
+    # (0 disables). Runs only while the Razorpay API keys are set.
+    RAZORPAY_LINK_RECONCILE_INTERVAL_SECONDS: int = 300
 
     # --- Live GSTIN verification during onboarding ---
     # False (default) = onboarding behaves exactly as before (format check
@@ -231,6 +316,9 @@ class Settings(BaseSettings):
     GST_VERIFICATION_ENABLED: bool = False
     GST_PROVIDER: str = "none"
     GST_API_TIMEOUT_SECONDS: float = 8.0
+    GST_API_URL: str = ""                     # GST_PROVIDER=http: https://vendor/.../{gstin}
+    GST_API_KEY: str = ""
+    GST_API_KEY_HEADER: str = "x-api-key"
 
     # --- Earring e-commerce prompt version ---
     # "v1" (default) = the original live prompt, byte-for-byte unchanged.
@@ -250,10 +338,13 @@ class Settings(BaseSettings):
     ERPNEXT_INVOICE_ENABLED: bool = False
     ERPNEXT_RECHARGE_ITEM_CODE: str = ""
     ERPNEXT_TAX_TEMPLATE: str = ""
+    # Sales to a buyer in another state are IGST, not CGST+SGST (PRIV-4). Set the seller's two-digit GST state code
+    # and the ERPNext tax template that carries IGST; until both are set every invoice uses ERPNEXT_TAX_TEMPLATE.
+    ERPNEXT_COMPANY_STATE_CODE: str = ""
+    ERPNEXT_TAX_TEMPLATE_INTERSTATE: str = ""
     ERPNEXT_MODE_OF_PAYMENT: str = ""
     ERPNEXT_PRINT_FORMAT: str = "Standard"
     ERPNEXT_PRICES_INCLUDE_TAX: bool = True
-    ERPNEXT_TIMEOUT_SECONDS: float = 8.0
     # Upper bound for the whole background invoice job (all ERPNext calls).
     ERPNEXT_JOB_TIMEOUT_SECONDS: float = 60.0
 
@@ -267,26 +358,10 @@ class Settings(BaseSettings):
     # so an unconfigured deployment can never credit a wallet.
     RAZORPAY_WEBHOOK_SECRET: str = ""
 
-    # --- WhatsApp Onboarding Gate (new customer onboarding) ---
-    # When False (DEFAULT) the WhatsApp pipeline behaves EXACTLY as before:
-    # inbound text messages are logged and ignored, and the image →
-    # style-selection → generation flow is untouched.
-    # When True, text messages from unregistered WhatsApp users are routed
-    # through app/services/onboarding_service.py (welcome → registration →
-    # recharge CTA). Registered users always bypass onboarding.
-    ENABLE_ONBOARDING_GATE: bool = False
-
-    # Gemini text model used ONLY to extract structured registration fields
-    # from free-form WhatsApp registration messages. This parser never
-    # generates conversational replies — it returns strict JSON only.
-    ONBOARDING_PARSER_MODEL: str = "gemini-1.5-flash"
-
-    # Cost safety net for the onboarding parser above (audit: paid Gemini
-    # call per registration message, no cap). Only matters once
-    # ENABLE_ONBOARDING_GATE is turned on -- defaults are generous so
-    # nothing changes for existing behavior until someone lowers them.
-    ONBOARDING_PARSER_MAX_CALLS_PER_DAY: int = 500
-    ONBOARDING_PARSER_QUOTA_COOLDOWN_SECONDS: int = 300
+    # (ENABLE_ONBOARDING_GATE was removed: no code read it. Registration and the welcome flow always run; a
+    # switch that appeared to turn them off did nothing.)
+    # (ONBOARDING_PARSER_MODEL / _MAX_CALLS_PER_DAY / _QUOTA_COOLDOWN_SECONDS were removed: nothing read them, so
+    # they suggested a cost cap on the onboarding parser that did not exist.)
 
     # --- Wallet gate (Scenarios 2, 3 and 4) ---
     # The wallet-balance gate in app/api/routes/meta_webhook.py is always
@@ -307,14 +382,14 @@ class Settings(BaseSettings):
     # Trial credits consumed per order (tier = TRIAL). A credit is one
     # complimentary order; the owner sets trial_credits_total per customer.
     TRIAL_CREDITS_PER_WHITE_BG: int = 1   # ₹50 Clean Studio Shot
-    TRIAL_CREDITS_PER_PACK_1: int = 1     # ₹500 E-Com Pack 1 (6 images)
+    TRIAL_CREDITS_PER_PACK_1: int = 1     # ₹500 E-Com Pack 1 (7 images)
 
     # Razorpay (or any PSP) payment-page URL used by the "Pay ₹<price>" CTA
     # URL button. Leave empty to fall back to the interactive reply button
     # ('recharge_500' / "💳 Recharge to use") that the onboarding flow already
     # uses. No payment gateway SDK or credential is required by this code —
     # the button only opens the PSP-hosted page.
-    RECHARGE_PAYMENT_URL: str = "https://rzp.io/rzp/FbuLh9je"
+    RECHARGE_PAYMENT_URL: str = _BUILTIN_RECHARGE_PAYMENT_URL
 
     # Zero-cost WhatsApp test mode. Must be a Settings field: pydantic-settings
     # reads backend/.env into this object only -- it never exports .env into
@@ -327,8 +402,121 @@ class Settings(BaseSettings):
     # Daily ceiling on ImageGenerationManager.generate_image() calls.
     MAX_GENERATIONS_PER_DAY: int = 100000
 
-    # Styles generated per WhatsApp Earring Catalog Pack (6 styles exist).
-    # None = all styles (production: the full 6-shot E-Com Pack 1).
+    # --- Administrators ---
+    # Usernames (comma-separated) that are administrators, in addition to users flagged is_admin in the database.
+    # While NO administrator exists anywhere (this empty and no flagged user), admin-only endpoints stay open to
+    # any logged-in user, as they were before, and log a warning: set this to lock them down.
+    ADMIN_USERNAMES: str = ""
+
+    # --- Operations (health, metrics, error tracking, alerts) ---
+    # Sentry error tracking is off unless a DSN is set (and the sentry-sdk package installed).
+    SENTRY_DSN: str = ""
+    # Operations alerts go to these WhatsApp numbers (comma-separated, international format). Empty = log only.
+    OPS_ALERT_WHATSAPP_NUMBERS: str = ""
+    OPS_ALERT_COOLDOWN_MINUTES: int = 60
+    OPS_ALERT_SWEEP_INTERVAL_SECONDS: int = 300
+    # Alert when this share of today's generation ceiling is used.
+    OPS_ALERT_SPEND_WARN_FRACTION: float = 0.8
+
+    # --- Meta (WhatsApp) request retries (app/services/meta_whatsapp_service.py) ---
+    # 429 / 5xx answers and connection failures are retried this many times with jittered waits. A timed-out
+    # SEND is never retried (it may already have been delivered).
+    META_REQUEST_RETRIES: int = 2
+    META_RETRY_BACKOFF_BASE_SECONDS: float = 1.0
+    META_RETRY_BACKOFF_CAP_SECONDS: float = 10.0
+    # Razorpay API calls (payment-link creation) give up after this long; the static fallback link is used.
+    RAZORPAY_API_TIMEOUT_SECONDS: float = 10.0
+
+    # --- Worker thread pools (app/utils/executors.py); 0 = automatic ---
+    CPU_WORKER_THREADS: int = 0
+    IO_WORKER_THREADS: int = 0
+    NET_WORKER_THREADS: int = 0
+
+    # --- Database connection pool (PostgreSQL; app/database.py) ---
+    DB_POOL_SIZE: int = 10
+    DB_MAX_OVERFLOW: int = 10
+    DB_POOL_TIMEOUT_SECONDS: float = 5.0
+    DB_POOL_RECYCLE_SECONDS: int = 1800
+
+    # --- Image provider timeouts and retries (app/ai/*) ---
+    # Client-side limits, so a slow or hung provider can never hold a paid order forever.
+    GEMINI_IMAGE_TIMEOUT_SECONDS: float = 90.0
+    OPENAI_IMAGE_TIMEOUT_SECONDS: float = 120.0       # the OpenAI default is 600 s, longer than the stuck-order limit
+    OPENAI_IMAGE_CONNECT_TIMEOUT_SECONDS: float = 10.0
+    # Hard deadline the manager puts on ONE provider attempt (a backstop above the client timeouts).
+    IMAGE_PROVIDER_TIMEOUT_SECONDS: float = 130.0
+    # A rate limit (429) or temporary overload (503) is retried this many times, with jittered waits, on
+    # the same provider before the next provider is tried. Billing / daily-quota exhaustion is never retried.
+    IMAGE_RATE_LIMIT_RETRIES: int = 2
+    # Circuit breaker per provider (EXT-6): this many outage-type failures in a row marks the provider down for the
+    # cool-down; 0 turns the breaker off. IMAGE_PROVIDER_RPM sizes a token bucket to the provider's quota (calls per
+    # minute, 0 = off) and a call that would wait longer than IMAGE_RATE_WAIT_MAX_SECONDS fails fast instead.
+    # Durable background jobs (ops forwards, invoice sends) are recorded in the database and retried (Q-5).
+    OUTBOX_ENABLED: bool = True
+    # How many paid provider calls may run at once in this process (0 = no limit) and how many paid orders one
+    # customer may have in progress (0 = no limit). Size the first to the provider quota (Q-6).
+    MAX_CONCURRENT_PROVIDER_CALLS: int = 0
+    # Team (ADMIN) orders are not part of the customers' daily ceiling but have a ceiling of their own, so a mistake
+    # or a loop on a team phone cannot spend without limit (COST-2). 0 = no limit.
+    MAX_ADMIN_GENERATIONS_PER_DAY: int = 200
+    # Photo bursts become one bulk order (UX-1). A photo within BULK_WINDOW_SECONDS of another waiting photo is part of a
+    # burst; after BULK_QUIET_SECONDS without a new photo the customer gets ONE "N photos, Rs X: confirm?" message.
+    # Needs OUTBOX_ENABLED. At most BULK_MAX_PHOTOS per confirmation; photos older than BULK_LOOKBACK_MINUTES are not grouped.
+    # The WhatsApp chat dashboard's record (every message, every image we produced, every invoice). Chats and the images
+    # we produced are kept RETENTION_CHAT_DAYS days (with RETENTION_ENABLED), like customer photos.
+    # Dashboard access: usernames in ADMIN_USERNAMES / is_admin users, plus these Google or login emails (comma-separated).
+    # GOOGLE_CLIENT_ID turns on "Sign in with Google" (the dashboard sends Google's ID token to /api/auth/google).
+    DASHBOARD_ALLOWED_EMAILS: str = ""
+    GOOGLE_CLIENT_ID: str = ""
+    DASHBOARD_HISTORY_DAYS: int = 90
+    # Google Drive archive of customer photos and the images we produced (see app/services/drive_archive.py). OFF until
+    # DRIVE_ENABLED=true and the OAuth credentials of the Drive owner's account are set.
+    DRIVE_ENABLED: bool = False
+    GOOGLE_DRIVE_CLIENT_ID: str = ""
+    GOOGLE_DRIVE_CLIENT_SECRET: str = ""
+    GOOGLE_DRIVE_REFRESH_TOKEN: str = ""
+    DRIVE_FOLDER_ID: str = ""
+    CHAT_LOG_ENABLED: bool = True
+    RETENTION_CHAT_DAYS: int = 90
+    BULK_ENABLED: bool = True
+    BULK_WINDOW_SECONDS: int = 45
+    BULK_QUIET_SECONDS: int = 8
+    BULK_MAX_PHOTOS: int = 50
+    BULK_CONCURRENCY: int = 4                 # photos of one bulk order worked on at the same time
+    BULK_LOOKBACK_MINUTES: int = 15
+    # What one successful image call costs, in rupees, per provider (COST-4). 0 = unknown: calls are still counted.
+    # OPS_ALERT_DAILY_COST_RUPEES warns the owner on WhatsApp when a day's estimated AI spend passes this (0 = off).
+    COST_PER_CALL_GEMINI_RUPEES: float = 0.0
+    COST_PER_CALL_OPENAI_RUPEES: float = 0.0
+    OPS_ALERT_DAILY_COST_RUPEES: int = 0
+
+    # Data retention (DATA-7). OFF until the owner confirms the periods: it deletes customer photos from disk.
+    # Financial records (wallet ledger, payments, refunds, invoices) are never touched by retention.
+    RETENTION_ENABLED: bool = False
+    RETENTION_MEDIA_DAYS: int = 90            # customer photos of finished orders
+    RETENTION_AUDIT_MASK_DAYS: int = 30       # phone numbers inside audit-log details are masked after this long
+    # "DELETE MY DATA" (PRIV-3): lets a customer erase their photos and personal details by WhatsApp message.
+    ERASURE_COMMAND_ENABLED: bool = True
+    # Consent to the data notice before personal data is collected (PRIV-2, DPDP Act). OFF until the owner provides
+    # the notice wording in CONSENT_NOTICE_TEXT; raise CONSENT_VERSION when the notice changes (everyone agrees again).
+    CONSENT_REQUIRED: bool = False
+    CONSENT_VERSION: str = "1"
+    CONSENT_NOTICE_TEXT: str = ""
+    MAX_INFLIGHT_ORDERS_PER_CUSTOMER: int = 3
+    CIRCUIT_BREAKER_FAILURES: int = 5
+    CIRCUIT_BREAKER_COOLDOWN_SECONDS: float = 60.0
+    IMAGE_PROVIDER_RPM: int = 0
+    IMAGE_RATE_WAIT_MAX_SECONDS: float = 20.0
+    IMAGE_RETRY_BACKOFF_BASE_SECONDS: float = 2.0
+    IMAGE_RETRY_BACKOFF_CAP_SECONDS: float = 15.0
+    # Whole Catalog Pack: styles still running after this long are dropped and the pack ships with the
+    # styles that finished (a pack whose styles all fail is failed and refunded as before).
+    # Sized for the worst case of one style (a rate-limited primary with retries, then a slow fallback, about
+    # 350 s) and, with the Meta upload that follows (up to ~190 s), kept under the 10-minute stuck-order limit.
+    PACK_GENERATION_DEADLINE_SECONDS: float = 360.0
+
+    # Styles generated per WhatsApp Earring Catalog Pack (7 styles exist).
+    # None = all styles (production: the full 7-shot E-Com Pack 1).
     # Set a number (e.g. 1) only as a temporary testing throttle.
     MAX_STYLES_PER_PACK: Optional[int] = None
 
@@ -350,13 +538,18 @@ class Settings(BaseSettings):
     PREPROCESS_COMPRESSION_QUALITY: int = 85
 
     # Logging
+    # Relative values resolve against backend/ (see LOG_PATH).
+    LOG_DIR: str = "logs"
     LOG_LEVEL: str = "DEBUG"
     LOG_FORMAT: str = (
         "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
         "<level>{level: <8}</level> | "
+        "<magenta>{extra[request_id]}</magenta> | "
         "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
         "<level>{message}</level>"
     )
+    # One JSON object per line on the console (for a log collector) instead of the readable format.
+    LOG_JSON: bool = False
 
     # --- Celery / Task Queue ---
     CELERY_BROKER_URL: str = "redis://localhost:6379/0"
@@ -368,9 +561,81 @@ class Settings(BaseSettings):
 
     # Name of the Celery task queue for analysis jobs
     CELERY_ANALYSIS_QUEUE: str = "analysis"
+    # Per-task limits for analysis / prompt tasks (Q-4): soft first, then hard.
+    CELERY_TASK_SOFT_TIME_LIMIT_SECONDS: int = 240
+    CELERY_TASK_TIME_LIMIT_SECONDS: int = 300
 
     # Number of Celery worker processes (only used when not eager)
     CELERY_WORKER_CONCURRENCY: int = 2
+
+    @model_validator(mode="after")
+    def _enforce_safe_runtime(self) -> "Settings":
+        """Refuse to boot in production on unsafe config; warn in development.
+
+        Runs before the SECRET_KEY fallback below so a missing production key
+        is an error, not a silently generated one.
+        """
+        if self.ENVIRONMENT == "production":
+            problems: List[str] = []
+            secret_key = (self.SECRET_KEY or "").strip()
+            if not secret_key:
+                problems.append("SECRET_KEY is not set")
+            elif len(secret_key) < _MIN_SECRET_KEY_LENGTH:
+                problems.append(
+                    f"SECRET_KEY is shorter than {_MIN_SECRET_KEY_LENGTH} characters"
+                )
+            elif len(set(secret_key)) < _MIN_SECRET_KEY_DISTINCT_CHARS:
+                problems.append("SECRET_KEY has too few distinct characters to be random")
+            if not self.META_APP_SECRET.strip():
+                problems.append("META_APP_SECRET is not set")
+            if not self.RAZORPAY_WEBHOOK_SECRET.strip():
+                problems.append("RAZORPAY_WEBHOOK_SECRET is not set")
+            if self.IS_SQLITE:
+                problems.append("DATABASE_URL points at SQLite")
+            if self.DEBUG:
+                problems.append("DEBUG is true")
+            if self.ALLOW_UNSIGNED_WEBHOOKS:
+                problems.append("ALLOW_UNSIGNED_WEBHOOKS is true")
+            if problems:
+                raise ValueError(
+                    "Refusing to start with ENVIRONMENT=production: "
+                    + "; ".join(problems)
+                )
+            # Things worth fixing but not worth refusing to start over (changing them blindly could break a
+            # working production setup): say so loudly in the log.
+            if self.RECHARGE_PAYMENT_URL == _BUILTIN_RECHARGE_PAYMENT_URL:
+                _config_logger.warning(
+                    "RECHARGE_PAYMENT_URL is not set: the built-in static payment link from the source code is "
+                    "used as the fallback. Set RECHARGE_PAYMENT_URL to your own link in the environment."
+                )
+            if self.CELERY_TASK_ALWAYS_EAGER:
+                _config_logger.warning(
+                    "CELERY_TASK_ALWAYS_EAGER is true in production: analysis tasks run inside the web process. "
+                    "Set it to false and run a real worker with a broker."
+                )
+        elif self.ALLOW_UNSIGNED_WEBHOOKS:
+            _config_logger.warning(
+                "ALLOW_UNSIGNED_WEBHOOKS is on: webhooks without a signature "
+                "are accepted when their secret is unset. Development only."
+            )
+
+        if self.MAX_GENERATIONS_PER_DAY < _PACK_IMAGE_COUNT:
+            _config_logger.warning(
+                f"MAX_GENERATIONS_PER_DAY={self.MAX_GENERATIONS_PER_DAY} is "
+                f"below one Pack ({_PACK_IMAGE_COUNT} images): Pack orders "
+                "will be refused once charged."
+            )
+
+        if Path.cwd().resolve() != BASE_DIR:
+            relative_db = self.IS_SQLITE and "///./" in self.DATABASE_URL
+            _config_logger.warning(
+                f"Working directory is {Path.cwd()}, not {BASE_DIR}. Uploads "
+                f"and reports use paths relative to the working directory "
+                f"({self.UPLOAD_DIR}, {self.REPORT_DIR}"
+                f"{', and the SQLite database' if relative_db else ''}); start "
+                "the server from backend/ so stored file paths keep resolving."
+            )
+        return self
 
     @model_validator(mode="after")
     def _default_secret_key(self) -> "Settings":
@@ -418,6 +683,17 @@ class Settings(BaseSettings):
     def REPORT_PATH(self) -> Path:
         """Return report directory as Path."""
         return Path(self.REPORT_DIR)
+
+    @property
+    def LOG_PATH(self) -> Path:
+        """Log directory; a relative LOG_DIR resolves against backend/."""
+        path = Path(self.LOG_DIR)
+        return path if path.is_absolute() else BASE_DIR / path
+
+    @property
+    def IS_PRODUCTION(self) -> bool:
+        """True when ENVIRONMENT=production."""
+        return self.ENVIRONMENT == "production"
 
 
 settings = Settings()

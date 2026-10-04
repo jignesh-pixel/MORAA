@@ -13,11 +13,13 @@ requests a URL and downloads the image bytes internally.
 Requires ``OPENAI_API_KEY`` environment variable in the backend .env.
 """
 
+import asyncio
 import base64
 import os
 import tempfile
 import time
-from typing import Any, Dict, Optional
+import weakref
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
@@ -53,6 +55,42 @@ OPENAI_IDENTITY_ANCHOR = (
     "If the scene instruction conflicts with the reference product's "
     "physical identity, preserve the reference product."
 )
+
+
+def _request_timeout() -> httpx.Timeout:
+    """Total request time limit with a short connect limit, from settings."""
+    return httpx.Timeout(
+        float(settings.OPENAI_IMAGE_TIMEOUT_SECONDS or 120.0),
+        connect=float(settings.OPENAI_IMAGE_CONNECT_TIMEOUT_SECONDS or 10.0),
+    )
+
+
+# One SDK client per event loop, reused for every call (PERF-4); see gemini_image_provider._CLIENTS.
+_CLIENTS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Tuple[str, Any]]" = weakref.WeakKeyDictionary()
+
+
+def _get_client(async_openai_cls: Any) -> Any:
+    loop = asyncio.get_running_loop()
+    key = settings.OPENAI_API_KEY
+    cached = _CLIENTS.get(loop)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    client = async_openai_cls(api_key=key, max_retries=0, timeout=_request_timeout())
+    _CLIENTS[loop] = (key, client)
+    return client
+
+
+async def close_openai_client() -> None:
+    """Close the running loop's shared client (called at application shutdown)."""
+    try:
+        cached = _CLIENTS.pop(asyncio.get_running_loop(), None)
+    except RuntimeError:
+        return
+    if cached is not None:
+        try:
+            await cached[1].close()
+        except Exception as e:  # noqa: BLE001 -- shutdown must never fail on this
+            logger.warning(f"OpenAI client close failed: {e}")
 
 
 class OpenAIImageProvider(BaseImageGenerationProvider):
@@ -131,8 +169,9 @@ class OpenAIImageProvider(BaseImageGenerationProvider):
             )
 
         try:
-            # max_retries=0: one HTTP attempt per call (the SDK default is 2 retries).
-            client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY, max_retries=0)
+            # Shared per-loop client (PERF-4) with an explicit timeout (EXT-3: the SDK default is 600 s).
+            # max_retries=0: one HTTP attempt per call (the SDK default is 2 retries); the manager owns retries.
+            client = _get_client(AsyncOpenAI)
 
             # Map aspect ratio to a size the ACTIVE model accepts.
             # gpt-image-1 (ChatGPT image, PRIMARY) supports only:
@@ -244,7 +283,6 @@ class OpenAIImageProvider(BaseImageGenerationProvider):
                 # Prefer b64_json if available (faster, no extra fetch)
                 if image_data_b64:
                     image_bytes = base64.b64decode(image_data_b64)
-                    data_url = f"data:image/png;base64,{image_data_b64}"
 
                     processing_time = time.time() - start_time
                     logger.info(
@@ -252,9 +290,9 @@ class OpenAIImageProvider(BaseImageGenerationProvider):
                         f"request_id={request_id} time={processing_time:.2f}s"
                     )
 
+                    # Raw bytes only (PERF-5): result.as_data_url() builds the data URL on demand.
                     return ImageGenerationResult(
                         success=True,
-                        image_url=data_url,
                         image_data=image_bytes,
                         mime_type="image/png",
                         provider_name=self.provider_name,
@@ -268,12 +306,10 @@ class OpenAIImageProvider(BaseImageGenerationProvider):
 
                 # Otherwise download from the URL
                 if image_url_from_api:
-                    async with httpx.AsyncClient() as hx:
+                    async with httpx.AsyncClient(timeout=_request_timeout()) as hx:
                         img_resp = await hx.get(image_url_from_api)
                         img_resp.raise_for_status()
                         image_bytes = img_resp.content
-                        image_data_b64 = base64.b64encode(image_bytes).decode("utf-8")
-                        data_url = f"data:image/png;base64,{image_data_b64}"
 
                     processing_time = time.time() - start_time
                     revised_prompt = getattr(response.data[0], "revised_prompt", None)
@@ -285,7 +321,6 @@ class OpenAIImageProvider(BaseImageGenerationProvider):
 
                     return ImageGenerationResult(
                         success=True,
-                        image_url=data_url,
                         image_data=image_bytes,
                         mime_type="image/png",
                         provider_name=self.provider_name,

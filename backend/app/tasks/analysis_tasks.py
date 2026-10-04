@@ -27,6 +27,7 @@ from app.models.history import HistoryEntry
 from app.models.image import Image
 from app.models.retry_history import RetryHistory
 from app.services.processing_service import ProcessingService
+from app.tasks.retry_policy import TRANSIENT_ERRORS
 from app.utils.logger import logger
 
 # Global pipeline instance (lazily initialised per worker process)
@@ -43,17 +44,14 @@ def get_analysis_pipeline() -> AnalysisPipeline:
     if _pipeline is None:
         engine = create_engine()
         _pipeline = AnalysisPipeline(engine)
-        logger.info(
-            f"Analysis pipeline initialised: {engine.engine_name} v{engine.engine_version}",
-            extra={"category": "system"},
-        )
+        logger.bind(category="system").info(f"Analysis pipeline initialised: {engine.engine_name} v{engine.engine_version}")
     return _pipeline
 
 
 class AnalysisTask(Task):
     """Base task class for analysis tasks with automatic error handling."""
 
-    autoretry_for = (Exception,)
+    autoretry_for = TRANSIENT_ERRORS
     max_retries = 2
     default_retry_delay = 10  # seconds between retries
     acks_late = True  # Re-deliver if worker crashes

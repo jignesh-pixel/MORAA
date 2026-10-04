@@ -197,7 +197,7 @@ async def analyze_image(
     summary="Get analysis result",
     description="Retrieve the result of a completed jewellery analysis.",
 )
-async def get_analysis(
+def get_analysis(
     analysis_id: str,
     db: Session = Depends(get_db),
 ):
@@ -220,7 +220,7 @@ async def get_analysis(
             )
         if status_info["status"] == "failed":
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=422,
                 detail="Analysis failed",
             )
 
@@ -233,14 +233,16 @@ async def get_analysis(
     summary="List all analyses",
     description="Get a list of all completed analyses.",
 )
-async def list_analyses(
+def list_analyses(
+    limit: int = Query(100, ge=1, le=500, description="Page size (default 100, maximum 500)"),
+    offset: int = Query(0, ge=0, description="How many analyses to skip (for the next page)"),
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user),
 ):
-    """Get all completed analyses."""
+    """Get completed analyses, newest first, one page at a time."""
     service = AnalysisService(db)
     user_id = current_user.id if current_user else None
-    return service.get_analysis_history(user_id=user_id)
+    return service.get_analysis_history(user_id=user_id, limit=limit, offset=offset)
 
 
 @router.post(
@@ -323,7 +325,7 @@ async def regenerate_analysis(
         "processing steps, tool executions, and audit events. (Part 12)"
     ),
 )
-async def get_analysis_timeline(
+def get_analysis_timeline(
     analysis_id: str,
     db: Session = Depends(get_db),
 ):

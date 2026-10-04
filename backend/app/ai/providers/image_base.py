@@ -8,6 +8,7 @@ This follows the same pattern as ``BaseAIProvider`` for image analysis,
 but is specialised for text-to-image generation.
 """
 
+import base64
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -28,6 +29,31 @@ class ImageGenerationResult:
     fallback_reason: Optional[str] = None
     error: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    # Providers fill ``image_data`` (the raw bytes) and leave ``image_url`` empty: a base64 data-URL copy of a
+    # 3 MB image is another ~4 MB per output that nothing on the WhatsApp path needs (PERF-5). The two helpers
+    # below build whichever form a caller wants, only when it is wanted. Older callers and tests that set
+    # ``image_url`` still work.
+
+    def as_bytes(self) -> Optional[bytes]:
+        """The image as raw bytes (from ``image_data``, else decoded from ``image_url``)."""
+        if isinstance(self.image_data, (bytes, bytearray)) and self.image_data:
+            return bytes(self.image_data)
+        if isinstance(self.image_url, str) and self.image_url.startswith("data:") and "," in self.image_url:
+            try:
+                return base64.b64decode(self.image_url.split(",", 1)[1]) or None
+            except Exception:  # noqa: BLE001 -- a malformed URL simply means "no usable image"
+                return None
+        return None
+
+    def as_data_url(self) -> Optional[str]:
+        """The image as a ``data:`` URL (``image_url`` when set, else built from ``image_data``)."""
+        if self.image_url:
+            return self.image_url
+        data = self.as_bytes()
+        if not data:
+            return None
+        return f"data:{self.mime_type or 'image/png'};base64,{base64.b64encode(data).decode('ascii')}"
 
 
 class BaseImageGenerationProvider(ABC):

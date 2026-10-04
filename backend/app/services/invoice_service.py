@@ -34,10 +34,10 @@ def generate_invoice_pdf(
     # Invoice Details
     p.setFont("Helvetica-Bold", 12)
     p.setFillColor(colors.HexColor("#1A1A1A"))
-    p.drawString(50, height - 140, "TAX INVOICE / RECEIPT")
+    p.drawString(50, height - 140, "PAYMENT RECEIPT")
 
     p.setFont("Helvetica", 10)
-    p.drawString(50, height - 165, f"Invoice No: {invoice_number}")
+    p.drawString(50, height - 165, f"Receipt No: {invoice_number}")
     p.drawString(50, height - 180, f"Date: {datetime.now().strftime('%d %b %Y, %I:%M %p')}")
     p.drawString(50, height - 195, f"Billed To: {customer_name}")
 
@@ -65,6 +65,7 @@ def generate_invoice_pdf(
     # Footer note
     p.setFont("Helvetica-Oblique", 9)
     p.setFillColor(colors.HexColor("#777777"))
+    p.drawString(50, 75, "This is a payment receipt, not a GST tax invoice. A tax invoice is issued separately where applicable.")
     p.drawString(50, 60, "Thank you for creating with Moraa Studio! Questions? Contact support@moraa.studio")
 
     p.showPage()

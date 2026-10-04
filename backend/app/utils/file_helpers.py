@@ -154,6 +154,10 @@ def delete_directory(dir_path: str) -> bool:
         return False
 
 
+# Folders inside uploads/ that do not belong to one upload request and must survive the orphan clean-up.
+PROTECTED_DIRECTORIES = frozenset({"outputs"})
+
+
 def cleanup_orphaned_directories(
     upload_dir: Path, known_request_ids: set
 ) -> int:
@@ -177,6 +181,8 @@ def cleanup_orphaned_directories(
         return 0
     removed = 0
     for entry in upload_dir.iterdir():
+        if entry.is_dir() and entry.name in PROTECTED_DIRECTORIES:
+            continue                                  # images we produced (chat dashboard record): never an orphan
         if entry.is_dir() and entry.name not in known_request_ids:
             if delete_directory(str(entry)):
                 removed += 1

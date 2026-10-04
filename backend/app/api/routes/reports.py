@@ -54,7 +54,7 @@ async def generate_report(
     summary="Download a report",
     description="Download a generated report file.",
 )
-async def download_report(
+def download_report(
     report_id: str,
     db: Session = Depends(get_db),
 ):

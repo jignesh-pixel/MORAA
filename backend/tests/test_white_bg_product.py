@@ -355,7 +355,7 @@ class ProductChoiceWebhookTests(FundedSlotGateTestCase):
         pack_retry.assert_not_awaited()
 
     def test_retry_legacy_null_goes_to_pack_1(self):
-        row = self._row(status="failed")
+        row = self._row(status="failed", amount_charged=PACK)       # a legacy order that was paid at upload
         pack_retry, _ = self._retry(row)
         pack_retry.assert_awaited_once_with(row.id)
         self.white_worker.assert_not_awaited()
@@ -492,9 +492,19 @@ class WhiteWorkerTests(unittest.TestCase):
         self.gen.assert_not_awaited()
         self.assertEqual(self.send.await_args.kwargs["caption"], mws.WHITE_BG_DRY_RUN_CAPTION)
 
-    def test_legacy_pack_1_refund_still_uses_pack_price(self):
+    def test_order_with_no_recorded_charge_is_never_refunded(self):
+        """Phase 2: a refund needs a recorded charge. The old NULL -> Pack 1 price fallback created money
+        out of nothing for any order that was never charged (e.g. a retried failure)."""
         legacy = WhatsAppIngestion(external_user_id=SENDER, external_message_id="wamid.legacy",
                                    channel="whatsapp", status="processing")
+        self.db.add(legacy)
+        self.db.commit()
+        mws._fail_ingestion(self.db, legacy, "legacy failure")
+        self.assertEqual(self._balance(), 650)
+
+    def test_pre_ledger_order_with_amount_charged_is_still_refunded(self):
+        legacy = WhatsAppIngestion(external_user_id=SENDER, external_message_id="wamid.legacy2",
+                                   channel="whatsapp", status="processing", amount_charged=PACK)
         self.db.add(legacy)
         self.db.commit()
         mws._fail_ingestion(self.db, legacy, "legacy failure")

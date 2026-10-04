@@ -1,0 +1,92 @@
+{
+  "project": "MORAA GemVision",
+  "phase": "Phase 6 Compliance and Cleanup",
+  "why": "The business collects customers' names, GST numbers, addresses and product photos and sends photos to AI providers abroad, with no notice, no consent, no way to delete data, no retention limit, a receipt titled 'Tax Invoice' without tax fields, no record of what the AI costs, and team orders that bypass every limit. Indian data-protection rules (DPDP Act) and tax rules expect better, and the owner needs to see AI spending. This phase builds the mechanisms; the wording and periods that need the owner or a lawyer stay switched off until supplied.",
+  "approach": "A consent step before any personal data is collected, a retention job and a DELETE MY DATA command (both careful to keep money records), a receipt that says what it is plus an IGST option, a per-call AI cost log with a daily spend alert, a separate ceiling for team orders, and validation of Meta's media links. Small cleanups removed empty folders.",
+  "decisions": [
+    {
+      "decision": "Build consent, retention and erasure switched OFF (or confirmation-gated) until the owner supplies wording and periods.",
+      "why": "The notice text is a legal statement and retention deletes photos; neither should be invented by an engineer. The mechanisms are ready and tested.",
+      "alternatives": [
+        { "option": "Write a default privacy notice", "why_not": "Legal wording the owner or their adviser must own." },
+        { "option": "Turn retention on with the audit's suggested periods", "why_not": "Irreversible deletion of customer photos without the owner's approval." }
+      ],
+      "tasks": "1.1, 1.2"
+    },
+    {
+      "decision": "Erasure keeps the customer row (placeholder name, phone and details) because the wallet ledger points at it, and refuses while money remains.",
+      "why": "Tax and audit rules require the money trail to stay; deleting the row would break the ledger. A customer with money left needs a person to settle it.",
+      "alternatives": [
+        { "option": "Delete the customer row entirely", "why_not": "Breaks the wallet ledger and the payment records that must be kept." },
+        { "option": "Refund the balance automatically", "why_not": "Refund policy for leaving customers is the owner's decision." }
+      ],
+      "tasks": "1.2"
+    },
+    {
+      "decision": "Retitle the fallback PDF 'Payment receipt' instead of trying to make it a legal tax invoice.",
+      "why": "A real tax invoice needs the seller's GST details and tax rows that live in ERPNext; a receipt that does not claim to be one is honest and safe.",
+      "alternatives": [
+        { "option": "Add GST fields to the local PDF", "why_not": "Duplicates ERPNext's job and risks wrong tax figures." }
+      ],
+      "tasks": "2.1"
+    },
+    {
+      "decision": "Do not merge the seven earring prompt routes or split the two large files now.",
+      "why": "Five of the route files are frozen by the prompt freeze guard, and the large files are patched by name in hundreds of tests and carry every money path. The risk is higher than the benefit before launch.",
+      "alternatives": [
+        { "option": "Refactor now", "why_not": "Would unlock frozen files and touch every payment path without the owner's say." }
+      ],
+      "tasks": "4.1"
+    }
+  ],
+  "errors": [
+    {
+      "error": "AssertionError: ['COST_PER_CALL_GEMINI_RUPEES', 'COST_PER_CALL_OPENAI_RUPEES'] unused settings",
+      "cause": "The price lookup built the setting name from the provider name, so the settings looked unused.",
+      "fix": "An explicit table of the two prices.",
+      "task": "3.2"
+    },
+    {
+      "error": "git: docker/.env.example was not in the commit",
+      "cause": "The repository ignores every .env* file, including the example file.",
+      "fix": "Renamed it env.example and updated the instructions.",
+      "task": "4.2"
+    }
+  ],
+  "domains": [
+    {
+      "name": "Privacy",
+      "goal": "Customers know what is kept, agree to it, and can have it removed.",
+      "tasks": [
+        { "title": "No personal data is collected from a number until it has agreed to the current notice (switched off until the notice text is supplied)", "status": "done", "files": ["backend/app/services/consent_service.py", "backend/app/models/consent_record.py", "backend/alembic/versions/0018_consent_records.py"], "verify": "Set CONSENT_REQUIRED=true and CONSENT_NOTICE_TEXT on a test number, send HI: the notice with an 'I agree' button arrives and nothing else happens until you tap it." },
+        { "title": "A customer can send DELETE MY DATA and CONFIRM DELETE to remove photos and personal details while the money trail is kept; an administrator can do the same by script", "status": "done", "files": ["backend/app/services/data_lifecycle.py", "backend/scripts/erase_customer.py"], "verify": "On a test customer with zero balance send the two messages: reply confirms; their name shows as Deleted customer and their ledger rows are unchanged. A customer with money in the wallet is refused." },
+        { "title": "Old customer photos and phone numbers in audit notes are removed on a schedule (switched off until approved)", "status": "done", "files": ["backend/app/services/data_lifecycle.py"], "verify": "Tests in tests/test_data_lifecycle.py. RETENTION_ENABLED stays false until you approve the periods." }
+      ]
+    },
+    {
+      "name": "Tax and billing",
+      "tasks": [
+        { "title": "The local PDF says 'Payment receipt' and that it is not a GST tax invoice", "status": "done", "files": ["backend/app/services/invoice_service.py"], "verify": "Recharge on a test number with ERPNext off: the PDF title reads PAYMENT RECEIPT." },
+        { "title": "An inter-state buyer's ERPNext invoice uses the IGST template and the right place of supply (inactive until two settings are filled)", "status": "done", "files": ["backend/app/services/gst_places.py", "backend/app/services/erpnext_service.py"], "verify": "Tests in tests/test_billing_erpnext.py use a fake ERPNext. Not tried against your real ERPNext." }
+      ]
+    },
+    {
+      "name": "Cost and limits",
+      "tasks": [
+        { "title": "Team (admin) orders have their own daily ceiling instead of bypassing every limit", "status": "done", "files": ["backend/app/ai/image_generation_manager.py", "backend/app/services/meta_whatsapp_service.py"], "verify": "Set MAX_ADMIN_GENERATIONS_PER_DAY to 6 and send two Packs from a team number: the second is refused with 'Team daily image limit reached'." },
+        { "title": "Every AI call is recorded with an estimated cost, a daily spend alert can warn the owner, and a report lists the last week", "status": "done", "files": ["backend/app/services/provider_call_log.py", "backend/scripts/cost_report.py", "backend/alembic/versions/0019_provider_calls.py"], "verify": "After migration 0019, run python scripts/cost_report.py: one row per day and provider. Costs read 0 until you set the price per call." },
+        { "title": "The photo download link must be on Meta's own hosts and the media id must be a plain token", "status": "done", "files": ["backend/app/services/meta_whatsapp_service.py"], "verify": "Tests in tests/test_media_hardening.py." },
+        { "title": "An optional rule that team ops commands must start with the word 'ops'", "status": "done", "files": ["backend/app/services/ops_forward.py"], "verify": "Off by default. With OPS_EXPLICIT_PREFIX=true a team 'start' goes to the customer flow and 'ops start' goes to ops." }
+      ]
+    },
+    {
+      "name": "Cleanup and not done",
+      "tasks": [
+        { "title": "Empty placeholder folders removed; the generated load-test results file is no longer tracked", "status": "done", "files": ["ai-engine/", "shared/", "backend/.gitignore"], "verify": "git status no longer shows last_results.json changing after a load test." },
+        { "title": "Split the two very large files and merge duplicate generation code (MAINT-1, ARC-4, ARC-5)", "status": "dropped" },
+        { "title": "Merge the seven earring prompt routes (MAINT-2)", "status": "dropped" },
+        { "title": "A real GST verification provider and verified-only GSTIN on invoices (EXT-8)", "status": "blocked", "blocked_by": "The owner's decision to buy a verification service or remove the step." }
+      ]
+    }
+  ]
+}

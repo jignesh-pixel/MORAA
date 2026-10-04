@@ -1,0 +1,603 @@
+diff --git a/backend/app/api/routes/meta_webhook.py b/backend/app/api/routes/meta_webhook.py
+index 8d1428d..b86a5eb 100644
+--- a/backend/app/api/routes/meta_webhook.py
++++ b/backend/app/api/routes/meta_webhook.py
+@@ -74,6 +74,8 @@ from app.services.upload_service import UploadService
+ from app.services.ops_forward import divert_ops_messages
+ from app.services.whatsapp_pay_service import (
+     handle_payment_status_event,
++    is_native_pay_active,
++    send_payment_unavailable,
+     try_send_native_recharge,
+ )
+ from app.services import entitlement_service as ent
+@@ -118,6 +120,39 @@ def _find_customer_safe(db: Session, sender: str) -> Optional[Customer]:
+     return find_customer_by_phone(db, sender)
+ 
+ 
++def _ensure_wallet_row(db: Session, sender: str) -> Optional[Customer]:
++    """Find the sender's wallet row, creating an UNREGISTERED placeholder if none.
++
++    Same placeholder shape the Razorpay webhook uses for unregistered payers;
++    registration later adopts the row by phone. Only called when native pay
++    is active, so an in-chat order can be credited to this row.
++    """
++    cust = find_customer_by_phone(db, sender)
++    if cust is not None:
++        return cust
++    try:
++        cust = Customer(
++            whatsapp_id=sender,
++            full_name="Valued Customer",
++            business_name="Jewelry Business",
++            gst_number="N/A",
++            address="N/A",
++            wallet_balance=0,
++            is_registered=False,
++        )
++        db.add(cust)
++        db.commit()
++        logger.info(f"Created unregistered wallet row for native pay: sender={sender}")
++        return cust
++    except IntegrityError:
++        db.rollback()  # concurrent create won; read it back
++        return find_customer_by_phone(db, sender)
++    except Exception as e:
++        db.rollback()
++        logger.error(f"Wallet row creation failed for {sender}: {e}")
++        return None
++
++
+ FEEDBACK_AUDIT_ACTION = "whatsapp_feedback"
+ 
+ 
+@@ -352,7 +387,9 @@ async def _send_registration_confirmation(
+         name=display_name,
+         balance=f"{get_balance(db, cust.whatsapp_id):,}",
+     )
+-    if await try_send_native_recharge(db, sender, 500, confirm_msg):
++    if await try_send_native_recharge(db, sender, 500, confirm_msg, site="registration"):
++        return
++    if await send_payment_unavailable(sender, "registration", body_text=confirm_msg):
+         return
+     try:
+         pay_url = await create_recharge_payment_link(
+@@ -605,10 +642,17 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
+         ingestion.status = "unfunded"
+         ingestion.error_message = f"Balance {balance} below minimum {min_price} at upload"
+         db.commit()
++        if customer is None and is_native_pay_active(sender):
++            customer = _ensure_wallet_row(db, sender)
+         hold_balance = get_balance(db, customer.whatsapp_id) if customer else 0
+         if customer is not None and await try_send_native_recharge(
+             db, sender, max(min_price, 500), _hold_body(min_price, hold_balance, "an order"),
+-            reply_to_message_id=message_id,
++            reply_to_message_id=message_id, site="photo_low_balance",
++        ):
++            return None
++        if await send_payment_unavailable(
++            sender, "photo_low_balance",
++            body_text=_hold_body(min_price, hold_balance, "an order"), reply_to_message_id=message_id,
+         ):
+             return None
+         await send_whatsapp_text(
+@@ -776,6 +820,11 @@ async def _handle_product_choice(
+         balance = get_balance(db, customer.whatsapp_id) if customer else 0
+         if await try_send_native_recharge(
+             db, sender, max(price, 500), _hold_body(price, balance, label), reply_to_message_id=quote_id,
++            site="product_choice",
++        ):
++            return None
++        if await send_payment_unavailable(
++            sender, "product_choice", body_text=_hold_body(price, balance, label), reply_to_message_id=quote_id,
+         ):
+             return None
+         await send_whatsapp_text(
+@@ -962,8 +1011,11 @@ async def receive_webhook(
+                     if await try_send_native_recharge(
+                         db, sender, requested_amount,
+                         f"Recharge your Moraa Studio wallet with ₹{requested_amount} 💳",
++                        site="recharge_command",
+                     ):
+                         continue
++                    if await send_payment_unavailable(sender, "recharge_command"):
++                        continue
+                     cust = _find_customer_safe(db, sender)
+                     cust_name = getattr(cust, "full_name", "Customer") if cust else "Customer"
+                     try:
+diff --git a/backend/app/config.py b/backend/app/config.py
+index 235d923..fa9dfe6 100644
+--- a/backend/app/config.py
++++ b/backend/app/config.py
+@@ -192,7 +192,8 @@ class Settings(BaseSettings):
+     # When True, recharge prompts send a native order_details message using
+     # the Razorpay payment configuration named WHATSAPP_PAY_CONFIGURATION_NAME
+     # (must match the name created in WhatsApp Manager exactly, max 60 chars);
+-    # any dispatch failure silently falls back to the Razorpay link CTA.
++    # any dispatch failure falls back to the Razorpay link CTA unless
++    # WHATSAPP_PAY_STRICT is on.
+     WHATSAPP_PAY_ENABLED: bool = False
+     WHATSAPP_PAY_CONFIGURATION_NAME: str = ""
+     # Comma-separated WhatsApp numbers for a pilot; empty = everyone.
+@@ -212,6 +213,15 @@ class Settings(BaseSettings):
+     WHATSAPP_PAY_IMPORTER_CITY: str = ""
+     WHATSAPP_PAY_IMPORTER_ZONE_CODE: str = ""  # state code, e.g. "MH", "GJ"
+     WHATSAPP_PAY_IMPORTER_POSTAL_CODE: str = ""
++    # Strict native mode: never send a Razorpay link / URL button for a wallet
++    # recharge. If native order_details cannot be sent, the customer gets an
++    # in-chat "temporarily unavailable" text and an ALERT is logged.
++    # Turn on ONLY after native pay is live and tested; before that it means
++    # nobody can recharge.
++    WHATSAPP_PAY_STRICT: bool = False
++    # Background sweep for orders whose payment webhook was missed (seconds;
++    # 0 disables). Runs only while WHATSAPP_PAY_ENABLED is true.
++    WHATSAPP_PAY_RECONCILE_INTERVAL_SECONDS: int = 300
+ 
+     # --- Live GSTIN verification during onboarding ---
+     # False (default) = onboarding behaves exactly as before (format check
+diff --git a/backend/app/main.py b/backend/app/main.py
+index d2f876a..774eb39 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -115,9 +115,25 @@ async def lifespan(app: FastAPI):
+             extra={"category": "system"},
+         )
+ 
++    # WhatsApp Pay reconcile sweep (best-effort): credits in-chat payments
++    # whose webhook was missed. Loop is idle while WHATSAPP_PAY_ENABLED=false.
++    import asyncio
++
++    reconcile_task = None
++    try:
++        from app.services.whatsapp_pay_service import run_reconcile_sweep_forever
++
++        reconcile_task = asyncio.create_task(run_reconcile_sweep_forever())
++    except Exception as e:
++        logger.warning(
++            f"WhatsApp Pay reconcile sweep not started: {e}", extra={"category": "system"}
++        )
++
+     yield
+ 
+     # Shutdown
++    if reconcile_task is not None:
++        reconcile_task.cancel()
+     logger.info(
+         f"Shutting down {settings.APP_NAME}",
+         extra={"category": "system"},
+diff --git a/backend/app/services/entitlement_service.py b/backend/app/services/entitlement_service.py
+index ed1dce1..6e7099d 100644
+--- a/backend/app/services/entitlement_service.py
++++ b/backend/app/services/entitlement_service.py
+@@ -181,17 +181,21 @@ async def send_trial_exhausted_card(db, customer: Any, reply_to_message_id: Opti
+     enabled, else the Razorpay link CTA)."""
+     from app.services import meta_whatsapp_service as mws
+     from app.services import razorpay_service
+-    from app.services.whatsapp_pay_service import try_send_native_recharge
++    from app.services.whatsapp_pay_service import send_payment_unavailable, try_send_native_recharge
+ 
+     total = int(customer.trial_credits_total or 0)
+     body = EXHAUSTED_TEMPLATE.format(used=total, total=total)
+     amount = 500
+     try:
+         if await try_send_native_recharge(db, customer.whatsapp_id, amount, body,
+-                                          reply_to_message_id=reply_to_message_id):
++                                          reply_to_message_id=reply_to_message_id,
++                                          site="trial_exhausted"):
+             return
+     except Exception as e:  # noqa: BLE001
+         logger.error(f"Native recharge for trial exhaustion failed: {e}")
++    if await send_payment_unavailable(customer.whatsapp_id, "trial_exhausted", body_text=body,
++                                      reply_to_message_id=reply_to_message_id):
++        return
+     try:
+         url = await razorpay_service.create_recharge_payment_link(
+             customer_phone=customer.whatsapp_id,
+diff --git a/backend/app/services/meta_whatsapp_service.py b/backend/app/services/meta_whatsapp_service.py
+index fc5fcea..1512705 100644
+--- a/backend/app/services/meta_whatsapp_service.py
++++ b/backend/app/services/meta_whatsapp_service.py
+@@ -361,12 +361,34 @@ async def send_feedback_buttons(recipient_id: str, ingestion_id: str) -> bool:
+ # ─── Plain text + CTA button messages ─────────────────────────────────────
+ 
+ 
++def _meta_error_details(response: Any) -> Dict[str, Any]:
++    """Pull code / error_subcode / message / details out of a Graph API error body."""
++    try:
++        err = (response.json() or {}).get("error") or {}
++    except Exception:
++        return {"status": getattr(response, "status_code", None), "message": (getattr(response, "text", "") or "")[:300]}
++    return {
++        "status": getattr(response, "status_code", None),
++        "code": err.get("code"),
++        "subcode": err.get("error_subcode"),
++        "type": err.get("type"),
++        "message": err.get("message"),
++        "details": (err.get("error_data") or {}).get("details"),
++        "fbtrace_id": err.get("fbtrace_id"),
++    }
++
++
+ async def _post_message_payload(
+     payload: Dict[str, Any],
+     label: str,
+     reply_to_message_id: Optional[str] = None,
++    error_out: Optional[Dict[str, Any]] = None,
+ ) -> bool:
+-    """POST a message payload to the Meta Send API with optional context quote."""
++    """POST a message payload to the Meta Send API with optional context quote.
++
++    When ``error_out`` is a dict it is filled with the parsed Meta error
++    (code, subcode, message, details) or {"timeout": True} on failure.
++    """
+     if not settings.META_WHATSAPP_TOKEN:
+         logger.error(f"META_WHATSAPP_TOKEN not configured — cannot send {label}")
+         return False
+@@ -392,7 +414,14 @@ async def _post_message_payload(
+             )
+ 
+             if response.status_code not in (200, 201):
+-                logger.error(f"Meta send {label} failed: status={response.status_code} body={response.text}")
++                err = _meta_error_details(response)
++                if error_out is not None:
++                    error_out.update(err)
++                logger.error(
++                    f"Meta send {label} failed: status={err.get('status')} code={err.get('code')} "
++                    f"subcode={err.get('subcode')} message={err.get('message')!r} "
++                    f"details={err.get('details')!r} fbtrace_id={err.get('fbtrace_id')}"
++                )
+                 return False
+ 
+             data = response.json()
+@@ -408,9 +437,13 @@ async def _post_message_payload(
+             return True
+ 
+     except httpx.TimeoutException:
++        if error_out is not None:
++            error_out["timeout"] = True
+         logger.error(f"Meta send {label} timed out")
+         return False
+     except Exception as e:
++        if error_out is not None:
++            error_out["message"] = str(e)
+         logger.error(f"Meta send {label} failed: {e}")
+         return False
+ 
+diff --git a/backend/app/services/whatsapp_pay_service.py b/backend/app/services/whatsapp_pay_service.py
+index e281904..c5cba6e 100644
+--- a/backend/app/services/whatsapp_pay_service.py
++++ b/backend/app/services/whatsapp_pay_service.py
+@@ -42,6 +42,8 @@ from app.services.meta_whatsapp_service import _post_message_payload, send_whats
+ from app.services.wallet_service import credit_wallet, find_customer_by_phone, get_balance
+ from app.utils.logger import logger
+ 
++_plog = logger.bind(category="payments")
++
+ GRAPH_BASE = "https://graph.facebook.com/v21.0"
+ INR_OFFSET = 100
+ MIN_RECHARGE_RUPEES = 500
+@@ -52,6 +54,12 @@ MONEY_ONCE_ACTION = "razorpay_payment_captured"
+ MONEY_ONCE_RESOURCE_TYPE = "razorpay_payment"
+ 
+ ORDER_FAILED_MESSAGE = "Your in-chat payment didn't go through. You can pay with the link below instead."
++# Strict mode (WHATSAPP_PAY_STRICT): in-chat texts that never carry a URL.
++PAYMENT_UNAVAILABLE_MESSAGE = "Payment system is temporarily unavailable. Please try again shortly."
++ORDER_FAILED_STRICT_MESSAGE = (
++    "Your in-chat payment didn't go through. "
++    "Reply *recharge {amount}* to try again."
++)
+ 
+ 
+ # ─── Activation ──────────────────────────────────────────────────────────
+@@ -85,17 +93,33 @@ def _importer_address() -> Optional[Dict[str, str]]:
+     return address
+ 
+ 
+-def is_native_pay_active(phone: str) -> bool:
+-    """True only when the feature is on, fully configured and allowed for phone."""
++def native_pay_block_reason(phone: str) -> Optional[str]:
++    """None when native pay may be attempted for phone, else the gate that blocks it."""
+     if not settings.WHATSAPP_PAY_ENABLED:
+-        return False
++        return "gate1_disabled: WHATSAPP_PAY_ENABLED is false"
+     if not (settings.WHATSAPP_PAY_CONFIGURATION_NAME or "").strip():
+-        logger.warning("WhatsApp Pay enabled but WHATSAPP_PAY_CONFIGURATION_NAME is empty")
+-        return False
++        return "gate2_no_config_name: WHATSAPP_PAY_CONFIGURATION_NAME is empty"
+     if _importer_address() is None:
+-        logger.warning("WhatsApp Pay enabled but WHATSAPP_PAY_IMPORTER_* address is incomplete")
+-        return False
+-    return _allowlisted(phone)
++        return ("gate3_importer_incomplete: WHATSAPP_PAY_IMPORTER_ADDRESS_LINE1/CITY/"
++                "ZONE_CODE/POSTAL_CODE or COUNTRY_OF_ORIGIN is empty")
++    if not _allowlisted(phone):
++        return "gate4_not_allowlisted: number not in WHATSAPP_PAY_ALLOWLIST"
++    return None
++
++
++def is_native_pay_active(phone: str) -> bool:
++    """True only when the feature is on, fully configured and allowed for phone."""
++    return native_pay_block_reason(phone) is None
++
++
++def _log_native_skip(recipient_id: str, site: str, reason: str) -> None:
++    msg = f"WhatsApp Pay native skipped: site={site} recipient={recipient_id} reason={reason}"
++    # Gate 1 is the normal "feature off" state: INFO. Everything else means
++    # the feature is on but this prompt will not be native: WARNING.
++    if reason.startswith("gate1_"):
++        _plog.info(msg)
++    else:
++        _plog.warning(msg)
+ 
+ 
+ # ─── Outbound: order_details ─────────────────────────────────────────────
+@@ -188,19 +212,25 @@ async def try_send_native_recharge(
+     amount_rupees: int,
+     body_text: str,
+     reply_to_message_id: Optional[str] = None,
++    site: str = "unknown",
+ ) -> bool:
+     """Send a native WhatsApp Pay recharge order. Never raises.
+ 
+     Returns True only when Meta accepted the order_details message. False
+-    means "not active / no customer / rejected" and the caller must run its
+-    existing Razorpay-link code unchanged (silent fallback).
++    means "not active / no customer / rejected"; the caller then calls
++    send_payment_unavailable (strict mode) or its Razorpay-link code.
++    Every exit is logged with the gate / Meta error that caused it.
+     """
+     try:
+-        if not is_native_pay_active(recipient_id):
++        reason = native_pay_block_reason(recipient_id)
++        if reason:
++            _log_native_skip(recipient_id, site, reason)
+             return False
+         customer = find_customer_by_phone(db, recipient_id)
+         if customer is None:
+-            return False  # wallet row required for crediting; link path handles placeholders
++            # wallet row required for crediting; link path handles placeholders
++            _log_native_skip(recipient_id, site, "gate5_no_customer: no wallet row for this number")
++            return False
+         amount = max(int(amount_rupees), MIN_RECHARGE_RUPEES)
+         expiry = max(int(settings.WHATSAPP_PAY_ORDER_EXPIRY_SECONDS), 300)
+         expires_at = datetime.now(timezone.utc) + timedelta(seconds=expiry)
+@@ -219,20 +249,64 @@ async def try_send_native_recharge(
+         payload = build_order_details_payload(
+             recipient_id, customer.whatsapp_id, order.reference_id, amount, body_text, expires_at
+         )
+-        sent = await _post_message_payload(payload, "whatsapp pay order", reply_to_message_id=reply_to_message_id)
++        _plog.info(
++            f"WhatsApp Pay native attempt: site={site} recipient={recipient_id} "
++            f"ref={order.reference_id} amount_rupees={amount} config={order.configuration_name}")
++        meta_error: Dict[str, Any] = {}
++        sent = await _post_message_payload(
++            payload, "whatsapp pay order", reply_to_message_id=reply_to_message_id, error_out=meta_error,
++        )
+         order.status = "sent" if sent else "dispatch_failed"
+         if not sent:
+-            order.last_error = "order_details rejected by Meta (see log)"
++            if meta_error.get("timeout"):
++                order.last_error = "timeout: Meta may still have delivered the order"
++            else:
++                order.last_error = (
++                    f"meta status={meta_error.get('status')} code={meta_error.get('code')} "
++                    f"subcode={meta_error.get('subcode')}: {meta_error.get('message') or ''} "
++                    f"{meta_error.get('details') or ''}"
++                ).strip()[:500]
+         db.commit()
+-        if not sent:
+-            logger.warning(f"WhatsApp Pay dispatch failed for {recipient_id}; using Razorpay link fallback")
++        if sent:
++            logger.info(f"WhatsApp Pay native sent: site={site} ref={order.reference_id}")
++        else:
++            _plog.warning(
++                f"WhatsApp Pay native dispatch failed: site={site} recipient={recipient_id} "
++                f"ref={order.reference_id} code={meta_error.get('code')} subcode={meta_error.get('subcode')} "
++                f"message={meta_error.get('message')!r} details={meta_error.get('details')!r} "
++                f"timeout={bool(meta_error.get('timeout'))}")
+         return bool(sent)
+     except Exception as e:
+         db.rollback()
+-        logger.error(f"WhatsApp Pay dispatch error for {recipient_id}: {e}; using Razorpay link fallback")
++        logger.error(f"WhatsApp Pay dispatch error: site={site} recipient={recipient_id}: {e}")
+         return False
+ 
+ 
++async def send_payment_unavailable(
++    recipient_id: str,
++    site: str,
++    body_text: Optional[str] = None,
++    reply_to_message_id: Optional[str] = None,
++) -> bool:
++    """Strict-mode replacement for every Razorpay-link fallback. Never raises.
++
++    Returns False when WHATSAPP_PAY_STRICT is off (caller keeps its link
++    code). Returns True when strict mode handled the prompt: an in-chat
++    notice was sent (no URL) and an ALERT logged; the caller must stop.
++    """
++    if not settings.WHATSAPP_PAY_STRICT:
++        return False
++    _plog.error(
++        f"ALERT WhatsApp Pay strict: native recharge not sent, no link emitted: "
++        f"site={site} recipient={recipient_id}")
++    text = f"{body_text}\n\n{PAYMENT_UNAVAILABLE_MESSAGE}" if body_text else PAYMENT_UNAVAILABLE_MESSAGE
++    try:
++        await send_whatsapp_text(recipient_id, text, reply_to_message_id=reply_to_message_id)
++    except Exception as e:
++        logger.error(f"WhatsApp Pay strict notice failed for {recipient_id}: {e}")
++    return True
++
++
+ async def send_order_status(recipient_id: str, reference_id: str, status: str, description: str = "") -> bool:
+     order: Dict[str, Any] = {"status": status}
+     if description:
+@@ -437,6 +511,34 @@ async def reconcile_pending_orders(db: Session, older_than_seconds: int = 120, l
+     return results
+ 
+ 
++async def run_reconcile_sweep_forever() -> None:
++    """Background loop started from app lifespan: reconcile missed webhooks.
++
++    Safe to run in every worker: crediting is guarded by the money-once
++    audit claim (uq_audit_logs_money_once). Never raises except on cancel.
++    """
++    interval = int(settings.WHATSAPP_PAY_RECONCILE_INTERVAL_SECONDS or 0)
++    if interval <= 0:
++        logger.info("WhatsApp Pay reconcile sweep disabled (interval <= 0)")
++        return
++    interval = max(interval, 60)
++    from app.database import SessionLocal
++
++    while True:
++        await asyncio.sleep(interval)
++        if not settings.WHATSAPP_PAY_ENABLED:
++            continue
++        try:
++            with SessionLocal() as db:
++                results = await reconcile_pending_orders(db)
++            if results:
++                logger.info(f"WhatsApp Pay reconcile sweep: {results}")
++        except asyncio.CancelledError:
++            raise
++        except Exception as e:
++            logger.error(f"WhatsApp Pay reconcile sweep failed: {e}")
++
++
+ # ─── Customer messages ───────────────────────────────────────────────────
+ 
+ 
+@@ -491,9 +593,23 @@ async def _send_receipt(db: Session, order: WhatsAppPaymentOrder) -> None:
+ 
+ 
+ async def _send_fallback_link_once(db: Session, order: WhatsAppPaymentOrder) -> None:
+-    """After a failed in-chat payment, offer the Razorpay link once."""
++    """After a failed in-chat payment, offer the Razorpay link once.
++
++    Strict mode: no link; an in-chat "reply recharge N to retry" text instead.
++    """
+     if order.fallback_sent:
+         return
++    if settings.WHATSAPP_PAY_STRICT:
++        try:
++            if await send_whatsapp_text(
++                order.whatsapp_id, ORDER_FAILED_STRICT_MESSAGE.format(amount=order.amount_rupees)
++            ):
++                order.fallback_sent = True
++                db.commit()
++        except Exception as e:
++            db.rollback()
++            logger.error(f"WhatsApp Pay strict retry notice failed for {order.reference_id}: {e}")
++        return
+     try:
+         from app.services.meta_whatsapp_service import send_whatsapp_cta_url_button
+         from app.services.razorpay_service import create_recharge_payment_link
+diff --git a/backend/tests/test_whatsapp_pay.py b/backend/tests/test_whatsapp_pay.py
+index ecabd7e..b93ae46 100644
+--- a/backend/tests/test_whatsapp_pay.py
++++ b/backend/tests/test_whatsapp_pay.py
+@@ -268,3 +268,105 @@ class WhatsAppPayTests(FundedSlotGateTestCase):
+         self.assertEqual(kwargs["customer_snapshot"]["gst_number"], "24AAAPS1234C1Z5")
+         self.assertEqual(self.pay_text.await_count, 1)  # receipt text still sent inline
+ 
++
++
++class WhatsAppPayStrictModeTests(WhatsAppPayTests):
++    """WHATSAPP_PAY_STRICT: no Razorpay link / URL button ever; gate logging."""
++
++    def _strict(self, **overrides):
++        self._enable(**overrides)
++        p = patch.object(settings, "WHATSAPP_PAY_STRICT", True)
++        p.start()
++        self.addCleanup(p.stop)
++
++    def _assert_unavailable_no_link(self):
++        self.cta.assert_not_awaited()
++        self.link.assert_not_awaited()
++        texts = [c.args[1] for c in self.pay_text.await_args_list]
++        self.assertTrue(any(pay.PAYMENT_UNAVAILABLE_MESSAGE in t for t in texts), texts)
++        self.assertFalse(any("http" in t for t in texts), texts)
++
++    def test_strict_meta_rejection_sends_in_chat_notice_not_link(self):
++        self._strict()
++        _make_customer(self.session, balance=0)
++        self.post.return_value = False
++        self._post(self._recharge_text())
++        self.assertEqual(self._order().status, "dispatch_failed")
++        self._assert_unavailable_no_link()
++
++    def test_strict_with_feature_disabled_never_sends_link(self):
++        self._strict(WHATSAPP_PAY_ENABLED=False)
++        _make_customer(self.session, balance=0)
++        self._post(self._recharge_text())
++        self.post.assert_not_awaited()
++        self._assert_unavailable_no_link()
++
++    def test_strict_unfunded_photo_never_sends_static_link(self):
++        from tests.test_wallet_funded_slot_gate import _image_payload
++        self._strict()
++        _make_customer(self.session, balance=0)
++        self.post.return_value = False
++        self._post(_image_payload(1))
++        self.assertEqual(self.sent_texts, [])
++        self._assert_unavailable_no_link()
++
++    def test_strict_failed_payment_offers_in_chat_retry_not_link(self):
++        self._strict()
++        o = self._sent_order()
++        self.cta.reset_mock()
++        self.pay_text.reset_mock()
++        for _ in range(2):
++            self._post(_payment_webhook(o.reference_id, status="pending", tx_status="failed"))
++        self.assertTrue(self._order().fallback_sent)
++        self.cta.assert_not_awaited()
++        self.assertEqual(self.pay_text.await_count, 1)
++        self.assertIn("recharge 500", self.pay_text.await_args.args[1])
++
++    def test_unfunded_photo_from_unknown_sender_gets_wallet_row_and_native_order(self):
++        from app.models.customer import Customer
++        from tests.test_wallet_funded_slot_gate import _image_payload
++        self._enable()
++        self._post(_image_payload(1))
++        self.assertEqual(self.post.await_count, 1)
++        cust = self.session.query(Customer).one()
++        self.assertEqual((cust.is_registered, cust.wallet_balance), (False, 0))
++        self.assertEqual(self._order().status, "sent")
++
++    def test_unknown_sender_gets_no_wallet_row_when_native_inactive(self):
++        from app.models.customer import Customer
++        from tests.test_wallet_funded_slot_gate import _image_payload
++        self._post(_image_payload(1))
++        self.post.assert_not_awaited()
++        self.assertEqual(self.session.query(Customer).count(), 0)
++
++    def test_gate_reasons(self):
++        self.assertTrue(pay.native_pay_block_reason(SENDER).startswith("gate1_"))
++        self._enable(WHATSAPP_PAY_CONFIGURATION_NAME="")
++        self.assertTrue(pay.native_pay_block_reason(SENDER).startswith("gate2_"))
++        with patch.object(settings, "WHATSAPP_PAY_CONFIGURATION_NAME", "cfg"), \
++             patch.object(settings, "WHATSAPP_PAY_IMPORTER_CITY", ""):
++            self.assertTrue(pay.native_pay_block_reason(SENDER).startswith("gate3_"))
++        with patch.object(settings, "WHATSAPP_PAY_CONFIGURATION_NAME", "cfg"), \
++             patch.object(settings, "WHATSAPP_PAY_ALLOWLIST", "919999999999"):
++            self.assertTrue(pay.native_pay_block_reason(SENDER).startswith("gate4_"))
++        with patch.object(settings, "WHATSAPP_PAY_CONFIGURATION_NAME", "cfg"):
++            self.assertIsNone(pay.native_pay_block_reason(SENDER))
++
++    def test_meta_error_details_parsed(self):
++        class _Resp:
++            status_code = 400
++            text = "{}"
++            def json(self):
++                return {"error": {"message": "(#131009) Parameter value is not valid", "type": "OAuthException",
++                                  "code": 131009, "error_subcode": 2494010,
++                                  "error_data": {"details": "payment configuration not found"},
++                                  "fbtrace_id": "Axyz"}}
++        err = mws._meta_error_details(_Resp())
++        self.assertEqual((err["status"], err["code"], err["subcode"]), (400, 131009, 2494010))
++        self.assertEqual(err["details"], "payment configuration not found")
++
++
++# Do not re-run every inherited WhatsAppPayTests test under the strict class.
++for _name in [n for n in dir(WhatsAppPayTests) if n.startswith("test_")]:
++    if _name not in WhatsAppPayStrictModeTests.__dict__:
++        setattr(WhatsAppPayStrictModeTests, _name, None)

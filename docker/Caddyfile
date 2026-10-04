@@ -1,0 +1,12 @@
+# HTTPS reverse proxy. Only the two provider webhooks are served to the internet: the application's own public-host
+# guard returns 404 for everything else when a request arrives through this proxy, and this file also limits the body
+# size at the door (SEC-8).
+{$PUBLIC_HOSTNAME} {
+	encode gzip
+	request_body {
+		max_size 12MB
+	}
+	reverse_proxy api:8000 {
+		header_up X-Forwarded-For {remote_host}
+	}
+}

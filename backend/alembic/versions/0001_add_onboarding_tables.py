@@ -80,16 +80,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Drop ONLY the additive onboarding tables (never existing tables)."""
-    existing = _table_names()
+    """Deliberate no-op: these tables hold customer records and wallet balances.
 
-    if "onboarding_sessions" in existing:
-        op.drop_index(
-            "ix_onboarding_sessions_whatsapp_id",
-            table_name="onboarding_sessions",
-        )
-        op.drop_table("onboarding_sessions")
-
-    if "customers" in existing:
-        op.drop_index("ix_customers_whatsapp_id", table_name="customers")
-        op.drop_table("customers")
+    ``alembic downgrade base`` used to drop ``customers`` (every customer and their money) and
+    ``onboarding_sessions``. That is unrecoverable data loss, so rolling back past this revision now
+    keeps both tables. ``upgrade`` only creates what is missing, so a later re-upgrade is lossless.
+    """

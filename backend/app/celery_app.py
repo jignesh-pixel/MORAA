@@ -51,24 +51,25 @@ celery_app.conf.update(
     # Retry policy for broker connection
     broker_connection_retry_on_startup=True,
     broker_connection_max_retries=10,
+    # Time limits (Q-4): a hung AI call can never keep a worker forever. The soft limit raises inside the task
+    # first (so it can record the failure); the hard limit then kills it.
+    task_soft_time_limit=settings.CELERY_TASK_SOFT_TIME_LIMIT_SECONDS,
+    task_time_limit=settings.CELERY_TASK_TIME_LIMIT_SECONDS,
 )
 
 
 @worker_ready.connect
 def on_worker_ready(**kwargs):
     """Log when the Celery worker starts."""
-    logger.info(
-        f"Celery worker ready — queue: {settings.CELERY_ANALYSIS_QUEUE}, "
+    logger.bind(category="system").info(f"Celery worker ready — queue: {settings.CELERY_ANALYSIS_QUEUE}, "
         f"concurrency: {settings.CELERY_WORKER_CONCURRENCY}, "
-        f"broker: {settings.CELERY_BROKER_URL}",
-        extra={"category": "system"},
-    )
+        f"broker: {settings.CELERY_BROKER_URL}")
 
 
 @worker_shutdown.connect
 def on_worker_shutdown(**kwargs):
     """Log when the Celery worker shuts down."""
-    logger.info("Celery worker shutting down", extra={"category": "system"})
+    logger.bind(category="system").info("Celery worker shutting down")
 
 
 # Import tasks so they are registered with the Celery app

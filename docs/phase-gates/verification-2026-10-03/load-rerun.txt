@@ -1,0 +1,45 @@
+== phase-3-gate-passed-except-timing
+[a] PASS in 0.8s
+[b] PASS in 0.8s
+[c] PASS in 16.0s
+[d] PASS in 1.9s
+[e] PASS in 12.7s
+[f] PASS in 1.8s
+[g] PASS in 9.6s
+[h] PASS in 14.0s
+[k] PASS
+[i] PASS
+== phase-4-gate-passed-except-timing
+[a] PASS in 0.9s
+[b] PASS in 0.9s
+[c] PASS in 15.7s
+[d] PASS in 1.8s
+[e] PASS in 11.8s
+[f] PASS in 2.0s
+[g] PASS in 11.2s
+[h] FAIL in 14.0s
+[k] PASS
+[i] PASS
+== phase-5-gate-passed-except-timing
+[a] PASS in 0.9s
+[b] PASS in 0.8s
+[c] PASS in 15.7s
+[d] PASS in 1.7s
+[e] PASS in 11.8s
+[f] PASS in 1.8s
+[g] PASS in 11.3s
+[h] PASS in 13.9s
+[k] PASS
+[i] FAIL
+== phase-6-gate-passed-except-timing
+[a] PASS in 0.9s
+[b] PASS in 1.0s
+[c] PASS in 18.5s
+[d] PASS in 2.4s
+[e] PASS in 19.3s
+[f] PASS in 1.8s
+[g] PASS in 12.6s
+[h] FAIL in 13.9s
+[k] PASS
+[i] PASS
+LOAD RERUN DONE

@@ -9,6 +9,7 @@ from app.database import get_db
 from app.schemas.image import UploadResponse
 from app.services.upload_service import UploadService
 from app.utils.logger import logger
+from app.utils.upload_limits import read_capped
 
 router = APIRouter(prefix="/api", tags=["Upload"])
 
@@ -38,7 +39,10 @@ async def upload_image(
     service = UploadService(db)
 
     # Read file data
-    file_data = await file.read()
+    try:
+        file_data = await read_capped(file)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     file_size = len(file_data)
     filename = file.filename or "untitled"
     mime_type = file.content_type or "image/jpeg"

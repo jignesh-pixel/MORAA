@@ -18,8 +18,20 @@ from app.models.whatsapp_ingestion import WhatsAppIngestion
 from app.models.customer import Customer
 from app.models.onboarding_session import OnboardingSession
 from app.models.whatsapp_payment_order import WhatsAppPaymentOrder
+from app.models.wallet_transaction import WalletTransaction
+from app.models.processed_message import ProcessedMessage
+from app.models.pending_payment import PendingPayment
+from app.models.razorpay_payment_link import RazorpayPaymentLink
+from app.models.generation_spend import GenerationSpend
+from app.models.revoked_token import RevokedToken
+from app.models.outbox_job import OutboxJob
+from app.models.scheduler_lease import SchedulerLease
+from app.models.consent_record import ConsentRecord
+from app.models.provider_call import ProviderCall
+from app.models.chat_log import ChatMessage, InvoiceRecord, OrderOutput  # noqa: F401
 
 __all__ = [
+    "WalletTransaction",
     "User",
     "Image",
     "Analysis",

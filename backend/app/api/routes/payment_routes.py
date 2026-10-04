@@ -6,9 +6,11 @@ Handles both standard payment links and Razorpay Payment Pages.
 import hashlib
 import hmac
 import json
+import time
 from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -22,16 +24,48 @@ from app.services.meta_whatsapp_service import (
     send_document_to_whatsapp,
     send_whatsapp_text,
 )
-from app.services.wallet_service import credit_wallet, find_customer_by_phone, get_balance
-from app.utils.logger import logger
-
+from app.models.whatsapp_payment_order import WhatsAppPaymentOrder
+from app.models.wallet_transaction import KIND_CREDIT_PAYMENT, KIND_DEBIT_DISPUTE, KIND_DEBIT_REFUND
+from app.services.pending_payment_service import mark_pending_credited, record_pending_payment
+from app.services.wallet_service import (
+    CLAWBACK_OUTCOME_DUPLICATE,
+    CLAWBACK_OUTCOME_NO_PAYMENT,
+    claw_back_payment,
+    credit_wallet,
+    find_customer_by_phone,
+    get_balance,
+    record_ledger,
+)
+from app.utils.executors import run_io
+from app.utils.logger import logger, mask_phone
+from app.utils.phone import is_plausible_phone, normalize_phone
 router = APIRouter(prefix="/api/payments", tags=["Payments"])
 
 SIGNATURE_HEADER = "X-Razorpay-Signature"
 PAISE_PER_RUPEE = 100
 
 AUDIT_ACTION_PAYMENT_CAPTURED = "razorpay_payment_captured"
+# Captured payment the webhook could not match to any payer (no phone).
+AUDIT_ACTION_PAYMENT_UNMATCHED = "razorpay_payment_unmatched"
+# One row per transient credit failure (each answered 503 so Razorpay retries).
+AUDIT_ACTION_PAYMENT_CREDIT_FAILED = "razorpay_payment_credit_failed"
+# After this many failed credit attempts for one payment, stop asking Razorpay
+# to retry (it would eventually disable the webhook) and leave the pending rows
+# plus an ALERT for a manual credit.
+MAX_CREDIT_ATTEMPTS = 8
 AUDIT_RESOURCE_TYPE = "razorpay_payment"
+# A payment, refund or dispute that needs a person's attention (wrong currency, unknown payment, dispute opened).
+AUDIT_ACTION_PAYMENT_REVIEW = "razorpay_payment_review"
+
+# WhatsApp Pay order states in which the WhatsApp Pay path credits (its sweep re-checks "sent" and "pending"
+# orders) or already credited the money. "created" / "dispatch_failed" orders are never swept, so they are not here.
+WHATSAPP_PAY_ACTIVE_STATES = frozenset({"sent", "pending", "captured"})
+
+# A refund that finished, or a dispute that was lost, takes the money back out of the wallet.
+MONEY_BACK_EVENTS = ("refund.processed", "payment.dispute.lost")
+EVENT_DISPUTE_CREATED = "payment.dispute.created"
+# A refund whose payment we have not credited yet is retried by Razorpay for this long, then left for review.
+NO_PAYMENT_RETRY_WINDOW_SECONDS = 6 * 3600
 
 PAYMENT_TIPS_MESSAGE = (
     "Payment Received 💳\n\n"
@@ -45,7 +79,9 @@ PAYMENT_TIPS_MESSAGE = (
 def verify_razorpay_signature(raw_body: bytes, signature_header: Optional[str]) -> bool:
     secret = (settings.RAZORPAY_WEBHOOK_SECRET or "").strip()
     if not secret:
-        return True
+        # Fail closed: nothing can be verified without the secret. The route
+        # decides separately whether the dev-only unsigned mode applies.
+        return False
     if not signature_header:
         return False
 
@@ -55,7 +91,7 @@ def verify_razorpay_signature(raw_body: bytes, signature_header: Optional[str]) 
         hashlib.sha256,
     ).hexdigest()
 
-    return hmac.compare_digest(computed, signature_header.strip())
+    return hmac.compare_digest(computed.encode("ascii"), signature_header.strip().encode("utf-8"))
 
 
 def _nested_get(payload: Dict[str, Any], *path: str) -> Any:
@@ -179,11 +215,182 @@ def extract_payment_data(payload: Dict[str, Any]) -> Optional[Tuple[str, int, st
         return None
 
 
+def extract_currency(payload: Dict[str, Any]) -> str:
+    """Upper-cased currency code of the payment in a payment event ("" when absent)."""
+    for path in (("payload", "payment", "entity"), ("payload", "payment_link", "entity")):
+        entity = _nested_get(payload, *path)
+        if isinstance(entity, dict):
+            code = entity.get("currency")
+            if isinstance(code, str) and code.strip():
+                return code.strip().upper()
+    return ""
+
+
+def _record_payment_review(db: Session, resource_id: str, reason: str, details: Dict[str, Any]) -> None:
+    """Leave a durable "a person must look at this" row (once per ``resource_id`` and reason). Never raises."""
+    try:
+        if _review_reason_exists(db, resource_id, reason):
+            return
+        db.add(
+            AuditLog(
+                user_id=None,
+                action=AUDIT_ACTION_PAYMENT_REVIEW,
+                resource_id=resource_id,
+                resource_type=AUDIT_RESOURCE_TYPE,
+                status="pending",
+                details=json.dumps({"reason": reason, **details}),
+            )
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Could not record payment review row for {resource_id}: {e}")
+
+
+def _review_reason_exists(db: Session, resource_id: str, reason: str) -> bool:
+    rows = (
+        db.query(AuditLog.details)
+        .filter(AuditLog.action == AUDIT_ACTION_PAYMENT_REVIEW, AuditLog.resource_id == resource_id)
+        .all()
+    )
+    return any(f'"reason": "{reason}"' in (row[0] or "") for row in rows)
+
+
+def _is_recent(created_at: Any) -> bool:
+    """True when a Razorpay epoch timestamp is under NO_PAYMENT_RETRY_WINDOW_SECONDS old (or missing/invalid)."""
+    try:
+        age = time.time() - float(created_at)
+    except (TypeError, ValueError):
+        return True
+    return age < NO_PAYMENT_RETRY_WINDOW_SECONDS
+
+
+def _handle_money_back_event(db: Session, payload: Dict[str, Any], event: str) -> Dict[str, str]:
+    """Refund processed / dispute lost: take the money back out of the wallet. Dispute opened: flag it."""
+    is_refund = event.startswith("refund.")
+    entity = _nested_get(payload, "payload", "refund" if is_refund else "dispute", "entity")
+    if not isinstance(entity, dict):
+        return {"status": "unparseable"}
+    entity_id = _as_id(entity.get("id"))
+    payment_id = _as_id(entity.get("payment_id"))
+    try:
+        amount_paise = int(entity.get("amount"))
+    except (TypeError, ValueError):
+        amount_paise = 0
+    if not entity_id or not payment_id or amount_paise <= 0:
+        logger.warning(f"Razorpay {event} payload is missing id, payment id or amount")
+        return {"status": "unparseable"}
+    amount = _paise_to_rupees(amount_paise)
+    if amount == 0:
+        logger.warning(f"Razorpay {event} {entity_id}: {amount_paise} paise is under half a rupee; wallet not changed.")
+        return {"status": "ignored_sub_rupee"}
+
+    currency = str(entity.get("currency") or "").strip().upper()
+    # A refund/dispute record that omits its currency is judged by the original payment, which the
+    # credit path already verified as INR; one that names another currency is never applied.
+    if currency and currency != "INR":
+        logger.error(f"ALERT Razorpay {event} {entity_id}: currency '{currency}' is not INR; not applied.")
+        _record_payment_review(db, entity_id, "currency_not_inr", {"event": event, "payment_id": payment_id})
+        return {"status": "unsupported_currency"}
+
+    if event == EVENT_DISPUTE_CREATED:
+        # Razorpay only holds the money while a dispute is open; it is taken back if the dispute is lost.
+        logger.error(
+            f"ALERT Razorpay dispute {entity_id} opened on payment {payment_id} (₹{amount}). "
+            "The wallet is not changed unless the dispute is lost; respond to it in the Razorpay dashboard."
+        )
+        _record_payment_review(db, entity_id, "dispute_opened", {"payment_id": payment_id, "amount": amount})
+        return {"status": "dispute_flagged"}
+
+    kind = KIND_DEBIT_REFUND if is_refund else KIND_DEBIT_DISPUTE
+    try:
+        result = claw_back_payment(db, payment_id=payment_id, entity_id=entity_id, amount=amount, kind=kind)
+    except Exception as e:
+        logger.error(f"Razorpay {event} {entity_id}: claw-back failed, asking Razorpay to retry: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not apply the refund yet, retry later",
+        )
+    if result["outcome"] == CLAWBACK_OUTCOME_NO_PAYMENT:
+        logger.error(
+            f"ALERT Razorpay {event} {entity_id} refers to payment {payment_id}, which this system never credited. "
+            "Nothing was taken from any wallet; review it."
+        )
+        _record_payment_review(db, entity_id, "no_matching_credit", {"event": event, "payment_id": payment_id, "amount": amount})
+        if _is_recent(entity.get("created_at")):
+            # The payment event may simply not have been credited yet (still in flight, or waiting for
+            # Razorpay's own retry). Answer 503 so Razorpay delivers this refund again later; answering
+            # 200 would drop it for good and the customer would keep the refunded money.
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Payment not credited yet, retry later",
+            )
+        return {"status": "no_matching_credit"}
+    if result["outcome"] == CLAWBACK_OUTCOME_DUPLICATE:
+        return {"status": "already_processed"}
+    if not is_refund:
+        # The "dispute opened" flag is closed now that the dispute has been decided.
+        try:
+            db.query(AuditLog).filter(
+                AuditLog.action == AUDIT_ACTION_PAYMENT_REVIEW,
+                AuditLog.resource_id == entity_id,
+                AuditLog.status == "pending",
+                AuditLog.details.contains('"dispute_opened"'),
+            ).update({AuditLog.status: "resolved"}, synchronize_session=False)
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.warning(f"Could not close the dispute flag for {entity_id}: {e}")
+    return {"status": "clawed_back" if not result["shortfall"] else "clawed_back_partial"}
+
+
+def _whatsapp_pay_will_credit() -> bool:
+    """True while the WhatsApp Pay path (and its reconcile sweep) is on, so it can credit its own payments."""
+    return bool(settings.WHATSAPP_PAY_ENABLED) and int(settings.WHATSAPP_PAY_RECONCILE_INTERVAL_SECONDS or 0) > 0
+
+
+def _whatsapp_pay_order_state(db: Session, payment_id: str, payload: Dict[str, Any]) -> Optional[str]:
+    """Status of the WhatsApp Pay order this Razorpay payment belongs to (None = not a WhatsApp Pay payment).
+
+    Matched exactly, by the Razorpay payment id or order id recorded on the order. Never raises.
+    """
+    try:
+        order_id = _as_id(_nested_get(payload, "payload", "payment", "entity", "order_id"))
+        match = WhatsAppPaymentOrder.pg_payment_id == payment_id
+        if order_id:
+            match = or_(match, WhatsAppPaymentOrder.pg_order_id == order_id)
+        row = db.query(WhatsAppPaymentOrder.status, WhatsAppPaymentOrder.credited).filter(match).first()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"WhatsApp Pay order lookup failed for payment {payment_id}: {e}")
+        return None
+    if row is None:
+        return None
+    return "captured" if row[1] else (row[0] or "created")
+
+
 def _resolve_customer(db: Session, sender_id: str) -> Optional[Customer]:
     if not sender_id:
         return None
 
     return find_customer_by_phone(db, sender_id)
+
+
+async def _queue_invoice(background_tasks: BackgroundTasks, args: Dict[str, Any]) -> None:
+    """Send the invoice through the durable outbox (retried, survives a restart); plain background task if the outbox
+    is off or the database could not record it."""
+    if settings.OUTBOX_ENABLED:
+        from app.services import outbox
+
+        payload = {k: args[k] for k in ("recipient_id", "payment_id", "amount", "customer_name", "customer_snapshot")}
+        outcome = await run_io(outbox.enqueue_status, "payment_invoice", payload, f"inv:{args['payment_id']}")
+        if outcome == outbox.QUEUED:
+            outbox.ensure_default_handlers()
+            background_tasks.add_task(outbox.drain_once)
+            return
+        if outcome == outbox.DUPLICATE:
+            return                                # this payment's invoice is already queued or sent
+    background_tasks.add_task(dispatch_payment_invoice, **args)
 
 
 def _already_processed(db: Session, payment_reference: str) -> bool:
@@ -203,6 +410,107 @@ def _already_processed(db: Session, payment_reference: str) -> bool:
         logger.error(f"Audit lookup error: {e}")
         db.rollback()
         return False
+
+
+def _record_unmatched_payment(
+    db: Session, payment_reference: str, amount_paid: int, event: str
+) -> None:
+    """Keep a durable record of a captured payment with no payer phone.
+
+    Retrying cannot add a phone to the payload, so the webhook still answers
+    200 (Razorpay disables a webhook that keeps failing for 24 hours). This
+    pending audit row plus the ALERT log line let an operator find the
+    payment and credit the payer by hand. Recorded once per payment. Never
+    raises.
+    """
+    logger.error(
+        f"ALERT Razorpay payment {payment_reference} (₹{amount_paid}, event={event}) "
+        "has no payer phone and was NOT credited. If another event for this payment "
+        "credits it, the audit row is marked resolved; otherwise identify the payer "
+        "and credit manually."
+    )
+    try:
+        exists = (
+            db.query(AuditLog.id)
+            .filter(
+                AuditLog.action == AUDIT_ACTION_PAYMENT_UNMATCHED,
+                AuditLog.resource_id == payment_reference,
+            )
+            .first()
+        )
+        if exists:
+            return
+        db.add(
+            AuditLog(
+                user_id=None,
+                action=AUDIT_ACTION_PAYMENT_UNMATCHED,
+                resource_id=payment_reference,
+                resource_type=AUDIT_RESOURCE_TYPE,
+                status="pending",
+                details=json.dumps(
+                    {"amount_paid": amount_paid, "currency": "INR", "event": event}
+                ),
+            )
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Could not record unmatched payment {payment_reference}: {e}")
+
+
+def _record_credit_failure(
+    db: Session, payment_reference: str, amount_paid: int, reason: str
+) -> int:
+    """Record one failed credit attempt; return how many have been recorded.
+
+    Written in its own transaction after the failed one was rolled back, so
+    the money claim stays free for Razorpay's retry. Never raises (returns 0
+    when even the record cannot be written, so the caller keeps retrying).
+    """
+    try:
+        db.add(
+            AuditLog(
+                user_id=None,
+                action=AUDIT_ACTION_PAYMENT_CREDIT_FAILED,
+                resource_id=payment_reference,
+                resource_type=AUDIT_RESOURCE_TYPE,
+                status="pending",
+                details=json.dumps(
+                    {"amount_paid": amount_paid, "currency": "INR", "reason": reason[:300]}
+                ),
+            )
+        )
+        db.commit()
+        return (
+            db.query(AuditLog.id)
+            .filter(
+                AuditLog.action == AUDIT_ACTION_PAYMENT_CREDIT_FAILED,
+                AuditLog.resource_id == payment_reference,
+            )
+            .count()
+        )
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Could not record credit failure for {payment_reference}: {e}")
+        return 0
+
+
+def _retry_or_give_up(
+    db: Session, payment_reference: str, amount_paid: int, reason: str
+) -> Dict[str, str]:
+    """Answer 503 so Razorpay retries, until MAX_CREDIT_ATTEMPTS is reached."""
+    attempts = _record_credit_failure(db, payment_reference, amount_paid, reason)
+    if attempts >= MAX_CREDIT_ATTEMPTS:
+        logger.error(
+            f"ALERT Razorpay payment {payment_reference} (₹{amount_paid}) failed to credit "
+            f"{attempts} times ({reason}); NOT credited and no longer retried. "
+            "Credit manually after fixing the cause."
+        )
+        return {"status": "credit_failed"}
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Payment not credited yet, retry later",
+    )
 
 
 def _payment_audit_row(
@@ -250,8 +558,11 @@ async def razorpay_webhook(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid Razorpay webhook signature",
             )
-    elif not settings.DEBUG:
-        logger.error("Razorpay webhook rejected: RAZORPAY_WEBHOOK_SECRET not configured and DEBUG is False.")
+    elif not settings.ALLOW_UNSIGNED_WEBHOOKS:
+        logger.error(
+            "Razorpay webhook rejected: RAZORPAY_WEBHOOK_SECRET not configured "
+            "and ALLOW_UNSIGNED_WEBHOOKS is off."
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Webhook not configured",
@@ -273,8 +584,22 @@ async def razorpay_webhook(
             detail="Invalid JSON payload",
         )
 
+    return await process_razorpay_event(db, payload, background_tasks)
+
+
+async def process_razorpay_event(
+    db: Session, payload: Dict[str, Any], background_tasks: BackgroundTasks
+) -> Dict[str, str]:
+    """Apply one (already verified) Razorpay event: credit a payment, take back a refund, or flag it.
+
+    The webhook calls this after checking the signature; the payment-link reconcile sweep calls it with an
+    event rebuilt from Razorpay's own answer. Both therefore credit through exactly the same once-only claim.
+    """
     event = payload.get("event", "")
     logger.info(f"Received Razorpay webhook event: '{event}'")
+
+    if event in MONEY_BACK_EVENTS or event == EVENT_DISPUTE_CREATED:
+        return _handle_money_back_event(db, payload, event)
 
     if event not in ("payment_link.paid", "payment.captured", "order.paid"):
         return {"status": "ignored", "event": event}
@@ -285,16 +610,56 @@ async def razorpay_webhook(
         return {"status": "unparseable"}
 
     sender_id, amount_paid, payment_reference = extracted
-    if not sender_id:
-        logger.warning(f"Payment {payment_reference} processed but sender phone number not found.")
+    currency = extract_currency(payload)
+    if currency != "INR":
+        # The wallet is in rupees: a payment in any other (or no) currency is never credited as rupees.
+        logger.error(
+            f"ALERT Razorpay payment {payment_reference}: currency '{currency or 'missing'}' is not INR; "
+            "NOT credited. Review it in the Razorpay dashboard."
+        )
+        _record_payment_review(db, payment_reference, "currency_not_inr", {"currency": currency, "event": event})
+        return {"status": "unsupported_currency"}
+    wa_pay_state = _whatsapp_pay_order_state(db, payment_reference, payload)
+    if wa_pay_state is not None and (wa_pay_state == "captured" or _whatsapp_pay_will_credit()):
+        # This payment belongs to a WhatsApp Pay order: that path credits the amount that was ORDERED,
+        # once Meta confirms it (its sweep re-checks "sent"/"pending" orders). Crediting it here too would use
+        # a different amount for the same money. When that path is off, or the order is in a state it will
+        # not credit, this path credits (or parks) the payment itself, so the payer is never left unpaid.
+        if wa_pay_state in WHATSAPP_PAY_ACTIVE_STATES:
+            logger.info(f"Payment {payment_reference} belongs to a WhatsApp Pay order; left to that path.")
+            return {"status": "whatsapp_pay_order"}
+        if _already_processed(db, payment_reference):
+            return {"status": "already_processed"}
+        logger.error(
+            f"ALERT Razorpay payment {payment_reference} belongs to a WhatsApp Pay order in state '{wa_pay_state}' "
+            "that will not be credited; parked for manual review."
+        )
+        record_pending_payment(
+            db, payment_id=payment_reference, amount_rupees=amount_paid, currency=currency, event=event,
+            payer_hint=sender_id, reason="whatsapp_pay_not_credited",
+        )
+        return {"status": "whatsapp_pay_order_review"}
+    if not sender_id or not is_plausible_phone(sender_id):
+        # Razorpay sends several events per payment; another event that did
+        # carry the phone may already have credited it.
+        if _already_processed(db, payment_reference):
+            return {"status": "already_processed"}
+        # No phone, or only a Razorpay id like "cust_...": never credit a wallet nobody can use.
+        _record_unmatched_payment(db, payment_reference, amount_paid, event)
+        record_pending_payment(
+            db, payment_id=payment_reference, amount_rupees=amount_paid, currency=currency, event=event,
+            payer_hint=sender_id, reason="missing_phone" if not sender_id else "not_a_phone_number",
+        )
         return {"status": "missing_phone"}
 
     if _already_processed(db, payment_reference):
         logger.info(f"Payment {payment_reference} already processed, skipping duplicate (event={event}, no credit).")
         return {"status": "already_processed"}
 
-    clean_sender = sender_id.lstrip("+").strip()
-    customer = _resolve_customer(db, sender_id)
+    # Digits only: spaces/hyphens/brackets in the payer's number must not
+    # create a second wallet row for the same phone.
+    clean_sender = normalize_phone(sender_id)
+    customer = _resolve_customer(db, clean_sender)
     customer_name = "Valued Customer"
 
     customer_was_created = customer is None
@@ -326,26 +691,47 @@ async def razorpay_webhook(
         )
         db.add(customer)
     try:
-        if not customer_was_created:
-            if credit_wallet(db, customer.whatsapp_id, amount_paid, commit=False) != 1:
+        if customer_was_created:
+            db.flush()      # assigns customer.id; a concurrent first payment conflicts here (IntegrityError)
+            record_ledger(db, customer_id=customer.id, kind=KIND_CREDIT_PAYMENT, amount=amount_paid, ref=payment_reference)
+        else:
+            if credit_wallet(db, customer.whatsapp_id, amount_paid, commit=False, ref=payment_reference) != 1:
                 raise RuntimeError("customer row not updated")
             if getattr(customer, "full_name", None):
                 customer_name = customer.full_name
+        # Close any earlier "not credited" alerts for this payment in the same
+        # transaction, so nobody credits it a second time by hand.
+        mark_pending_credited(db, payment_reference, clean_sender)
+        db.query(AuditLog).filter(
+            AuditLog.action.in_((AUDIT_ACTION_PAYMENT_UNMATCHED, AUDIT_ACTION_PAYMENT_CREDIT_FAILED)),
+            AuditLog.resource_id == payment_reference,
+            AuditLog.status == "pending",
+        ).update({AuditLog.status: "resolved"}, synchronize_session=False)
         db.commit()
-    except IntegrityError:
+    except IntegrityError as integrity_error:
         db.rollback()
+        logger.warning(f"Payment {payment_reference}: integrity error: {getattr(integrity_error, 'orig', integrity_error)}")
         if _already_processed(db, payment_reference):
             logger.info(f"Payment {payment_reference} already processed concurrently, skipping duplicate.")
             return {"status": "already_processed"}
-        logger.error(f"Payment webhook: customer provisioning conflict for {clean_sender}")
-        return {"status": "error", "message": "Customer provisioning failed"}
+        # Usually a concurrent first payment created the same customer row.
+        # The claim was rolled back too, so Razorpay's retry credits normally
+        # (and then finds the existing customer). A 200 here lost the money.
+        logger.error(
+            f"Payment webhook: customer provisioning conflict for {mask_phone(clean_sender)}; "
+            f"payment {payment_reference} not credited yet, asking Razorpay to retry."
+        )
+        return _retry_or_give_up(db, payment_reference, amount_paid, "customer provisioning conflict")
     except Exception as e:
         db.rollback()
-        logger.error(f"Payment webhook: wallet credit failed for {clean_sender}: {e}")
-        return {"status": "error", "message": "Wallet credit failed"}
+        logger.error(
+            f"Payment webhook: wallet credit failed for {mask_phone(clean_sender)}: {e}; "
+            f"payment {payment_reference} not credited yet, asking Razorpay to retry."
+        )
+        return _retry_or_give_up(db, payment_reference, amount_paid, f"wallet credit failed: {e}")
 
     logger.info(
-        f"Wallet credited ₹{amount_paid} for {clean_sender}: event={event} "
+        f"Wallet credited ₹{amount_paid} for {mask_phone(clean_sender)}: event={event} "
         f"payment_id={payment_reference} balance_after={get_balance(db, customer.whatsapp_id)}. "
         "Now sending WhatsApp confirmation."
     )
@@ -365,8 +751,7 @@ async def razorpay_webhook(
         # 2. PDF Invoice Dispatch -- in the background after the response:
         # ERPNext Sales Invoice PDF when ERPNEXT_INVOICE_ENABLED, otherwise
         # (or on any ERPNext failure) the same local ReportLab receipt.
-        background_tasks.add_task(
-            dispatch_payment_invoice,
+        invoice_args = dict(
             recipient_id=clean_sender,
             payment_id=payment_reference,
             amount=amount_paid,
@@ -375,13 +760,15 @@ async def razorpay_webhook(
                 "full_name": getattr(customer, "full_name", None),
                 "business_name": getattr(customer, "business_name", None),
                 "gst_number": getattr(customer, "gst_number", None),
+                "is_gst_verified": bool(getattr(customer, "is_gst_verified", False)),
                 "address": getattr(customer, "address", None),
             },
             local_pdf_fn=generate_invoice_pdf,
             send_document_fn=send_document_to_whatsapp,
         )
+        await _queue_invoice(background_tasks, invoice_args)
 
-        logger.info(f"Sent confirmation and tips to {clean_sender}; invoice queued")
+        logger.info(f"Sent confirmation and tips to {mask_phone(clean_sender)}; invoice queued")
     except Exception as e:
         logger.error(f"Post-payment WhatsApp dispatch failed: {e}")
 

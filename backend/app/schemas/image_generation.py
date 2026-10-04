@@ -9,6 +9,8 @@ from typing import Any, Dict, Optional
 
 from pydantic import BaseModel, Field
 
+from app.utils.upload_limits import MAX_BASE64_CHARS
+
 
 class ImageGenerationRequest(BaseModel):
     """Request to generate an image from a text prompt."""
@@ -26,6 +28,7 @@ class ImageGenerationRequest(BaseModel):
     )
     reference_image: Optional[str] = Field(
         None,
+        max_length=MAX_BASE64_CHARS,
         description=(
             "Optional base64-encoded reference image of the original product. "
             "When provided, the AI will use this as a visual reference to preserve "

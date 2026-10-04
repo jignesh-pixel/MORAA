@@ -28,9 +28,19 @@ from app.schemas.image_generation import (
     ImageGenerationResponse,
 )
 from app.services.image_quality_floor import check_quality_floor
+from app.utils.executors import run_cpu
 from app.utils.logger import logger
 
 router = APIRouter(prefix="/api", tags=["Image Generation"])
+
+
+async def _data_url_off_loop(result) -> Optional[str]:
+    """The generated image as a data URL for the API response. Providers return raw bytes now; encoding a
+    multi-MB image to base64 is CPU work, so it runs on the CPU pool, not on the event loop."""
+    url = getattr(result, "image_url", None)
+    if isinstance(url, str) and url:
+        return url
+    return await run_cpu(result.as_data_url)
 
 
 @router.post(
@@ -132,7 +142,7 @@ async def generate_image(
             # wallet), matching the manager's existing zero-auto-retry
             # philosophy (MAX_RETRIES_PER_PROVIDER = 0).
             if request.enforce_quality_floor and result.image_data:
-                floor_result = check_quality_floor(result.image_data)
+                floor_result = await run_cpu(check_quality_floor, result.image_data)
                 if not floor_result.passed:
                     logger.warning(
                         f"Image generation quality floor failed: "
@@ -157,7 +167,7 @@ async def generate_image(
                 provider=result.provider_name,
                 fallback_used=result.fallback_used,
                 fallback_reason=result.fallback_reason,
-                image_url=result.image_url,
+                image_url=await _data_url_off_loop(result),
                 generation_time=round(result.processing_time, 2),
                 model_used=result.model_used,
                 metadata=result.metadata,
