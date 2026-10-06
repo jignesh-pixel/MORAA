@@ -51,24 +51,29 @@ CATALOG_PACK_STYLES: List[Tuple[str, str]] = [
     ("Stand Display", "prompt_stand"),
 ]
 
-# ─── Styles per pack (settings.MAX_STYLES_PER_PACK, default 1) ─────────────
-# Set MAX_STYLES_PER_PACK in .env (or leave it empty for all styles).
-MAX_STYLES_PER_PACK: Optional[int] = settings.MAX_STYLES_PER_PACK
+# ─── Strict single-call policy ────────────────────────────────────────────
+# One customer action (a Studio Shot or a Catalog Pack tap) makes exactly ONE image-generation call: no parallel
+# styles, no rate-limit retry, no fallback provider (ImageGenerationManager single_attempt mode), and no
+# pre-check call (image_prevalidation_service is bypassed).
+MAX_IMAGE_CALLS_PER_ORDER = 1
 
-
-def _pack_style_count_label() -> str:
-    """Human-readable style count for user-facing copy, kept in sync with the throttle."""
-    if MAX_STYLES_PER_PACK is None:
-        return f"all {len(CATALOG_PACK_STYLES)} styles"
-    count = max(MAX_STYLES_PER_PACK, 1)
-    return "1 test style" if count == 1 else f"{count} test styles"
+# Styles per Catalog Pack. Capped by MAX_IMAGE_CALLS_PER_ORDER, so the pack generates only the first style of
+# CATALOG_PACK_STYLES (the former MAX_STYLES_PER_PACK setting was removed).
+MAX_STYLES_PER_PACK: Optional[int] = MAX_IMAGE_CALLS_PER_ORDER
 
 
 def pack_generation_count() -> int:
-    """How many images one Catalog Pack generates (all styles, or fewer under the development throttle)."""
-    if MAX_STYLES_PER_PACK is None:
-        return len(CATALOG_PACK_STYLES)
-    return min(len(CATALOG_PACK_STYLES), max(MAX_STYLES_PER_PACK, 1))
+    """How many images one Catalog Pack generates: never more than MAX_IMAGE_CALLS_PER_ORDER."""
+    styles = len(CATALOG_PACK_STYLES) if MAX_STYLES_PER_PACK is None else max(MAX_STYLES_PER_PACK, 1)
+    return min(len(CATALOG_PACK_STYLES), styles, MAX_IMAGE_CALLS_PER_ORDER)
+
+
+def _pack_style_count_label() -> str:
+    """Human-readable image count for user-facing copy, kept in sync with pack_generation_count()."""
+    count = pack_generation_count()
+    if count == len(CATALOG_PACK_STYLES):
+        return f"all {count} styles"
+    return "1 image" if count == 1 else f"{count} images"
 
 
 CATALOG_PACK_ACK_TEMPLATE = (
@@ -1547,6 +1552,7 @@ async def _generate_single_pack_style(
             reference_image=reference_image_bytes,
             reference_mime_type=reference_mime_type,
             spend_reserved=spend_reserved,
+            single_attempt=True,
         )
 
         image_bytes = _result_bytes(result) if result.success else None
@@ -1642,10 +1648,10 @@ PACK_RUNNABLE_STATUSES = ("pack_queued", "stored")
 
 
 async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
-    """Generate the catalog styles in parallel and deliver them to WhatsApp.
+    """Generate the Catalog Pack and deliver it to WhatsApp.
 
-    The number of styles is capped by ``MAX_STYLES_PER_PACK`` (1 during the
-    development throttle) instead of always fanning out to every style in CATALOG_PACK_STYLES.
+    Strict single-call policy: exactly ``pack_generation_count()`` (= MAX_IMAGE_CALLS_PER_ORDER = 1) image call,
+    in single_attempt mode (no retry, no fallback provider).
     """
     from app.database import SessionLocal
     from app.models.image import Image
@@ -1742,10 +1748,8 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
                 continue
             style_jobs.append((style_title, builder()))
 
-        # Development throttle — cap the pack to MAX_STYLES_PER_PACK styles
-        # (1 during development) so we do not burn 6 parallel generations.
-        if MAX_STYLES_PER_PACK is not None:
-            style_jobs = style_jobs[: max(MAX_STYLES_PER_PACK, 1)]
+        # Strict single-call policy: never more styles than image calls allowed for one order.
+        style_jobs = style_jobs[: pack_generation_count()]
 
         if not style_jobs:
             return await _fail("No valid style prompt builders available")
@@ -1781,7 +1785,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
 
         logger.info(
             f"Catalog pack generation started: ingestion_id={ingestion_id} "
-            f"styles={len(style_jobs)} dev_throttle={MAX_STYLES_PER_PACK} "
+            f"styles={len(style_jobs)} max_calls={MAX_IMAGE_CALLS_PER_ORDER} "
             f"dry_run={DRY_RUN_IMAGE_MODE}"
         )
 
@@ -2014,7 +2018,8 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
     catalog worker. The order is claimed with one guarded UPDATE, so a second
     trigger for the same ingestion can never run a second generation. Reuses
     the frozen Prompt 1 builder and the shared ImageGenerationManager (spend
-    guard + Gemini -> OpenAI fallback). Every failure goes through
+    guard; single_attempt mode: exactly one provider call, no retry, no
+    fallback). Every failure goes through
     _fail_ingestion / _fail_delivery (refund of amount_charged exactly once)
     and the customer is told; an unexpected exception is recorded the same
     way, so a paid order is never left silently stuck in "processing".
@@ -2115,6 +2120,7 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
                     context={"request_id": order_request_id, "aspect_ratio": "1:1"},
                     reference_image=reference_image_bytes,
                     reference_mime_type=reference_mime_type,
+                    single_attempt=True,
                     **({"spend_reserved": True} if admin_order else {}),
                 )
             except BaseException:

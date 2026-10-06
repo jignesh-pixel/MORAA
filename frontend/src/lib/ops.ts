@@ -10,14 +10,28 @@
  *   OPS_SHEET_URL=https://script.google.com/macros/s/XXXX/exec
  *   OPS_SECRET=<same value as OPS_SECRET in Apps Script>
  *   OPS_TEMPLATE_LANG=en
- *   WHATSAPP_TOKEN=<already used by the customer flow>
- *   WHATSAPP_PHONE_NUMBER_ID=<already used by the customer flow>
+ *   META_WHATSAPP_TOKEN=<same value the backend (customer flow) uses>
+ *   META_PHONE_NUMBER_ID=<same value the backend (customer flow) uses>
+ *     (the older names WHATSAPP_TOKEN / WHATSAPP_PHONE_NUMBER_ID are still read as a fallback)
  *   META_APP_SECRET=<Meta App → Settings → Basic → App secret>
  *   GRAPH_VERSION=v21.0   (use whatever version the customer flow uses)
  */
 import crypto from 'crypto';
 
 const GRAPH = () => `https://graph.facebook.com/${process.env.GRAPH_VERSION || 'v21.0'}`;
+
+/** Env value with stray whitespace / CR / wrapping quotes removed (docker --env-file keeps quotes literally). */
+const envValue = (...names: string[]): string => {
+  for (const name of names) {
+    const v = (process.env[name] || '').trim().replace(/^(['"])(.*)\1$/, '$2').trim();
+    if (v) return v;
+  }
+  return '';
+};
+
+// Same names as the backend's customer flow, so both send with one token and one number.
+const waToken = () => envValue('META_WHATSAPP_TOKEN', 'WHATSAPP_TOKEN');
+const waPhoneNumberId = () => envValue('META_PHONE_NUMBER_ID', 'WHATSAPP_PHONE_NUMBER_ID');
 
 // ─────────────── team (default-deny) ───────────────
 
@@ -169,9 +183,15 @@ async function sendInternalTemplate(key: string, name: string, params: string[])
 }
 
 async function waSend(payload: unknown): Promise<boolean> {
-  const r = await fetch(`${GRAPH()}/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`, {
+  const token = waToken();
+  const phoneNumberId = waPhoneNumberId();
+  if (!token || !phoneNumberId) {
+    console.error('[ops] WhatsApp send skipped: META_WHATSAPP_TOKEN or META_PHONE_NUMBER_ID is not set');
+    return false;
+  }
+  const r = await fetch(`${GRAPH()}/${phoneNumberId}/messages`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' },
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
   if (!r.ok) console.error('[ops] WhatsApp send failed', r.status, await r.text());
@@ -214,7 +234,9 @@ export async function deliverNotifications(list: OpsNotification[]): Promise<{ o
  * Swap the upload block for your own storage if you prefer.
  */
 async function storeOpsMedia(mediaId: string, mime: string, msgId: string): Promise<string> {
-  const auth = { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` };
+  const token = waToken();
+  if (!token) throw new Error('[ops] cannot fetch media: META_WHATSAPP_TOKEN is not set');
+  const auth = { Authorization: `Bearer ${token}` };
   const meta = await fetch(`${GRAPH()}/${mediaId}`, { headers: auth }).then(r => r.json());
   const bytes: ArrayBuffer = await fetch(meta.url, { headers: auth }).then(r => r.arrayBuffer());
   const file = Buffer.from(new Uint8Array(bytes));

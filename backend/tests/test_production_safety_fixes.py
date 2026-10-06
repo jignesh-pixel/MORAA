@@ -290,47 +290,27 @@ class FallbackTests(unittest.TestCase):
         openai.generate_image.assert_not_awaited()
 
 
-# ── 14. Pre-validation bounds ──────────────────────────────────────────────
-class PrevalidationBoundsTests(unittest.TestCase):
-    def _run(self, generate):
+# ── 14. Pre-validation bypass (strict single-call policy) ──────────────────
+class PrevalidationBypassTests(unittest.TestCase):
+    def test_no_client_no_call_no_spend_counted(self):
+        from app.ai import image_generation_manager as igm
         from app.services import image_prevalidation_service as ips
 
-        captured = {}
-
-        class FakeClient:
-            def __init__(self, **kwargs):
-                captured["client"] = kwargs
-                self.models = MagicMock()
-                self.models.generate_content.side_effect = generate(captured)
-
-        with patch("google.genai.Client", FakeClient), patch.object(settings, "GEMINI_API_KEY", "k"), \
-             patch.object(settings, "IMAGE_PREVALIDATION_FAIL_OPEN", True):
+        client = MagicMock()
+        counted = MagicMock()
+        with patch("google.genai.Client", client), patch.object(settings, "GEMINI_API_KEY", "k"), \
+             patch.object(igm, "record_external_spend", counted):
             result = asyncio.run(ips.check_image_quality(b"\xff\xd8\xff\x00", "image/jpeg"))
-        return result, captured
-
-    def test_timeout_and_max_output_tokens_set(self):
-        def generate(captured):
-            def _gen(**kw):
-                captured["config"] = kw["config"]
-                raise RuntimeError("stop")
-            return _gen
-        _, captured = self._run(generate)
-        self.assertEqual(captured["client"]["http_options"].timeout, 30_000)
-        self.assertEqual(captured["config"].max_output_tokens, 2048)
-        self.assertEqual(captured["config"].temperature, 0.0)
-
-    def test_timeout_fails_open_without_retry(self):
-        calls = []
-
-        def generate(captured):
-            def _gen(**kw):
-                calls.append(1)
-                raise TimeoutError("timed out")
-            return _gen
-        result, _ = self._run(generate)
-        self.assertEqual(len(calls), 1)
+        client.assert_not_called()
+        counted.assert_not_called()                        # 0 paid calls, so nothing added to the daily total
         self.assertTrue(result.approved)
         self.assertFalse(result.checked)
+
+    def test_module_has_no_ai_client_import(self):
+        source = Path(__file__).resolve().parent.parent.joinpath(
+            "app", "services", "image_prevalidation_service.py").read_text(encoding="utf-8")
+        for needle in ("google.genai", "from google import genai", "generate_content", "httpx", "openai"):
+            self.assertNotIn(needle, source)
 
 
 # ── 3/5. Paid catalog failure + startup recovery ───────────────────────────

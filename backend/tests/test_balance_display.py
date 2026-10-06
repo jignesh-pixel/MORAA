@@ -103,10 +103,12 @@ class ButtonsShowBalanceAtSendTimeTests(FundedSlotGateTestCase):
 
 
 class PrecheckModelTests(unittest.TestCase):
-    def test_default_model_is_not_the_retired_one(self):
+    def test_precheck_has_no_model_setting_while_bypassed(self):
+        # Strict single-call policy: the pre-check makes no Gemini call, so it has no model to configure.
         from app.config import Settings
 
-        self.assertNotEqual(Settings.model_fields["IMAGE_PREVALIDATION_MODEL"].default, "gemini-2.5-flash")
+        self.assertNotIn("IMAGE_PREVALIDATION_MODEL", Settings.model_fields)
+        self.assertNotIn("IMAGE_PREVALIDATION_FAIL_OPEN", Settings.model_fields)
 
 
 if __name__ == "__main__":

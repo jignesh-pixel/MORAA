@@ -111,10 +111,11 @@ class FeedbackPersistenceTests(unittest.TestCase):
 
 
 class ConfigAndAlertTests(unittest.TestCase):
-    def test_style_limit_comes_from_settings_full_pack_by_default(self):
-        # Development throttle lifted: all 6 E-Com Pack 1 styles by default.
-        self.assertIsNone(settings.MAX_STYLES_PER_PACK)
-        self.assertEqual(meta_whatsapp_service.MAX_STYLES_PER_PACK, settings.MAX_STYLES_PER_PACK)
+    def test_style_limit_is_the_single_call_policy_not_a_setting(self):
+        # Strict single-call policy: one Pack order = one image call; no setting can widen it.
+        self.assertEqual(meta_whatsapp_service.MAX_STYLES_PER_PACK, meta_whatsapp_service.MAX_IMAGE_CALLS_PER_ORDER)
+        self.assertEqual(meta_whatsapp_service.pack_generation_count(), 1)
+        self.assertFalse(hasattr(settings, "MAX_STYLES_PER_PACK"))
 
     def test_failure_rate_alert_logged_when_above_target(self):
         engine, db = _make_engine_and_session()

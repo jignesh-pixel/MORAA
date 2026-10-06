@@ -64,7 +64,9 @@ class OrderDeclinedBeforeChargeTests(LedgerTestBase):
     def test_pack_is_declined_when_the_daily_cap_leaves_no_room_for_a_whole_pack(self):
         customer = self.make_customer(1000)
         ingestion = self.make_ingestion()
-        with patch.object(settings, "MAX_GENERATIONS_PER_DAY", mws.pack_generation_count() - 1):
+        cap = mws.pack_generation_count()                               # one call per pack (single-call policy)
+        with patch.object(settings, "MAX_GENERATIONS_PER_DAY", cap):
+            self.assertIsNone(igm.reserve_generation_slots(cap))         # today's ceiling already used up
             self.assertIsNone(self.choose(ingestion.id))
         self.assert_declined_untouched(customer, ingestion, 1000)
 

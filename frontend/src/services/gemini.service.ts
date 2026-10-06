@@ -220,6 +220,9 @@ export async function analyzeImageWithGemini(
           topP: config.topP,
           topK: config.topK,
           maxOutputTokens: config.maxOutputTokens,
+          // gemini-2.5-flash thinks by default and thinking tokens are billed as output tokens.
+          // A fixed-schema JSON extraction does not need it, so it is turned off.
+          thinkingConfig: { thinkingBudget: 0 },
         },
       });
 
@@ -230,12 +233,16 @@ export async function analyzeImageWithGemini(
       const usage = (response as any)?.usageMetadata || {};
       const promptTokens = usage.promptTokenCount ?? 0;
       const completionTokens = usage.candidatesTokenCount ?? 0;
+      // Billed output = candidates + thoughts; candidatesTokenCount alone under-reports the bill.
+      const thoughtsTokens = usage.thoughtsTokenCount ?? 0;
 
       logger.info("Gemini analysis completed", {
         requestId,
         executionTimeMs,
         promptTokens,
         completionTokens,
+        thoughtsTokens,
+        billedOutputTokens: completionTokens + thoughtsTokens,
         model,
       });
 

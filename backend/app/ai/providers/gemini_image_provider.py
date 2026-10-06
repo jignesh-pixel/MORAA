@@ -11,8 +11,10 @@ Requires ``GEMINI_API_KEY`` environment variable in the backend .env.
 
 import asyncio
 import base64
+import threading
 import time
 import weakref
+from collections import OrderedDict
 from typing import Any, Dict, Optional, Tuple
 
 from app.ai.providers.image_base import BaseImageGenerationProvider, ImageGenerationResult
@@ -52,6 +54,40 @@ def _get_client(genai: Any, types: Any) -> Any:
     )
     _CLIENTS[loop] = (key, client)
     return client
+
+
+# ─── API audit: Gemini image calls per user action ──────────────────────
+# Strict single-call policy: one customer action (one order, identified by its request_id) makes exactly one
+# Gemini image call. Each call is counted per request_id just before it is sent, so a second call for the same
+# order shows up as "Count 2 of 1" at ERROR level instead of passing silently. In-process only, last 1000 orders.
+API_AUDIT_EXPECTED_CALLS = 1
+_API_AUDIT_MAX_TRACKED = 1000
+_api_audit_counts: "OrderedDict[str, int]" = OrderedDict()
+_api_audit_lock = threading.Lock()
+
+
+def _audit_gemini_image_call(request_id: Any, model_name: str) -> int:
+    """Count and log one Gemini image call for ``request_id``. Returns this call's number for the order."""
+    key = str(request_id or "")
+    if not key or key == "unknown":
+        logger.warning(
+            f"[API-AUDIT] Gemini Image Call Triggered: untracked (no request_id) model={model_name}"
+        )
+        return 0
+    with _api_audit_lock:
+        count = _api_audit_counts.pop(key, 0) + 1
+        _api_audit_counts[key] = count
+        while len(_api_audit_counts) > _API_AUDIT_MAX_TRACKED:
+            _api_audit_counts.popitem(last=False)
+    line = (
+        f"[API-AUDIT] Gemini Image Call Triggered: Count {count} of {API_AUDIT_EXPECTED_CALLS} "
+        f"request_id={key} model={model_name}"
+    )
+    if count > API_AUDIT_EXPECTED_CALLS:
+        logger.error(f"{line} -- MORE THAN ONE GEMINI IMAGE CALL FOR THIS ORDER")
+    else:
+        logger.info(line)
+    return count
 
 
 async def close_gemini_client() -> None:
@@ -175,6 +211,7 @@ class GeminiImageProvider(BaseImageGenerationProvider):
             # Native async call (no worker thread, so the shared 6-thread pool can never be filled up by a
             # Pack), under the client timeout set in _get_client plus a hard deadline as a backstop.
             timeout = float(settings.GEMINI_IMAGE_TIMEOUT_SECONDS or 0)
+            _audit_gemini_image_call(request_id, model_name)
             call = client.aio.models.generate_content(
                 model=model_name,
                 contents=contents,

@@ -511,6 +511,7 @@ class ImageGenerationManager:
         reference_image: Optional[bytes],
         reference_mime_type: str,
         request_id: str,
+        retries: Optional[int] = None,
     ) -> ImageGenerationResult:
         """Call one provider; retry a rate limit (429) / overload (503) with jittered waits (EXT-2).
 
@@ -518,8 +519,11 @@ class ImageGenerationManager:
         them. The retries are on the SAME slot of the daily spend counter (one order = one slot), and the
         prompt and request sent are identical on every attempt. The circuit breaker is told ONE outcome per call
         chain (not one per retry), and is always told something, even when the call is cancelled or raises.
+        ``retries`` overrides IMAGE_RATE_LIMIT_RETRIES (0 = exactly one attempt).
         """
-        retries = max(int(settings.IMAGE_RATE_LIMIT_RETRIES or 0), 0)
+        if retries is None:
+            retries = int(settings.IMAGE_RATE_LIMIT_RETRIES or 0)
+        retries = max(int(retries), 0)
         if not breaker.allow(provider_name):
             logger.warning(f"Image provider '{provider_name}' circuit is open; not calling it request_id={request_id}")
             return ImageGenerationResult(
@@ -604,15 +608,20 @@ class ImageGenerationManager:
         reference_mime_type: str = "image/jpeg",
         marketplace: Optional[str] = None,
         spend_reserved: bool = False,
+        single_attempt: bool = False,
     ) -> ImageGenerationResult:
         """Generate one image (see ``_generate_image_inner``). A slot this call took from the daily counter is
-        given back if the call ends in failure, so failed generations do not eat the daily ceiling (COST-1)."""
+        given back if the call ends in failure, so failed generations do not eat the daily ceiling (COST-1).
+
+        ``single_attempt=True`` makes exactly ONE provider call: the first provider of the chain only, no
+        rate-limit retry and no fallback provider, whatever the outcome.
+        """
         state: Dict[str, Any] = {}
         succeeded = False
         try:
             result = await self._generate_image_inner(
                 prompt, context, force_provider, reference_image, reference_mime_type, marketplace,
-                spend_reserved, state,
+                spend_reserved, state, single_attempt,
             )
             succeeded = bool(result.success)
             return result
@@ -634,6 +643,7 @@ class ImageGenerationManager:
         marketplace: Optional[str],
         spend_reserved: bool,
         state: Dict[str, Any],
+        single_attempt: bool = False,
     ) -> ImageGenerationResult:
         context = dict(context) if context else {}
         request_id = context.get("request_id", "unknown")
@@ -665,6 +675,8 @@ class ImageGenerationManager:
             provider_chain = [force_provider]
         else:
             provider_chain = self._get_provider_chain()
+        if single_attempt:
+            provider_chain = provider_chain[:1]     # the primary only: a failure is final, never a fallback call
 
         effective_prompt = prompt
         if has_reference and "REFERENCE IMAGE PRIORITY" not in prompt.upper():
@@ -679,7 +691,7 @@ class ImageGenerationManager:
 
         logger.info(
             f"ImageGenerationManager: generating image request_id={request_id} "
-            f"chain={provider_chain} has_reference={has_reference}"
+            f"chain={provider_chain} has_reference={has_reference} single_attempt={single_attempt}"
         )
 
         last_error: Optional[str] = None
@@ -703,6 +715,7 @@ class ImageGenerationManager:
                     reference_image if provider_has_ref else None,
                     reference_mime_type,
                     request_id,
+                    retries=0 if single_attempt else None,
                 )
 
                 if result.success:
@@ -769,9 +782,10 @@ class ImageGenerationManager:
                     )
 
                 fallback_reason = f"{provider_name}_{_classify_error(error_msg)}"
+                next_step = "trying fallback" if idx + 1 < len(provider_chain) else "no fallback provider left"
                 logger.warning(
                     f"Image provider '{provider_name}' failed ({error_msg}) "
-                    f"request_id={request_id} — trying fallback"
+                    f"request_id={request_id} — {next_step}"
                 )
 
             except Exception as e:

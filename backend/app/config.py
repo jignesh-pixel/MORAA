@@ -16,10 +16,10 @@ _config_logger = logging.getLogger(__name__)
 # skip .env and run on unsafe defaults).
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Images in a WhatsApp Catalog Pack (CATALOG_PACK_STYLES in
-# meta_whatsapp_service.py); a daily cap below this cannot serve one Pack.
-# Kept equal to len(CATALOG_PACK_STYLES) by tests/test_earring_stand_shot.py.
-_PACK_IMAGE_COUNT = 7
+# Images in a WhatsApp Catalog Pack: one, under the strict single-call policy
+# (meta_whatsapp_service.pack_generation_count()); a daily cap below this cannot serve one Pack.
+# Kept equal to pack_generation_count() by tests/test_earring_stand_shot.py.
+_PACK_IMAGE_COUNT = 1
 
 
 def _resolve_env_file() -> Optional[str]:
@@ -515,21 +515,12 @@ class Settings(BaseSettings):
     # 350 s) and, with the Meta upload that follows (up to ~190 s), kept under the 10-minute stuck-order limit.
     PACK_GENERATION_DEADLINE_SECONDS: float = 360.0
 
-    # Styles generated per WhatsApp Earring Catalog Pack (7 styles exist).
-    # None = all styles (production: the full 7-shot E-Com Pack 1).
-    # Set a number (e.g. 1) only as a temporary testing throttle.
-    MAX_STYLES_PER_PACK: Optional[int] = None
-
-    # --- AI image pre-validation (Scenario 4) ---
-    # Fast Gemini quality inspection of a funded image before generation.
+    # --- Strict single-call policy: one customer action = exactly ONE Gemini image call ---
+    # The Catalog Pack size is fixed in code (meta_whatsapp_service.MAX_IMAGE_CALLS_PER_ORDER = 1) and the photo
+    # pre-check makes no Gemini call (image_prevalidation_service approves every non-empty photo). The settings
+    # MAX_STYLES_PER_PACK, IMAGE_PREVALIDATION_MODEL and IMAGE_PREVALIDATION_FAIL_OPEN were removed; an old .env
+    # that still sets them loads fine (extra="ignore").
     IMAGE_PREVALIDATION_ENABLED: bool = True
-    # gemini-2.5-flash now returns 404 "no longer available to new users";
-    # Google's error names gemini-3.6-flash as the replacement.
-    IMAGE_PREVALIDATION_MODEL: str = "gemini-3.6-flash"
-    # When the inspector cannot run (no API key, outage, unparseable reply):
-    # True  -> allow the image through (never block a paying customer)
-    # False -> reject the image and ask the customer to resend
-    IMAGE_PREVALIDATION_FAIL_OPEN: bool = True
 
     # --- Image Preprocessing ---
     # Max dimension (pixels) for image resizing before AI analysis

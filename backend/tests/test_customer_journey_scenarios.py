@@ -399,22 +399,17 @@ class PreValidationPolicyTests(unittest.TestCase):
         self.assertFalse(result.approved)
         self.assertEqual(result.reason, REASON_NOT_JEWELLERY)
 
-    def test_inspector_without_api_key_follows_fail_open_policy(self):
-        with patch.object(settings, "GEMINI_API_KEY", ""), patch.object(
-            settings, "IMAGE_PREVALIDATION_FAIL_OPEN", True
-        ):
-            result = asyncio.run(image_prevalidation_service.check_image_quality(b"x"))
+    def test_pre_check_is_bypassed_with_or_without_an_api_key(self):
+        # Strict single-call policy: approved at once, never inspected, never a Gemini client.
+        for key in ("", "test-key"):
+            with patch.object(settings, "GEMINI_API_KEY", key), \
+                 patch("google.genai.Client", side_effect=AssertionError("pre-check must not create a client")):
+                result = asyncio.run(image_prevalidation_service.check_image_quality(b"x"))
+            self.assertTrue(result.approved)
+            self.assertFalse(result.checked)
 
-        self.assertFalse(result.checked)
-        self.assertTrue(result.approved)
-
-        with patch.object(settings, "GEMINI_API_KEY", ""), patch.object(
-            settings, "IMAGE_PREVALIDATION_FAIL_OPEN", False
-        ):
-            result = asyncio.run(image_prevalidation_service.check_image_quality(b"x"))
-
-        self.assertFalse(result.checked)
-        self.assertFalse(result.approved)
+        empty = asyncio.run(image_prevalidation_service.check_image_quality(b""))
+        self.assertFalse(empty.approved)                    # no photo bytes: nothing to generate from
 
 
 # ─── Webhook integration: Scenarios 2, 3, 4 ──────────────────────────────
