@@ -316,6 +316,7 @@ def erase_customer(db: Session, customer: Customer) -> Dict[str, int]:
     customer.business_name = "-"
     customer.gst_number = "-"
     customer.address = "-"
+    customer.email = None
     customer.is_registered = False
     customer.is_gst_verified = False
     customer.whatsapp_id = f"erased-{customer.id}"[:100]

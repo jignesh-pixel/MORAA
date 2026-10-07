@@ -16,10 +16,10 @@ _config_logger = logging.getLogger(__name__)
 # skip .env and run on unsafe defaults).
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Images in a WhatsApp Catalog Pack: one, under the strict single-call policy
-# (meta_whatsapp_service.pack_generation_count()); a daily cap below this cannot serve one Pack.
-# Kept equal to pack_generation_count() by tests/test_earring_stand_shot.py.
-_PACK_IMAGE_COUNT = 1
+# Images in a WhatsApp Catalog Pack: one per style in meta_whatsapp_service.CATALOG_PACK_STYLES
+# (= pack_generation_count()); a daily cap below this cannot serve one Pack.
+# Kept equal to len(CATALOG_PACK_STYLES) by tests/test_earring_stand_shot.py.
+_PACK_IMAGE_COUNT = 7
 
 
 def _resolve_env_file() -> Optional[str]:
@@ -511,15 +511,17 @@ class Settings(BaseSettings):
     IMAGE_RETRY_BACKOFF_CAP_SECONDS: float = 15.0
     # Whole Catalog Pack: styles still running after this long are dropped and the pack ships with the
     # styles that finished (a pack whose styles all fail is failed and refunded as before).
-    # Sized for the worst case of one style (a rate-limited primary with retries, then a slow fallback, about
-    # 350 s) and, with the Meta upload that follows (up to ~190 s), kept under the 10-minute stuck-order limit.
+    # Pack styles are single attempts (no retry, no fallback), so one style is bounded by IMAGE_PROVIDER_TIMEOUT_SECONDS
+    # plus any wait for a provider slot; this leaves room for that wait and, with the Meta upload that follows
+    # (up to ~190 s), stays under the 10-minute stuck-order limit.
     PACK_GENERATION_DEADLINE_SECONDS: float = 360.0
 
-    # --- Strict single-call policy: one customer action = exactly ONE Gemini image call ---
-    # The Catalog Pack size is fixed in code (meta_whatsapp_service.MAX_IMAGE_CALLS_PER_ORDER = 1) and the photo
-    # pre-check makes no Gemini call (image_prevalidation_service approves every non-empty photo). The settings
-    # MAX_STYLES_PER_PACK, IMAGE_PREVALIDATION_MODEL and IMAGE_PREVALIDATION_FAIL_OPEN were removed; an old .env
-    # that still sets them loads fine (extra="ignore").
+    # --- Image calls per order ---
+    # A Clean Studio Shot makes one Gemini image call; a Catalog Pack makes one call per style in
+    # meta_whatsapp_service.CATALOG_PACK_STYLES (every style, fixed in code), each a single attempt with no retry
+    # and no fallback provider. The photo pre-check makes no Gemini call (image_prevalidation_service approves
+    # every non-empty photo). The settings MAX_STYLES_PER_PACK, IMAGE_PREVALIDATION_MODEL and
+    # IMAGE_PREVALIDATION_FAIL_OPEN were removed; an old .env that still sets them loads fine (extra="ignore").
     IMAGE_PREVALIDATION_ENABLED: bool = True
 
     # --- Image Preprocessing ---

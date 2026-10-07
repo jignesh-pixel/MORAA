@@ -264,6 +264,32 @@ def _normalize_gst(value: Any) -> str:
     return gst_norm if _GSTIN_RE.match(gst_norm) else "N/A"
 
 
+# An email address in a chat message (RFC 5322 dot-atom subset, RFC 5321
+# lengths). Checked before the greeting / recharge patterns so that
+# "pay500@gmail.com" or "hi@brand.in" is saved, not read as a command.
+# ponytail: quoted local parts ("a b"@x.com) and IP-literal domains (a@[1.2.3.4]) are not accepted; add them only if a real customer needs one.
+_EMAIL_ATOM = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+"
+_EMAIL_RE = re.compile(
+    r"(?<![\w.@])"                                                   # not inside a longer token
+    r"(" + _EMAIL_ATOM + r"(?:\." + _EMAIL_ATOM + r")*)"              # local part: atoms joined by single dots
+    r"@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}"
+    r"(?![\w@-]|\.[A-Za-z0-9-])"                                     # a trailing "." or ")" is punctuation
+)
+_WA_FORMAT_RE = re.compile(r"(?<!\S)[*_~]+|[*_~]+(?!\S)")
+
+
+def _extract_email(text: Optional[str]) -> Optional[str]:
+    """First valid email address in ``text``, lowercased, or None."""
+    if not isinstance(text, str):
+        return None
+    # WhatsApp formatting (*bold*, _italic_, ~strike~) wraps whole words; those markers are not part of the address.
+    text = _WA_FORMAT_RE.sub(" ", text)
+    for match in _EMAIL_RE.finditer(text):
+        if len(match.group(1)) <= 64 and len(match.group(0)) <= 254:
+            return match.group(0).lower()
+    return None
+
+
 _REG_NAME_KEYS = {"name", "full name", "your name"}
 _REG_BUSINESS_KEYS = {
     "business", "business name", "brand", "brand name",
@@ -972,6 +998,30 @@ async def _handle_erasure_command(db: Session, sender: str, raw_text: str) -> No
     await send_whatsapp_text(sender, data_lifecycle.ERASURE_DONE_MESSAGE)
 
 
+async def _save_customer_email(db: Session, sender: str, email: str) -> None:
+    """Store an email address sent as a chat message on the sender's customer row. An unknown number gets no row: it
+    is asked to set up the account first. The full address is never logged (masked phone and domain only)."""
+    domain = email.rsplit("@", 1)[-1]
+    cust = _find_customer_safe(db, sender)
+    if cust is None:
+        logger.info(f"Email from unknown sender not saved: sender={mask_phone(sender)} domain={domain}")
+        await send_whatsapp_text(
+            sender, "Please send HI to set up your Moraa Studio account first, then send your email address again."
+        )
+        return
+    try:
+        cust.email = email
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        # type only: a database error message can carry the bound address
+        logger.error(f"Email save failed for {mask_phone(sender)} domain={domain}: {type(e).__name__}")
+        await send_whatsapp_text(sender, "Sorry, we couldn't save your email address. Please try again.")
+        return
+    logger.info(f"Customer email saved: sender={mask_phone(sender)} domain={domain}")
+    await send_whatsapp_text(sender, f"Thanks! Your email address {email} has been saved ✅")
+
+
 def _queue_order_run(background_tasks: BackgroundTasks, job: Tuple[Any, str]) -> None:
     """Start a paid order. With the outbox on, the order is first recorded in the database (so a crash or deploy
     before it starts does not strand it: the sweep starts it) and then run right here as before."""
@@ -1426,6 +1476,14 @@ async def receive_webhook(
                     )
                     if cust is None:
                         continue
+                    reg_email = _extract_email(raw_text)
+                    if reg_email:
+                        try:
+                            cust.email = reg_email
+                            db.commit()
+                        except Exception as e:  # never let the email break registration
+                            db.rollback()
+                            logger.error(f"Registration email save failed for {mask_phone(sender)}: {type(e).__name__}")
 
                     # GST first; the confirmation waits for GST resolution.
                     await verify_after_registration(
@@ -1438,6 +1496,14 @@ async def receive_webhook(
                     data_lifecycle.is_erasure_request(raw_text) or data_lifecycle.is_erasure_confirmation(raw_text)
                 ):
                     await _handle_erasure_command(db, sender, raw_text)
+                    continue
+
+                # Before the greeting / recharge patterns: "pay500@gmail.com" is an email, not a ₹500 recharge.
+                email = _extract_email(raw_text)
+                if email:
+                    if await _consent_gate(db, sender):
+                        continue
+                    await _save_customer_email(db, sender, email)
                     continue
 
                 if re.search(r"\b(hi|hii|hello|hey|start)\b", lower_text):

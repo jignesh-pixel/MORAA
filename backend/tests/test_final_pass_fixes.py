@@ -111,10 +111,11 @@ class FeedbackPersistenceTests(unittest.TestCase):
 
 
 class ConfigAndAlertTests(unittest.TestCase):
-    def test_style_limit_is_the_single_call_policy_not_a_setting(self):
-        # Strict single-call policy: one Pack order = one image call; no setting can widen it.
-        self.assertEqual(meta_whatsapp_service.MAX_STYLES_PER_PACK, meta_whatsapp_service.MAX_IMAGE_CALLS_PER_ORDER)
-        self.assertEqual(meta_whatsapp_service.pack_generation_count(), 1)
+    def test_pack_is_every_style_and_no_setting_can_shrink_it(self):
+        # One Pack order = one image call per style in CATALOG_PACK_STYLES; no throttle constant or setting is left.
+        self.assertEqual(meta_whatsapp_service.pack_generation_count(), len(meta_whatsapp_service.CATALOG_PACK_STYLES))
+        self.assertFalse(hasattr(meta_whatsapp_service, "MAX_STYLES_PER_PACK"))
+        self.assertFalse(hasattr(meta_whatsapp_service, "MAX_IMAGE_CALLS_PER_ORDER"))
         self.assertFalse(hasattr(settings, "MAX_STYLES_PER_PACK"))
 
     def test_failure_rate_alert_logged_when_above_target(self):

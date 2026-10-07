@@ -57,10 +57,10 @@ def _get_client(genai: Any, types: Any) -> Any:
 
 
 # ─── API audit: Gemini image calls per user action ──────────────────────
-# Strict single-call policy: one customer action (one order, identified by its request_id) makes exactly one
-# Gemini image call. Each call is counted per request_id just before it is sent, so a second call for the same
-# order shows up as "Count 2 of 1" at ERROR level instead of passing silently. In-process only, last 1000 orders.
-API_AUDIT_EXPECTED_CALLS = 1
+# Each Gemini image call is counted per order (its request_id) just before it is sent and logged at INFO as
+# "Count N", so the number of paid calls behind one order can be read from the logs. A Clean Studio Shot is one
+# call; a Catalog Pack is one call per style (every style shares the order's request_id), so a count above 1 is
+# expected there and is not an error. In-process only, last 1000 orders.
 _API_AUDIT_MAX_TRACKED = 1000
 _api_audit_counts: "OrderedDict[str, int]" = OrderedDict()
 _api_audit_lock = threading.Lock()
@@ -79,14 +79,7 @@ def _audit_gemini_image_call(request_id: Any, model_name: str) -> int:
         _api_audit_counts[key] = count
         while len(_api_audit_counts) > _API_AUDIT_MAX_TRACKED:
             _api_audit_counts.popitem(last=False)
-    line = (
-        f"[API-AUDIT] Gemini Image Call Triggered: Count {count} of {API_AUDIT_EXPECTED_CALLS} "
-        f"request_id={key} model={model_name}"
-    )
-    if count > API_AUDIT_EXPECTED_CALLS:
-        logger.error(f"{line} -- MORE THAN ONE GEMINI IMAGE CALL FOR THIS ORDER")
-    else:
-        logger.info(line)
+    logger.info(f"[API-AUDIT] Gemini Image Call Triggered: Count {count} request_id={key} model={model_name}")
     return count
 
 

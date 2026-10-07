@@ -56,7 +56,7 @@ class AuditLog(Base):
         String(100), nullable=False, index=True
     )  # upload, analyze, retry, regenerate, download, login, etc.
     resource_type: Mapped[str] = mapped_column(String(50), nullable=True)
-    resource_id: Mapped[str] = mapped_column(String(36), nullable=True)
+    resource_id: Mapped[str] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(
         String(20), nullable=False
     )  # success, failure, pending

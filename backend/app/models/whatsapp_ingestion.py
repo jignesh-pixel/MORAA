@@ -115,7 +115,7 @@ class WhatsAppIngestion(Base):
 
     # ── Processing state ───────────────────────────────────────────────
     status: Mapped[str] = mapped_column(
-        String(20),
+        String(64),
         nullable=False,
         default="received",
         comment="Lifecycle: received → downloaded → stored → [Part 3: processing → completed → delivered → failed]",
@@ -128,7 +128,7 @@ class WhatsAppIngestion(Base):
 
     # ── Product purchased (migration 0004) ─────────────────────────────
     product_code: Mapped[str] = mapped_column(
-        String(20),
+        String(64),
         nullable=True,
         comment="PACK_1 | WHITE_BG. NULL = legacy row, treated as PACK_1",
     )

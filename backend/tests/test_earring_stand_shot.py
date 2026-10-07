@@ -142,9 +142,9 @@ class StandShotPackWiringTests(unittest.TestCase):
 
     def test_pack_size_constant_in_config_matches_the_pack(self):
         # config.py cannot import the service (circular); this keeps its "cap below one Pack" warning honest.
-        # Strict single-call policy: a Pack is one image call, whatever the number of defined styles.
-        self.assertEqual(mws.pack_generation_count(), mws.MAX_IMAGE_CALLS_PER_ORDER)
-        self.assertEqual(config._PACK_IMAGE_COUNT, mws.pack_generation_count())
+        # A Pack generates every defined style, one image call each.
+        self.assertEqual(mws.pack_generation_count(), len(mws.CATALOG_PACK_STYLES))
+        self.assertEqual(config._PACK_IMAGE_COUNT, len(mws.CATALOG_PACK_STYLES))
 
 
 if __name__ == "__main__":

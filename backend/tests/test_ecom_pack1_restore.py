@@ -1,5 +1,5 @@
-"""E-Com Pack 1 under the strict single-call policy: the 7 styles are still defined, but one Pack order makes
-exactly ONE image-generation call (the first style), with no retry and no fallback provider.
+"""E-Com Pack 1: the full 7-shot pack (six original shots + Stand Display). One Pack order generates every style,
+with exactly ONE image-generation call per style: no retry and no fallback provider for any style.
 
 All network/AI calls are mocked; no credits are used.
 """
@@ -52,13 +52,18 @@ class PackDefinitionTests(unittest.TestCase):
     def test_exactly_seven_shots_original_six_first_then_stand(self):
         self.assertEqual(mws.CATALOG_PACK_STYLES, EXPECTED)
 
-    def test_pack_is_capped_at_one_image_call(self):
+    def test_pack_generates_every_style(self):
+        from app import config
         from app.config import Settings
 
-        self.assertEqual(mws.MAX_IMAGE_CALLS_PER_ORDER, 1)
-        self.assertEqual(mws.pack_generation_count(), 1)
-        self.assertIn("generating 1 image", mws.CATALOG_PACK_ACK_TEMPLATE)
-        self.assertNotIn("MAX_STYLES_PER_PACK", Settings.model_fields)    # no setting can re-open the fan-out
+        self.assertEqual(mws.pack_generation_count(), len(mws.CATALOG_PACK_STYLES))
+        self.assertEqual(mws.pack_generation_count(), 7)
+        self.assertEqual(config._PACK_IMAGE_COUNT, mws.pack_generation_count())
+        self.assertIn("generating all 7 styles", mws.CATALOG_PACK_ACK_TEMPLATE)
+        # No cap left anywhere that could quietly shrink the multi-angle pack the customer paid for.
+        self.assertFalse(hasattr(mws, "MAX_IMAGE_CALLS_PER_ORDER"))
+        self.assertFalse(hasattr(mws, "MAX_STYLES_PER_PACK"))
+        self.assertNotIn("MAX_STYLES_PER_PACK", Settings.model_fields)
 
     def test_pack_price_unchanged(self):
         self.assertEqual(wallet_service.price_per_image(), 500)
@@ -126,28 +131,28 @@ class PackRunTests(unittest.TestCase):
         finally:
             s.close()
 
-    def test_pack_makes_exactly_one_generation_call_and_delivers(self):
+    def test_all_seven_shots_generated_once_each_and_delivered(self):
         from app.ai.providers.image_base import ImageGenerationResult
 
         gen = AsyncMock(return_value=ImageGenerationResult(
             success=True, image_url="data:image/png;base64,QUJD", provider_name="gemini"))
         with patch("app.ai.image_generation_manager.ImageGenerationManager.generate_image", gen):
             self.assertTrue(asyncio.run(mws.process_whatsapp_catalog_pack(self.oid)))
-        # ONE manager call for the whole order (first style), in single-attempt mode (no retry, no fallback),
-        # the customer's own photo as the reference, existing 4:5 pack ratio.
-        self.assertEqual(gen.await_count, 1)
-        call = gen.await_args
-        self.assertEqual(call.kwargs["prompt"], PROMPTS[0])
-        self.assertIs(call.kwargs["single_attempt"], True)
-        self.assertEqual(call.kwargs["reference_image"], self.photo_bytes)
-        self.assertEqual(call.kwargs["context"]["aspect_ratio"], "4:5")
-        self.assertEqual(self.upload.await_count, 1)
-        self.assertEqual(self.deliver.await_args.kwargs["image_urls"], ["media-1"])
+        # Exactly one manager call per style (no extra call), each in single-attempt mode (no retry, no fallback),
+        # existing prompts, the customer's own photo as the reference, existing 4:5 pack ratio.
+        self.assertEqual(gen.await_count, len(mws.CATALOG_PACK_STYLES))
+        self.assertEqual(sorted(c.kwargs["prompt"] for c in gen.await_args_list), sorted(PROMPTS))
+        for call in gen.await_args_list:
+            self.assertIs(call.kwargs["single_attempt"], True)
+            self.assertEqual(call.kwargs["reference_image"], self.photo_bytes)
+            self.assertEqual(call.kwargs["context"]["aspect_ratio"], "4:5")
+        self.assertEqual(self.upload.await_count, 7)
+        self.assertEqual(self.deliver.await_args.kwargs["image_urls"], [f"media-{i}" for i in range(1, 8)])
         # Pack-level charge untouched: no extra debit, no refund.
         self.assertEqual(self._state(), ("delivered", 0, 0))
         self.text.assert_not_awaited()
 
-    def test_only_the_first_pack_style_is_generated(self):
+    def test_generation_order_matches_pack_order(self):
         seen = []
 
         async def fake_style(**kw):
@@ -156,18 +161,37 @@ class PackRunTests(unittest.TestCase):
 
         with patch.object(mws, "_generate_single_pack_style", side_effect=fake_style):
             asyncio.run(mws.process_whatsapp_catalog_pack(self.oid))
-        self.assertEqual(seen, [(EXPECTED[0][0], PROMPTS[0])])
+        self.assertEqual(seen, [(title, prompt) for (title, _), prompt in zip(EXPECTED, PROMPTS)])
 
     def _run_with(self, successes):
         results = ["data:image/png;base64,QUJD" if ok else None for ok in successes]
         with patch.object(mws, "_generate_single_pack_style", AsyncMock(side_effect=results)):
             return asyncio.run(mws.process_whatsapp_catalog_pack(self.oid))
 
-    def test_one_of_one_is_delivered(self):
-        self.assertTrue(self._run_with([True]))
+    def test_seven_of_seven_is_delivered(self):
+        self.assertTrue(self._run_with([True] * 7))
         self.assertEqual(self._state(), ("delivered", 0, 0))
         s = self.Session(); self.assertIsNone(s.get(WhatsAppIngestion, self.oid).error_message); s.close()
         self.text.assert_not_awaited()
+
+    def test_six_of_seven_is_partial_not_delivered(self):
+        self.assertTrue(self._run_with([True, True, False, True, True, True, True]))
+        self.assertEqual(self.upload.await_count, 6)
+        # Existing partial status; no extra charge and no refund (existing rule).
+        self.assertEqual(self._state(), ("delivered_partial", 0, 0))
+        s = self.Session(); self.assertEqual(s.get(WhatsAppIngestion, self.oid).error_message, "Delivered 6/7 images"); s.close()
+        self.assertIn("6 of 7 images", self.text.await_args.args[1])
+
+    def test_only_the_stand_shot_failing_is_partial_not_delivered(self):
+        self.assertTrue(self._run_with([True] * 6 + [False]))
+        self.assertEqual(self.upload.await_count, 6)
+        self.assertEqual(self._state(), ("delivered_partial", 0, 0))
+        self.assertIn("6 of 7 images", self.text.await_args.args[1])
+
+    def test_one_of_seven_is_partial_not_delivered(self):
+        self.assertTrue(self._run_with([True] + [False] * 6))
+        self.assertEqual(self._state(), ("delivered_partial", 0, 0))
+        self.assertIn("1 of 7 images", self.text.await_args.args[1])
 
     # ── Daily spend cap (MAX_GENERATIONS_PER_DAY) ──
     def _real_generation(self, cap, already_used=0):
@@ -187,24 +211,39 @@ class PackRunTests(unittest.TestCase):
             ok = asyncio.run(mws.process_whatsapp_catalog_pack(self.oid))
         return ok, provider
 
-    def test_pack_runs_its_one_call_when_cap_allows(self):
+    def _spend_used(self):
         from app.ai import image_generation_manager as igm
-        ok, provider = self._real_generation(cap=1)
-        self.assertTrue(ok)
-        self.assertEqual(provider.await_count, 1)
         from app.services import spend_counter
         shared = spend_counter.used(igm.current_spend_day())      # the shared DB counter when it answers (PostgreSQL)
-        self.assertEqual(igm._spend_count if shared is None else shared, 1)
+        return igm._spend_count if shared is None else shared
+
+    def test_pack_runs_all_seven_when_cap_allows(self):
+        ok, provider = self._real_generation(cap=7)
+        self.assertTrue(ok)
+        self.assertEqual(provider.await_count, 7)
+        self.assertEqual(self._spend_used(), 7)
         self.assertEqual(self._state(), ("delivered", 0, 0))
 
-    def test_full_cap_blocks_the_pack_before_any_call_and_refunds_once(self):
-        from app.ai import image_generation_manager as igm
-        ok, provider = self._real_generation(cap=1, already_used=1)
+    def test_cap_of_the_old_six_shot_pack_now_blocks_the_whole_pack_and_refunds_once(self):
+        ok, provider = self._real_generation(cap=6)
         self.assertFalse(ok)
-        provider.assert_not_awaited()
-        from app.services import spend_counter
-        shared = spend_counter.used(igm.current_spend_day())
-        self.assertEqual(igm._spend_count if shared is None else shared, 1)   # only the pre-used slot
+        provider.assert_not_awaited()          # never a 6/7 pack: the reservation is all-or-nothing
+        self.assertEqual(self._spend_used(), 0)
+        self.assertEqual(self._state(), ("failed", 500, 1))
+
+    def test_cap_too_small_blocks_whole_pack_before_any_call_and_refunds_once(self):
+        ok, provider = self._real_generation(cap=1)
+        self.assertFalse(ok)
+        provider.assert_not_awaited()          # never a 1/7 pack
+        self.assertEqual(self._spend_used(), 0)  # nothing consumed
+        self.assertEqual(self._state(), ("failed", 500, 1))
+        self.assertIn("₹500 has been refunded", self.text.await_args.args[1])
+
+    def test_partly_used_cap_blocks_the_pack_before_any_call_and_refunds_once(self):
+        ok, provider = self._real_generation(cap=7, already_used=1)
+        self.assertFalse(ok)
+        provider.assert_not_awaited()          # 6 slots left cannot hold a 7-style pack
+        self.assertEqual(self._spend_used(), 1)  # only the pre-used slot
         self.assertEqual(self._state(), ("failed", 500, 1))
         self.assertIn("₹500 has been refunded", self.text.await_args.args[1])
 
@@ -251,27 +290,34 @@ class PackRunTests(unittest.TestCase):
             breaker.reset()
         return ok, sdk_calls, openai_call, audit_lines
 
-    def test_real_provider_makes_exactly_one_gemini_call_and_logs_the_audit_line(self):
+    def test_real_provider_makes_one_gemini_call_per_style_and_logs_each_audit_line(self):
         image_part = SimpleNamespace(inline_data=SimpleNamespace(data=b"\x89PNG-generated", mime_type="image/png"))
         response = SimpleNamespace(candidates=[SimpleNamespace(content=SimpleNamespace(parts=[image_part]))])
         ok, sdk_calls, openai_call, audit_lines = self._run_real_providers(response)
         self.assertTrue(ok)
-        self.assertEqual(len(sdk_calls), 1)
+        styles = len(mws.CATALOG_PACK_STYLES)
+        self.assertEqual(len(sdk_calls), styles)          # one Gemini call per style, never more
         openai_call.assert_not_awaited()
         gemini_lines = [line for line in audit_lines if "Gemini Image Call Triggered" in line]
-        self.assertEqual(len(gemini_lines), 1)
-        self.assertIn("[API-AUDIT] Gemini Image Call Triggered: Count 1 of 1", gemini_lines[0])
+        self.assertEqual(len(gemini_lines), styles)
+        # Every style shares the order's request_id, so the audit counts the order's calls 1..7.
+        for n, line in enumerate(gemini_lines, start=1):
+            self.assertIn(f"[API-AUDIT] Gemini Image Call Triggered: Count {n} request_id=", line)
         self.assertEqual(self._state(), ("delivered", 0, 0))
 
     def test_rate_limited_gemini_is_not_retried_and_never_falls_back(self):
         rate_limit = RuntimeError(
             "429 RESOURCE_EXHAUSTED. Quota exceeded for metric generate_content requests per minute. retry in 1s"
         )
-        ok, sdk_calls, openai_call, audit_lines = self._run_real_providers(rate_limit)
+        # Circuit breaker off, so every style reaches Gemini and the count measures retries only (with the breaker
+        # on, five outage failures in a row would stop the last styles before they call at all).
+        with patch.object(settings, "CIRCUIT_BREAKER_FAILURES", 0):
+            ok, sdk_calls, openai_call, audit_lines = self._run_real_providers(rate_limit)
         self.assertFalse(ok)
-        self.assertEqual(len(sdk_calls), 1)               # IMAGE_RATE_LIMIT_RETRIES=2 is ignored for this order
+        # IMAGE_RATE_LIMIT_RETRIES=2 is ignored: exactly one call per style (with retries it would be 3 per style).
+        self.assertEqual(len(sdk_calls), len(mws.CATALOG_PACK_STYLES))
         openai_call.assert_not_awaited()                  # recoverable error, still no fallback provider
-        self.assertEqual(sum("Gemini Image Call Triggered" in line for line in audit_lines), 1)
+        self.assertEqual(sum("Gemini Image Call Triggered" in line for line in audit_lines), len(sdk_calls))
         self.assertEqual(self._state(), ("failed", 500, 1))
 
     def test_all_shots_failed_refunds_pack_price_once(self):
@@ -304,7 +350,7 @@ class PackRunTests(unittest.TestCase):
 
 
 class ApiAuditCounterTests(unittest.TestCase):
-    def test_a_second_call_for_the_same_order_is_logged_as_an_error(self):
+    def test_every_call_for_an_order_is_counted_and_logged_at_info(self):
         from app.ai.providers import gemini_image_provider as gip
         from app.utils.logger import logger
 
@@ -319,10 +365,11 @@ class ApiAuditCounterTests(unittest.TestCase):
         finally:
             logger.remove(sink)
             gip._api_audit_counts.clear()
-        self.assertEqual(records[0][0], "INFO")
-        self.assertIn("[API-AUDIT] Gemini Image Call Triggered: Count 1 of 1 request_id=order-a", records[0][1])
-        self.assertEqual(records[2][0], "ERROR")
-        self.assertIn("Count 2 of 1 request_id=order-a", records[2][1])
+        # A Catalog Pack makes one call per style under one request_id: a second call is expected, not an error.
+        self.assertEqual([level for level, _ in records], ["INFO", "INFO", "INFO"])
+        self.assertIn("[API-AUDIT] Gemini Image Call Triggered: Count 1 request_id=order-a", records[0][1])
+        self.assertIn("[API-AUDIT] Gemini Image Call Triggered: Count 1 request_id=order-b", records[1][1])
+        self.assertIn("[API-AUDIT] Gemini Image Call Triggered: Count 2 request_id=order-a", records[2][1])
 
 
 class SpendGuardTests(unittest.TestCase):

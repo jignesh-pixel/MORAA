@@ -1,6 +1,6 @@
 """Pre-validation of a funded jewellery image (Scenario 4) -- BYPASSED.
 
-Strict single-call policy: one customer action makes exactly ONE paid Gemini call, the image generation itself.
+The only paid Gemini calls are the image generations themselves (one per Studio Shot, one per Catalog Pack style).
 ``check_image_quality`` therefore makes no network request and no Gemini call: every non-empty photo is approved
 immediately. Photos are still decoded and validated locally (``meta_whatsapp_service.validate_image``) before
 this runs.

@@ -51,29 +51,21 @@ CATALOG_PACK_STYLES: List[Tuple[str, str]] = [
     ("Stand Display", "prompt_stand"),
 ]
 
-# ─── Strict single-call policy ────────────────────────────────────────────
-# One customer action (a Studio Shot or a Catalog Pack tap) makes exactly ONE image-generation call: no parallel
-# styles, no rate-limit retry, no fallback provider (ImageGenerationManager single_attempt mode), and no
-# pre-check call (image_prevalidation_service is bypassed).
-MAX_IMAGE_CALLS_PER_ORDER = 1
-
-# Styles per Catalog Pack. Capped by MAX_IMAGE_CALLS_PER_ORDER, so the pack generates only the first style of
-# CATALOG_PACK_STYLES (the former MAX_STYLES_PER_PACK setting was removed).
-MAX_STYLES_PER_PACK: Optional[int] = MAX_IMAGE_CALLS_PER_ORDER
+# ─── Image calls per order ────────────────────────────────────────────────
+# A Clean Studio Shot makes exactly one image-generation call. A Full Catalog Pack generates EVERY style in
+# CATALOG_PACK_STYLES, one call per style (the styles run in parallel). Each of those calls is a single attempt:
+# no rate-limit retry and no fallback provider (ImageGenerationManager single_attempt mode). The photo pre-check
+# makes no call at all (image_prevalidation_service is bypassed).
 
 
 def pack_generation_count() -> int:
-    """How many images one Catalog Pack generates: never more than MAX_IMAGE_CALLS_PER_ORDER."""
-    styles = len(CATALOG_PACK_STYLES) if MAX_STYLES_PER_PACK is None else max(MAX_STYLES_PER_PACK, 1)
-    return min(len(CATALOG_PACK_STYLES), styles, MAX_IMAGE_CALLS_PER_ORDER)
+    """How many images one Catalog Pack generates: every style in CATALOG_PACK_STYLES, one call each."""
+    return len(CATALOG_PACK_STYLES)
 
 
 def _pack_style_count_label() -> str:
-    """Human-readable image count for user-facing copy, kept in sync with pack_generation_count()."""
-    count = pack_generation_count()
-    if count == len(CATALOG_PACK_STYLES):
-        return f"all {count} styles"
-    return "1 image" if count == 1 else f"{count} images"
+    """Human-readable style count for user-facing copy, kept in sync with pack_generation_count()."""
+    return f"all {pack_generation_count()} styles"
 
 
 CATALOG_PACK_ACK_TEMPLATE = (
@@ -865,8 +857,8 @@ async def send_catalog_pack_images_to_whatsapp(
     if not recipient_id or not image_urls:
         return 0
 
-    # Caption counts reflect what is actually delivered, so the throttled
-    # single-style test pack does not claim to be a complete pack.
+    # Caption counts reflect what is actually delivered, so a pack missing a
+    # failed style does not claim to be a complete pack.
     total = len(image_urls)
     known_styles = len(CATALOG_PACK_STYLES)
     sent_count = 0
@@ -1648,10 +1640,11 @@ PACK_RUNNABLE_STATUSES = ("pack_queued", "stored")
 
 
 async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
-    """Generate the Catalog Pack and deliver it to WhatsApp.
+    """Generate every Catalog Pack style in parallel and deliver them to WhatsApp.
 
-    Strict single-call policy: exactly ``pack_generation_count()`` (= MAX_IMAGE_CALLS_PER_ORDER = 1) image call,
-    in single_attempt mode (no retry, no fallback provider).
+    One image call per style in CATALOG_PACK_STYLES (``pack_generation_count()`` calls for the order), each in
+    single_attempt mode (no retry, no fallback provider), so a failed style is final and the pack is delivered
+    with the styles that succeeded.
     """
     from app.database import SessionLocal
     from app.models.image import Image
@@ -1748,9 +1741,6 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
                 continue
             style_jobs.append((style_title, builder()))
 
-        # Strict single-call policy: never more styles than image calls allowed for one order.
-        style_jobs = style_jobs[: pack_generation_count()]
-
         if not style_jobs:
             return await _fail("No valid style prompt builders available")
 
@@ -1785,7 +1775,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
 
         logger.info(
             f"Catalog pack generation started: ingestion_id={ingestion_id} "
-            f"styles={len(style_jobs)} max_calls={MAX_IMAGE_CALLS_PER_ORDER} "
+            f"styles={len(style_jobs)} calls_per_style=1 "
             f"dry_run={DRY_RUN_IMAGE_MODE}"
         )
 

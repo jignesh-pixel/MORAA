@@ -150,6 +150,16 @@ class Customer(Base):
         comment="True to skip wallet/payment checks (owner-granted)",
     )
 
+    # ── Contact and Google Drive delivery (migration 0022) ─────────────
+    # Nullable with no default: every existing way of creating a customer (registration, the Razorpay payer
+    # auto-provision, the WhatsApp Pay wallet row) keeps working without an email.
+    email: Mapped[str] = mapped_column(String(320), nullable=True, comment="Customer email, lowercased")
+    drive_folder_id: Mapped[str] = mapped_column(String(200), nullable=True)
+    drive_images_folder_id: Mapped[str] = mapped_column(String(200), nullable=True)
+    drive_invoices_folder_id: Mapped[str] = mapped_column(String(200), nullable=True)
+    drive_sheet_id: Mapped[str] = mapped_column(String(200), nullable=True)
+    drive_shared_to: Mapped[str] = mapped_column(String(320), nullable=True, comment="Email the Drive folder is shared with")
+
     # ── Backward-compatible aliases ────────────────────────────────────
     # The requested Customer schema uses ``phone_number`` and
     # ``business_address``; the deployed columns are named ``whatsapp_id``
