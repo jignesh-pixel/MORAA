@@ -148,10 +148,9 @@ class CollectionProductsMessageTests(PackWebhookBase):
         self.assertEqual(interactive["header"], {"type": "text", "text": "Studio Shot"})
         self.assertEqual(interactive["action"]["catalog_id"], "CAT1")
         items = [i["product_retailer_id"] for i in interactive["action"]["sections"][0]["product_items"]]
-        self.assertEqual(items, ["studio_sku_1", "studio_sku_5", "studio_sku_20", "studio_sku_50", "studio_sku_100"])
-        body = interactive["body"]["text"]
-        for size in (1, 5, 20, 50, 100):
-            self.assertIn(f"{pricing.pack_title(size)}: {pricing.format_rupees(pricing.pack_total(size))}", body)
+        self.assertEqual(items, ["cuye50mhk4", "jqlyripyx9", "dnv3cpdm89", "weime1udtl", "ufd9yt7y6f"])
+        self.assertEqual(interactive["body"]["text"], sku_messages.PRODUCT_LIST_BODY)
+        self.assertNotIn("•", interactive["body"]["text"])
 
     def test_catalog_pack_lists_its_five_sku_tiers(self):
         post, _menu = self._send(mws.COLLECTION_CATALOG)
@@ -159,14 +158,13 @@ class CollectionProductsMessageTests(PackWebhookBase):
         self.assertEqual(interactive["header"]["text"], "Catalog Pack")
         items = [i["product_retailer_id"] for i in interactive["action"]["sections"][0]["product_items"]]
         self.assertEqual(items, ["sku_pack_1", "sku_pack_5", "sku_pack_20", "sku_pack_50", "sku_pack_100"])
-        for size in (1, 5, 20, 50, 100):
-            self.assertIn(f"{pricing.pack_title(size)}: {pricing.format_rupees(size * 500)}",
-                          interactive["body"]["text"])
+        self.assertEqual(interactive["body"]["text"],
+                         "Tap View items below to select your packs and add them to your cart.")
 
-    def test_without_a_catalogue_the_list_menu_is_sent(self):
+    def test_without_a_catalogue_no_silent_list_menu_is_sent(self):
         post, menu = self._send(mws.COLLECTION_STUDIO, catalog_id="")
-        post.assert_not_awaited()
-        menu.assert_awaited_once()
+        menu.assert_not_awaited()
+        self.assertEqual(post.await_args.args[0]["type"], "text")
 
     def test_the_cart_button_is_place_order(self):
         self.assertEqual(sku_messages.PAY_BUTTON, "Place Order")

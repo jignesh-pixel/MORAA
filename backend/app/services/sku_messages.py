@@ -74,6 +74,9 @@ def _tiers(unit_price: int) -> str:
     )
 
 
+PRODUCT_LIST_BODY = "Tap View items below to select your packs and add them to your cart."
+
+
 def studio_tiers_body() -> str:
     """Body of the Studio Shot product list: the SKU tiers and their prices."""
     return (

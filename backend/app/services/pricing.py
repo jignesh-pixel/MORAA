@@ -23,6 +23,16 @@ STUDIO_RETAILER_PREFIX = "studio_sku_"
 CATALOG_RETAILER_PREFIX = "sku_pack_"
 # The first catalogue's Studio Shot ids ("pack_20"): still read in carts and list replies sent before the switch.
 PACK_RETAILER_PREFIX = "pack_"
+# Studio Shot tiers are catalogue items whose retailer id is the Meta "content id": pack size -> id. Lower case,
+# because parse_retailer_id compares lower-cased ids. Catalog Pack ids (sku_pack_N) are NOT mapped.
+STUDIO_CONTENT_IDS = {
+    1: "cuye50mhk4",
+    5: "jqlyripyx9",
+    20: "dnv3cpdm89",
+    50: "weime1udtl",
+    100: "ufd9yt7y6f",
+}
+_STUDIO_UNITS_BY_CONTENT_ID = {content_id: units for units, content_id in STUDIO_CONTENT_IDS.items()}
 PAISE_PER_RUPEE = 100
 PRICE_CHANGED_ACTION = "price_changed"
 
@@ -78,8 +88,9 @@ def pack_total(units: int, db: Any = None) -> int:
 
 
 def pack_retailer_id(units: int) -> str:
-    """Studio Shot tier id in the catalogue: ``studio_sku_20``."""
-    return f"{STUDIO_RETAILER_PREFIX}{int(units)}"
+    """Studio Shot tier id in the catalogue: its Meta content id (``dnv3cpdm89`` for 20), or ``studio_sku_N`` for a
+    pack size without a content id."""
+    return STUDIO_CONTENT_IDS.get(int(units)) or f"{STUDIO_RETAILER_PREFIX}{int(units)}"
 
 
 def catalog_retailer_id(units: int) -> str:
@@ -93,9 +104,12 @@ def _tier_units(text: str, prefix: str) -> Optional[int]:
 
 
 def parse_retailer_id(retailer_id: Any) -> Optional[Tuple[str, int]]:
-    """``studio_sku_20`` -> (white_bg, 20), ``sku_pack_5`` -> (creative_pack, 5); None for anything else (or a size
+    """A Studio Shot content id (``dnv3cpdm89``) or ``studio_sku_20`` -> (white_bg, 20), ``sku_pack_5`` -> (creative_pack, 5); None for anything else (or a size
     that is not a pack size). Prices are never taken from Meta: only the id is used."""
     text = str(retailer_id or "").strip().lower()
+    content_units = _STUDIO_UNITS_BY_CONTENT_ID.get(text)
+    if content_units and is_pack_size(content_units):
+        return SKU_WHITE_BG, content_units
     for prefix, sku in ((STUDIO_RETAILER_PREFIX, SKU_WHITE_BG), (CATALOG_RETAILER_PREFIX, SKU_CREATIVE),
                         (PACK_RETAILER_PREFIX, SKU_WHITE_BG)):
         units = _tier_units(text, prefix)

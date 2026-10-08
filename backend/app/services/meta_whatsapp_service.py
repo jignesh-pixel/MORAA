@@ -895,7 +895,7 @@ async def send_collection_products(
         "interactive": {
             "type": "product_list",
             "header": {"type": "text", "text": title[:60]},
-            "body": {"text": await run_io(sku_messages.studio_tiers_body if studio else sku_messages.catalog_pack_body)},
+            "body": {"text": sku_messages.PRODUCT_LIST_BODY},
             "action": {
                 "catalog_id": catalog_id,
                 "sections": [{

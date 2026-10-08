@@ -99,7 +99,7 @@ class SenderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(inter["body"]["text"], sku_messages.pack_menu_body())
         self.assertEqual(inter["action"]["button"], sku_messages.PACK_MENU_BUTTON)
         rows = inter["action"]["sections"][0]["rows"]
-        self.assertEqual([r["id"] for r in rows], ["studio_sku_5", "studio_sku_20", "studio_sku_50", "studio_sku_100",
+        self.assertEqual([r["id"] for r in rows], ["jqlyripyx9", "dnv3cpdm89", "weime1udtl", "ufd9yt7y6f",
                                                    "sku_pack_5", "sku_pack_20", "sku_pack_50", "sku_pack_100"])
         self.assertEqual(rows[1]["title"], "Studio Shot · 20 SKUs")
         self.assertEqual(rows[5]["title"], "Catalog Pack · 20 SKUs")
@@ -113,7 +113,7 @@ class SenderTests(unittest.IsolatedAsyncioTestCase):
         payload = await self._menu(ECOM_PACK1_ENABLED=True)
         rows = payload["interactive"]["action"]["sections"][0]["rows"]
         self.assertEqual(len(rows), 10)                          # 5 tiers x 2 collections: Meta's list maximum
-        self.assertEqual((rows[0]["id"], rows[5]["id"]), ("studio_sku_1", "sku_pack_1"))
+        self.assertEqual((rows[0]["id"], rows[5]["id"]), ("cuye50mhk4", "sku_pack_1"))
         self.assertEqual(rows[0]["title"], "Studio Shot · 1 SKU")
 
     async def test_list_message_trims_to_meta_limits(self):
@@ -368,6 +368,19 @@ class CartTests(PackWebhookBase):
         self._post(_order([("pack_20", 1)]))
         self.assertEqual(self.pack_link.await_args.kwargs["units"], 20)
 
+    def test_studio_shot_content_ids_price_as_studio_skus(self):
+        expected = {"cuye50mhk4": (1, 20), "jqlyripyx9": (5, 100), "dnv3cpdm89": (20, 400),
+                    "weime1udtl": (50, 1000), "ufd9yt7y6f": (100, 2000)}
+        for content_id, (units, rupees) in expected.items():
+            quote = pricing.quote_cart([{"retailer_id": content_id.upper(), "quantity": 1, "item_price": 1}])
+            self.assertEqual((quote["white_units"], quote["creative_packs"], quote["total"]), (units, 0, rupees))
+        self.assertEqual(pricing.parse_retailer_id("sku_pack_20"), ("creative_pack", 20))      # Catalog Pack unchanged
+
+    def test_a_content_id_cart_is_one_studio_link(self):
+        _make_customer(self.session, balance=0)
+        self._post(_order([("dnv3cpdm89", 2), ("jqlyripyx9", 1)]))
+        self._assert_one_link(45, 900)
+
     def test_quote_cart_ignores_meta_prices_and_unknown_items(self):
         quote = pricing.quote_cart([{"retailer_id": "studio_sku_20", "quantity": 2, "item_price": 1},
                                     {"retailer_id": "STUDIO_SKU_5", "quantity": 1},
@@ -405,7 +418,7 @@ class CartTests(PackWebhookBase):
 
     def test_catalogue_price_sync_covers_both_collections(self):
         ids = [r["retailer_id"] for r in pricing.catalogue_requests(20)]
-        self.assertEqual(ids, [f"studio_sku_{n}" for n in (1, 5, 20, 50, 100)]
+        self.assertEqual(ids, [pricing.STUDIO_CONTENT_IDS[n] for n in (1, 5, 20, 50, 100)]
                          + [f"sku_pack_{n}" for n in (1, 5, 20, 50, 100)])
         requests = pricing.catalogue_requests(20)
         self.assertEqual(requests[2]["data"]["price"], 400 * pricing.PAISE_PER_RUPEE)            # studio_sku_20
@@ -443,7 +456,7 @@ class JourneyTests(PackWebhookBase):
     def test_picking_a_collection_sends_only_that_collections_items_as_a_product_list(self):
         import asyncio
 
-        for collection, expected in ((mws.COLLECTION_STUDIO, "studio_sku_"), (mws.COLLECTION_CATALOG, "sku_pack_")):
+        for collection, expected in ((mws.COLLECTION_STUDIO, tuple(pricing.STUDIO_CONTENT_IDS.values())), (mws.COLLECTION_CATALOG, "sku_pack_")):
             with patch.object(settings, "META_CATALOG_ID", "CAT1"),                     patch.object(mws, "_post_message_payload", new=AsyncMock(return_value=True)) as post:
                 asyncio.run(mws.send_collection_products(SENDER, collection))
             interactive = post.await_args.args[0]["interactive"]
