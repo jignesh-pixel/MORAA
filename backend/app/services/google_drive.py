@@ -320,6 +320,16 @@ async def share_with_email(file_id: str, email: str, role: str = "reader") -> st
     return response.json()["id"]
 
 
+async def share_anyone_with_link(file_id: str) -> str:
+    """"Anyone with the link can view": a reader permission of type "anyone", not listed in search
+    (allowFileDiscovery false). Returns the permission id. Raises DriveError when the shared drive or the
+    Workspace forbids link sharing."""
+    _check(file_id)
+    response = await _request("POST", f"{FILES_URL}/{file_id}/permissions", params={"fields": "id"},
+                              json_body={"type": "anyone", "role": "reader", "allowFileDiscovery": False})
+    return response.json()["id"]
+
+
 async def list_permissions(file_id: str) -> List[Dict[str, Any]]:
     """[{"id", "type", "role", "emailAddress", "permissionDetails"}] (inherited shared-drive members included)."""
     _check(file_id)

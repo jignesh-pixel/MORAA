@@ -187,12 +187,12 @@ async def ensure_day_folder(customer_id: str, when: Optional[datetime] = None) -
 
 
 def _next_number(children: List[Dict[str, Any]]) -> int:
-    numbers = [int(m.group(1)) for c in children if (m := re.fullmatch(r"(\d+)\.\w+", c.get("name") or ""))]
+    numbers = [int(m.group(1)) for c in children if (m := re.fullmatch(r"(\d+)(?: - .*)?\.\w+", c.get("name") or ""))]
     return max(numbers, default=0) + 1
 
 
 async def upload_delivery_image(customer_id: str, path: str, mime: str,
-                                when: Optional[datetime] = None) -> Dict[str, str]:
+                                when: Optional[datetime] = None, label: str = "") -> Dict[str, str]:
     """Upload a finished image as the next number in its day folder (001.png, 002.png ...), streamed from disk.
     Returns {"file_id", "name", "day_folder_id", "day_folder_link"}."""
     folders = await ensure_customer_folders(customer_id)
@@ -201,7 +201,9 @@ async def upload_delivery_image(customer_id: str, path: str, mime: str,
     # pick the same number (Drive keeps both files); a per-customer counter in the database is the upgrade.
     async with customer_lock(customer_id):
         day_id, _label = await _day_folder(folders["images"], when)
-        name = f"{_next_number(await google_drive.list_children(day_id)):03d}{extension}"
+        number = f"{_next_number(await google_drive.list_children(day_id)):03d}"
+        tag = re.sub(r"[^\w .&()-]+", " ", label).strip()[:60]
+        name = f"{number} - {tag}{extension}" if tag else f"{number}{extension}"
         uploaded = await google_drive.upload_file(path, name, day_id, mime)
     return {"file_id": uploaded["id"], "name": name, "day_folder_id": day_id,
             "day_folder_link": google_drive.folder_link(day_id)}
@@ -230,6 +232,25 @@ async def _share_refused(phone: str, error: DriveError) -> None:
         logger.warning(f"Google email request not sent to {mask_phone(phone)}: {type(e).__name__}")
 
 
+async def ensure_link_access(customer_id: str) -> bool:
+    """Make the customer's root folder "anyone with the link can view" (DRIVE_LINK_PUBLIC). True when that is in
+    place. Never raises: a Drive that refuses link sharing (Workspace / shared-drive policy) is logged as an ALERT
+    and the folder stays shared with the customer's email only."""
+    if not settings.DRIVE_LINK_PUBLIC or not delivery_enabled():
+        return False
+    try:
+        root = (await ensure_customer_folders(customer_id))["root"]
+        if any(p.get("type") == "anyone" for p in await google_drive.list_permissions(root)):
+            return True
+        await google_drive.share_anyone_with_link(root)
+        metrics.registry.inc("moraa_drive_share_total", {"outcome": "link_public"})
+        return True
+    except Exception as e:  # noqa: BLE001 -- the email share still works
+        logger.error(f"ALERT Drive link sharing failed for customer {customer_id[:8]} ({type(e).__name__}): the "
+                     "folder is shared with the customer's email only")
+        return False
+
+
 async def share_customer_folder(customer_id: str) -> str:
     """Share the customer's root folder with their email as reader. Returns "shared", "already", "no_email",
     "refused" or "not_configured". Raises a retryable DriveError for the outbox to try again."""
@@ -241,6 +262,7 @@ async def share_customer_folder(customer_id: str) -> str:
         return "no_email"
     old = (info["shared_to"] or "").strip().lower()
     if old == email:
+        await ensure_link_access(customer_id)
         return "already"
     root = (await ensure_customer_folders(customer_id))["root"]
     try:
@@ -255,6 +277,7 @@ async def share_customer_folder(customer_id: str) -> str:
             if permission.get("type") == "user" and (permission.get("emailAddress") or "").lower() == old:
                 await google_drive.remove_permission(root, permission["id"])
     await run_io(_update_customer, customer_id, {"drive_shared_to": email})
+    await ensure_link_access(customer_id)
     metrics.registry.inc("moraa_drive_share_total", {"outcome": "shared"})
     return "shared"
 
@@ -306,7 +329,7 @@ async def erase_customer_drive(customer_id: str) -> Dict[str, int]:
         removed["sheet"] = 1
     for permission in await google_drive.list_permissions(root):
         inherited = any(d.get("inherited") for d in permission.get("permissionDetails") or [])
-        if permission.get("type") == "user" and not inherited:   # shared-drive members are inherited: they stay
+        if permission.get("type") in ("user", "anyone") and not inherited:   # shared-drive members are inherited: they stay
             await google_drive.remove_permission(root, permission["id"])
             removed["permissions"] += 1
     await google_drive.rename(root, f"erased-{customer_id[:8]}")

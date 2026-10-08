@@ -34,8 +34,8 @@ def enabled() -> bool:
 BACKGROUND: "set" = set()           # uploads started by workers (strong references until done)
 
 
-def folder_ready(phone: str) -> bool:
-    """(blocking) True when the customer behind this number has a Drive folder shared with their email."""
+def customer_id_if_ready(phone: str) -> Optional[str]:
+    """(blocking) The customer's id when they have a Drive folder shared with their email, else None."""
     from app.database import SessionLocal
     from app.services import drive_layout
     from app.services.wallet_service import find_customer_by_phone
@@ -43,7 +43,12 @@ def folder_ready(phone: str) -> bool:
     with SessionLocal() as db:
         customer = find_customer_by_phone(db, phone)
         customer_id = customer.id if customer else None
-    return bool(customer_id) and drive_layout.folder_shared_sync(customer_id)
+    return customer_id if customer_id and drive_layout.folder_shared_sync(customer_id) else None
+
+
+def folder_ready(phone: str) -> bool:
+    """(blocking) True when the customer behind this number has a Drive folder shared with their email."""
+    return customer_id_if_ready(phone) is not None
 
 
 def hand_over(ingestion_id: str, image_path: str, mime_type: str = "image/png") -> Optional[int]:

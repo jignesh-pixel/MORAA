@@ -259,7 +259,7 @@ class GoogleFakeMixin:
         self.key_file.write_text(json.dumps({"type": "service_account", "client_email": SA_EMAIL,
                                              "private_key": private_pem(), "token_uri": TOKEN_URI}), encoding="utf-8")
         for p in (patch.multiple(settings, GOOGLE_SA_KEY_FILE=str(self.key_file), DRIVE_SHARED_DRIVE_ID=DRIVE_ID,
-                                 DRIVE_DELIVERY_ENABLED=delivery, **extra_settings),
+                                 DRIVE_DELIVERY_ENABLED=delivery, **{"DRIVE_LINK_PUBLIC": False, **extra_settings}),
                   patch.object(google_drive, "_transport", httpx.MockTransport(self.google.handler)),
                   patch.object(google_drive, "BACKOFF_SECONDS", 0.0)):
             p.start()
@@ -637,6 +637,64 @@ class ShareTests(DriveDbTestBase):
             asyncio.run(drive_layout.handle_share_job({"customer_id": customer_id}))
         self.assertTrue(asyncio.run(drive_layout.handle_share_job({"customer_id": customer_id})))
         self.assertEqual(self.customer(customer_id).drive_shared_to, "buyer@gmail.com")
+
+
+class PublicLinkTests(DriveDbTestBase):
+    def setUp(self) -> None:
+        super().setUp()
+        p = patch.object(settings, "DRIVE_LINK_PUBLIC", True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_the_root_is_also_anyone_with_the_link_can_view_once(self):
+        customer_id = self.make_customer(email="buyer@gmail.com")
+        self.assertEqual(asyncio.run(drive_layout.share_customer_folder(customer_id)), "shared")
+        root = self.customer(customer_id).drive_folder_id
+        self.assertEqual([(p["type"], p["role"]) for p in self.google.permissions[root]],
+                         [("user", "reader"), ("anyone", "reader")])
+        anyone = [r for r in self.google.permission_requests if r["type"] == "anyone"]
+        self.assertEqual(anyone, [{"type": "anyone", "role": "reader", "allowFileDiscovery": False}])
+        self.assertEqual(asyncio.run(drive_layout.share_customer_folder(customer_id)), "already")
+        self.assertTrue(asyncio.run(drive_layout.ensure_link_access(customer_id)))
+        self.assertEqual(len([p for p in self.google.permissions[root] if p["type"] == "anyone"]), 1)
+
+    def test_a_customer_shared_before_the_change_gets_the_public_link_on_the_next_check(self):
+        customer_id = self.make_customer(email="buyer@gmail.com")
+        with patch.object(settings, "DRIVE_LINK_PUBLIC", False):
+            asyncio.run(drive_layout.share_customer_folder(customer_id))
+        root = self.customer(customer_id).drive_folder_id
+        self.assertEqual([p["type"] for p in self.google.permissions[root]], ["user"])
+        self.assertTrue(asyncio.run(drive_layout.ensure_link_access(customer_id)))
+        self.assertEqual([p["type"] for p in self.google.permissions[root]], ["user", "anyone"])
+
+    def test_the_switch_off_keeps_the_folder_email_only(self):
+        customer_id = self.make_customer(email="buyer@gmail.com")
+        with patch.object(settings, "DRIVE_LINK_PUBLIC", False):
+            asyncio.run(drive_layout.share_customer_folder(customer_id))
+            self.assertFalse(asyncio.run(drive_layout.ensure_link_access(customer_id)))
+        self.assertNotIn("anyone", json.dumps(self.google.permission_requests))
+
+    def test_a_drive_that_forbids_link_sharing_does_not_break_the_email_share(self):
+        customer_id = self.make_customer(email="buyer@gmail.com")
+        with patch.object(google_drive, "share_anyone_with_link",
+                          AsyncMock(side_effect=DriveError(403, "sharingRateLimitExceeded", False))):
+            self.assertEqual(asyncio.run(drive_layout.share_customer_folder(customer_id)), "shared")
+        root = self.customer(customer_id).drive_folder_id
+        self.assertEqual([p["type"] for p in self.google.permissions[root]], ["user"])
+        self.assertEqual(self.customer(customer_id).drive_shared_to, "buyer@gmail.com")
+
+    def test_erasure_also_removes_the_public_link(self):
+        customer_id = self.make_customer(email="buyer@gmail.com")
+        asyncio.run(drive_layout.share_customer_folder(customer_id))
+        removed = asyncio.run(drive_layout.erase_customer_drive(customer_id))
+        self.assertEqual(removed["permissions"], 2)
+        self.assertEqual(self.google.permissions[self.customer(customer_id).drive_folder_id], [])
+
+    def test_catalog_pack_styles_are_named_after_their_style(self):
+        customer_id = self.make_customer()
+        first = asyncio.run(drive_layout.upload_delivery_image(customer_id, self.image(), "image/png", label="Close Up"))
+        second = asyncio.run(drive_layout.upload_delivery_image(customer_id, self.image(), "image/png"))
+        self.assertEqual((first["name"], second["name"]), ("001 - Close Up.png", "002.png"))
 
 
 class ErasureTests(DriveDbTestBase):

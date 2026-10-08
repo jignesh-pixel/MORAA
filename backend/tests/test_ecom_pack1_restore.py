@@ -168,6 +168,43 @@ class PackRunTests(unittest.TestCase):
         with patch.object(mws, "_generate_single_pack_style", AsyncMock(side_effect=results)):
             return asyncio.run(mws.process_whatsapp_catalog_pack(self.oid))
 
+    def _run_on_drive(self, drive_ok):
+        """Seven styles for a customer with a shared Drive folder; ``drive_ok[i]`` False = Drive refuses style i."""
+        names = iter(range(1, 8))
+
+        async def to_drive(image_bytes, customer_id, ingestion_id, style_title):
+            index = next(names)
+            return f"{index:03d} - {style_title}.png" if drive_ok[index - 1] else None
+
+        with patch.object(mws, "_generate_single_pack_style", AsyncMock(return_value=b"png-bytes")), \
+                patch.object(mws, "_upload_style_to_drive", side_effect=to_drive), \
+                patch("app.services.drive_delivery.enabled", return_value=True), \
+                patch("app.services.drive_delivery.customer_id_if_ready", return_value="cust-1"), \
+                patch("app.services.batch_notify.schedule") as schedule:
+            ok = asyncio.run(mws.process_whatsapp_catalog_pack(self.oid))
+        return ok, schedule
+
+    def test_a_pack_for_a_customer_with_a_drive_folder_stays_out_of_the_chat(self):
+        ok, schedule = self._run_on_drive([True] * 7)
+        self.assertTrue(ok)
+        self.deliver.assert_not_awaited()
+        self.upload.assert_not_awaited()
+        self.assertEqual(self._state(), ("delivered", 0, 0))
+        s = self.Session()
+        try:
+            self.assertEqual(s.get(WhatsAppIngestion, self.oid).delivery_channel, "drive")
+        finally:
+            s.close()
+        schedule.assert_called_once_with("cust-1")
+
+    def test_styles_drive_could_not_take_are_sent_on_whatsapp_and_the_pack_is_still_whole(self):
+        ok, schedule = self._run_on_drive([True, False, True, True, False, True, True])
+        self.assertTrue(ok)
+        self.assertEqual(self.upload.await_count, 2)                 # only the two Drive could not take go to Meta
+        self.assertEqual(len(self.deliver.await_args.kwargs["image_urls"]), 2)
+        self.assertEqual(self._state(), ("delivered", 0, 0))
+        schedule.assert_called_once_with("cust-1")
+
     def test_seven_of_seven_is_delivered(self):
         self.assertTrue(self._run_with([True] * 7))
         self.assertEqual(self._state(), ("delivered", 0, 0))

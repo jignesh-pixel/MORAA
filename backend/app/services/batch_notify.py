@@ -72,7 +72,8 @@ def _state(customer_id: str) -> Optional[Dict[str, Any]]:
             AuditLog.action == NOTIFIED_ACTION, AuditLog.resource_id == customer_id
         ).scalar()
         delivered = db.query(WhatsAppIngestion).filter(
-            mine, WhatsAppIngestion.status == "delivered", WhatsAppIngestion.delivery_channel == CHANNEL_DRIVE,
+            mine, WhatsAppIngestion.status.in_(("delivered", "delivered_partial")),
+            WhatsAppIngestion.delivery_channel == CHANNEL_DRIVE,
             *([WhatsAppIngestion.updated_at > last] if last is not None else []),
         )
         count = delivered.count()
@@ -114,6 +115,7 @@ async def handle_outbox_job(payload: Dict[str, Any]) -> bool:
         await run_io(schedule, customer_id, 1)                 # still working: look again after the next quiet time
         return True
     link = folder_link((await drive_layout.ensure_customer_folders(customer_id))["root"])     # the parent folder
+    await drive_layout.ensure_link_access(customer_id)          # anyone with the link can view (never raises)
     last_inbound = _aware(state["last_inbound"])
     if last_inbound is not None and datetime.now(timezone.utc) - last_inbound < SERVICE_WINDOW:
         text = sku_messages.ready_message(link, state["balance"], state.get("name", ""), state.get("email", ""))

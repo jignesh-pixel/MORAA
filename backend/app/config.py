@@ -414,6 +414,9 @@ class Settings(BaseSettings):
     # Finished white-background images go to {phone}/Images/{day}/ in the business shared drive instead of the chat,
     # followed by one "ready" message. Off by default: delivery stays on WhatsApp exactly as before.
     DRIVE_DELIVERY_ENABLED: bool = False
+    # True = each customer's root Drive folder is also "anyone with the link can view" (so the link opens without
+    # signing in). Customer images and invoices sit under that folder: set False to share by email address only.
+    DRIVE_LINK_PUBLIC: bool = True
     GOOGLE_SA_KEY_FILE: str = ""              # path to the service-account JSON key (business Workspace); never logged
     DRIVE_SHARED_DRIVE_ID: str = ""
     DRIVE_IMAGES_RETENTION_DAYS: int = 90     # delivered images are deleted from Drive after this; invoices stay

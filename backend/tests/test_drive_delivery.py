@@ -73,7 +73,7 @@ class DriveUploadTests(DeliveryBase):
                 self.assertTrue(asyncio.run(outbox.run_job_now(job_id)))
         names = sorted(f["name"] for f in self.google.files.values() if f["name"].endswith(".png"))
         self.assertEqual(names, ["001.png", "002.png"])
-        day = [f for f in self.google.files.values() if f["mimeType"].endswith("folder") and re.fullmatch(r"\d{1,2} [A-Z][a-z]{2} \d{4}", f["name"])]
+        day = [f for f in self.google.files.values() if f["mimeType"].endswith("folder") and re.fullmatch(r"\d{4}-\d{2}-\d{2}", f["name"])]
         self.assertEqual(len(day), 1)                                  # one folder for today (IST)
         for order in (first, second):
             status, channel, file_id = self.status(order)
@@ -90,6 +90,42 @@ class DriveUploadTests(DeliveryBase):
         [job] = self.jobs("drive_deliver")
         self.assertEqual(job.status, "pending")                         # back in the queue with a back-off
         self.assertEqual(self.status(order)[0], "drive_pending")
+
+
+class CatalogPackToDriveTests(DeliveryBase):
+    """Catalog Pack styles go to Generated Images/{day} for a customer with a shared folder; Drive failing sends
+    that style through Meta as before."""
+
+    def _style(self, **extra):
+        with patch.object(mws, "_generate_single_pack_style", AsyncMock(return_value=b"\x89PNG\r\n\x1a\nxxxx")), \
+                patch.object(mws, "_upload_and_keep", AsyncMock(return_value="media-1")) as meta:
+            result = asyncio.run(mws._generate_and_upload_style(
+                ingestion_id="ing-1", style_title="Close Up", **extra))
+        return result, meta
+
+    def test_a_style_for_a_customer_with_a_folder_is_uploaded_to_drive_not_meta(self):
+        (ok, token), meta = self._style(drive_customer_id=self.customer_id)
+        self.assertTrue(ok)
+        self.assertEqual(token, mws.DRIVE_RESULT_PREFIX + "001 - Close Up.png")
+        meta.assert_not_awaited()
+        self.assertEqual([f["name"] for f in self.google.files.values() if f["name"].endswith(".png")],
+                         ["001 - Close Up.png"])
+
+    def test_without_a_drive_customer_the_style_goes_to_meta_as_before(self):
+        (ok, token), meta = self._style()
+        self.assertEqual((ok, token), (True, "media-1"))
+        meta.assert_awaited_once()
+
+    def test_when_drive_fails_the_style_goes_to_meta(self):
+        with patch("app.services.drive_layout.upload_delivery_image", AsyncMock(side_effect=RuntimeError("boom"))):
+            (ok, token), meta = self._style(drive_customer_id=self.customer_id)
+        self.assertEqual((ok, token), (True, "media-1"))
+        meta.assert_awaited_once()
+
+    def test_customer_id_if_ready_needs_a_shared_folder(self):
+        self.assertIsNone(drive_delivery.customer_id_if_ready(PHONE))
+        asyncio.run(__import__("app.services.drive_layout", fromlist=["x"]).share_customer_folder(self.customer_id))
+        self.assertEqual(drive_delivery.customer_id_if_ready(PHONE), self.customer_id)
 
 
 class FallbackTests(DeliveryBase):
@@ -156,7 +192,7 @@ class BatchNotifyTests(DeliveryBase):
         send.assert_awaited_once()
         text = send.await_args.args[1]
         self.assertIn("https://drive.google.com/drive/folders/", text)
-        self.assertIn("3 SKUs left", text)
+        self.assertIn("Your batch photos are ready!", text)
 
     def test_waits_while_an_order_is_still_in_progress(self):
         self.deliver(self.order(message_id="wamid.a"))

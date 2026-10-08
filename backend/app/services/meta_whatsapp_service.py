@@ -1857,8 +1857,49 @@ async def _generate_single_pack_style(
         return None
 
 
+# A style that went to the customer's Drive folder comes back from _generate_and_upload_style as
+# DRIVE_RESULT_PREFIX + the Drive file name, where a style sent through Meta comes back as its media id.
+DRIVE_RESULT_PREFIX = "drive:"
+
+
+def _image_mime(image_bytes: bytes) -> str:
+    if image_bytes[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if image_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"
+
+
+async def _upload_style_to_drive(
+    image_bytes: bytes, customer_id: str, ingestion_id: str, style_title: Optional[str]
+) -> Optional[str]:
+    """Put one finished style in the customer's Generated Images/{day} folder (named "NNN - {style}") and keep the
+    dashboard copy, as _upload_and_keep does. Returns the Drive file name, or None when Drive failed (the caller
+    then sends that style through Meta, so a paid style is never lost)."""
+    import tempfile
+    from pathlib import Path
+
+    from app.services import drive_layout
+
+    mime = _image_mime(image_bytes)
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "style" + drive_layout.IMAGE_EXTENSIONS.get(mime, ".png"))
+            await run_io(Path(path).write_bytes, image_bytes)
+            uploaded = await drive_layout.upload_delivery_image(
+                customer_id, path, mime, datetime.now(timezone.utc), label=style_title or "",
+            )
+    except Exception as e:  # noqa: BLE001 -- the style goes through Meta instead
+        logger.error(f"Catalog pack style '{style_title}' not saved to Drive ({type(e).__name__}); sending on WhatsApp")
+        return None
+    info = chat_log.write_output_file(ingestion_id, image_bytes) if chat_log.enabled() else None
+    if info:
+        chat_log.fire(chat_log.register_output, ingestion_id, style_title, 0, info, None)
+    return uploaded["name"]
+
+
 async def _generate_and_upload_style(
-    generate_deadline_seconds: float = 0.0, **kwargs: Any
+    generate_deadline_seconds: float = 0.0, drive_customer_id: Optional[str] = None, **kwargs: Any
 ) -> Tuple[bool, Optional[str]]:
     """Generate one style, then upload it to Meta AT ONCE and let go of the bytes (PERF-5).
 
@@ -1883,6 +1924,12 @@ async def _generate_and_upload_style(
         return False, None
     if not image_bytes:
         return False, None
+    if drive_customer_id:
+        drive_name = await _upload_style_to_drive(
+            image_bytes, drive_customer_id, str(kwargs.get("ingestion_id") or ""), kwargs.get("style_title"))
+        if drive_name:
+            del image_bytes
+            return True, DRIVE_RESULT_PREFIX + drive_name
     media_id = await _upload_and_keep(image_bytes, str(kwargs.get("ingestion_id") or ""), kwargs.get("style_title"))
     del image_bytes
     return True, (media_id or None)
@@ -2079,6 +2126,13 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         quote_id = ingestion.external_message_id
         _release_db(db)
 
+        # Phase 8: a customer whose Drive folder is shared with their email gets the styles there, not in the chat.
+        from app.services import drive_delivery
+
+        drive_customer_id = None
+        if drive_delivery.enabled():
+            drive_customer_id = await run_io(drive_delivery.customer_id_if_ready, recipient_id)
+
         gather_results = await _gather_styles_with_deadline(
             [
                 _generate_and_upload_style(
@@ -2090,6 +2144,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
                     reference_mime_type=reference_mime,
                     request_id=order_request_id,
                     spend_reserved=spend_reserved,
+                    drive_customer_id=drive_customer_id,
                 )
                 for style_title, prompt in style_jobs
             ],
@@ -2100,7 +2155,8 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         # Each style was uploaded to Meta the moment it finished; a style that failed (or was dropped at the
         # deadline) is None. Same order as the styles, failures skipped, exactly as before.
         generated_any = any(r and r[0] for r in gather_results)
-        media_ids: List[str] = [r[1] for r in gather_results if r and r[1]]
+        media_ids: List[str] = [r[1] for r in gather_results if r and r[1] and not r[1].startswith(DRIVE_RESULT_PREFIX)]
+        drive_count = sum(1 for r in gather_results if r and r[1] and r[1].startswith(DRIVE_RESULT_PREFIX))
 
         # Styles that produced nothing (failed, dropped at the deadline) cost nothing: give their reserved
         # slots back to the shared daily counter (COST-1).
@@ -2118,9 +2174,10 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         if not _advance_status(db, ingestion_id, "processing", "generated"):
             return False
 
-        if not media_ids:
+        if not media_ids and not drive_count:
             return await _fail("All Meta media uploads failed", delivery=True)
 
+        from app.services import batch_notify
         from app.services.wallet_service import find_customer_by_phone, get_balance
 
         cust = find_customer_by_phone(db, recipient_id)
@@ -2128,12 +2185,16 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         balance_text = f"₹{rem_bal:,}"
         _release_db(db)
 
-        sent_count = await send_catalog_pack_images_to_whatsapp(
-            recipient_id=recipient_id,
-            image_urls=media_ids,
-            balance_text=balance_text,
-            reply_to_message_id=quote_id,
-        )
+        # Styles saved to Drive are announced by the one batch "ready" message; only the styles Drive could not take
+        # (if any) are sent here.
+        sent_count = drive_count
+        if media_ids:
+            sent_count += await send_catalog_pack_images_to_whatsapp(
+                recipient_id=recipient_id,
+                image_urls=media_ids,
+                balance_text=balance_text,
+                reply_to_message_id=quote_id,
+            )
         # Completion is measured against the styles this pack was meant to
         # produce, not just the images that happened to be generated.
         total_images = len(style_jobs)
@@ -2147,7 +2208,11 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
             if not _advance_status(db, ingestion_id, "generated", "delivered_partial"):
                 return True       # recovery changed the order; the images are already with the customer
             ingestion.error_message = f"Delivered {sent_count}/{total_images} images"
+            if drive_count:
+                ingestion.delivery_channel = drive_delivery.CHANNEL_DRIVE
             db.commit()
+            if drive_count:
+                await run_io(batch_notify.schedule, drive_customer_id)
             logger.warning(
                 f"Catalog pack partially delivered: ingestion_id={ingestion_id} "
                 f"sent={sent_count}/{total_images} recipient={mask_phone(recipient_id)}"
@@ -2167,7 +2232,11 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         if not _advance_status(db, ingestion_id, "generated", "delivered"):
             return True       # images are already with the customer; do not overwrite a swept status
         ingestion.error_message = None
+        if drive_count:
+            ingestion.delivery_channel = drive_delivery.CHANNEL_DRIVE
         db.commit()
+        if drive_count:
+            await run_io(batch_notify.schedule, drive_customer_id)
 
         logger.info(
             f"Catalog pack delivered: ingestion_id={ingestion_id} images={len(media_ids)} "
