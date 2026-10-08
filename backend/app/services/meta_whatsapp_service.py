@@ -876,13 +876,15 @@ async def send_collection_products(
     """A picked collection's products as WhatsApp's multi-product message ("View items"): the customer sets each
     tier's quantity with + / -, then sends the cart (an ``order``). Prices shown there come from the catalogue
     (``set_price.py`` keeps them equal to pricing.py); the cart is always re-priced by the server. Without
-    META_CATALOG_ID, or if Meta refuses the message, the list menu."""
+    META_CATALOG_ID, or if Meta refuses the message, the list menu only with PRODUCT_LIST_FALLBACK_ENABLED; otherwise
+    the refusal is logged in full (Meta's code and message, the catalogue id and the exact retailer ids sent)."""
     retailer_ids = _collection_retailer_ids(collection_id)
     catalog_id = (settings.META_CATALOG_ID or "").strip()
     if not retailer_ids:
         return False
     if not catalog_id:
-        return await send_pack_menu(recipient_id, reply_to_message_id)
+        logger.error("META_CATALOG_ID is not set: cannot send the collection product list")
+        return await _product_list_failed(recipient_id, reply_to_message_id)
     studio = collection_id == COLLECTION_STUDIO
     title = sku_messages.STUDIO_COLLECTION_TITLE if studio else sku_messages.CATALOG_COLLECTION_TITLE
     payload = {
@@ -903,9 +905,25 @@ async def send_collection_products(
             },
         },
     }
-    if await _post_message_payload(payload, "collection products", reply_to_message_id=reply_to_message_id):
+    error: Dict[str, Any] = {}
+    if await _post_message_payload(payload, "collection products", reply_to_message_id=reply_to_message_id,
+                                   error_out=error):
         return True
-    return await send_pack_menu(recipient_id, reply_to_message_id)       # products refused: the list still works
+    logger.error(
+        f"product_list refused by Meta: collection={collection_id} catalog_id={catalog_id} "
+        f"retailer_ids={retailer_ids[:30]} meta_error={error}"
+    )
+    return await _product_list_failed(recipient_id, reply_to_message_id)
+
+
+async def _product_list_failed(recipient_id: str, reply_to_message_id: Optional[str]) -> bool:
+    """The product list could not be sent: the radio list menu with PRODUCT_LIST_FALLBACK_ENABLED, else a short text
+    (never silence) so the customer can ask again."""
+    if settings.PRODUCT_LIST_FALLBACK_ENABLED:
+        return await send_pack_menu(recipient_id, reply_to_message_id)
+    await send_whatsapp_text(recipient_id, "Sorry, we couldn't load the items right now. Please tap View Collections "
+                                           "and try again in a moment.", reply_to_message_id=reply_to_message_id)
+    return False
 
 
 async def send_catalogue(recipient_id: str, reply_to_message_id: Optional[str] = None) -> bool:

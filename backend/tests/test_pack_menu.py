@@ -453,6 +453,15 @@ class JourneyTests(PackWebhookBase):
             ids = [i["product_retailer_id"] for i in section["product_items"]]
             self.assertTrue(ids and all(i.startswith(expected) for i in ids))
 
+    def test_a_refused_product_list_is_not_replaced_by_the_radio_list_unless_enabled(self):
+        import asyncio
+
+        for fallback, menu_calls in ((False, 0), (True, 1)):
+            with patch.object(settings, "META_CATALOG_ID", "CAT1"),                     patch.object(settings, "PRODUCT_LIST_FALLBACK_ENABLED", fallback),                     patch.object(mws, "_post_message_payload", new=AsyncMock(return_value=False)),                     patch.object(mws, "send_whatsapp_text", new=AsyncMock(return_value=True)) as text,                     patch.object(mws, "send_pack_menu", new=AsyncMock(return_value=True)) as menu:
+                asyncio.run(mws.send_collection_products(SENDER, mws.COLLECTION_STUDIO))
+            self.assertEqual(menu.await_count, menu_calls)
+            self.assertEqual(text.await_count, 0 if fallback else 1)
+
     def test_tapping_the_old_view_collections_button_sends_the_list(self):
         tap = {"type": "interactive", "id": "wamid.coll1", "from": SENDER, "timestamp": "1",
                "interactive": {"type": "button_reply", "button_reply": {"id": mws.COLLECTIONS_BUTTON, "title": "View Collections"}}}

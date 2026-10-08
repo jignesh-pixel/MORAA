@@ -406,6 +406,9 @@ class Settings(BaseSettings):
     SKU_CREDIT_VALIDITY_DAYS: int = 90        # a new pack extends every unused credit to this many days
     SKU_ERPNEXT_ITEM_CODE: str = ""           # ERPNext item for packs; empty = ERPNEXT_RECHARGE_ITEM_CODE
     META_CATALOG_ID: str = ""                 # WhatsApp catalogue that scripts/set_price.py updates
+    # Debug: when Meta refuses the Step-2 product_list message, False = log the exact Meta error and tell the customer
+    # to try again (no silent radio list); True = fall back to the radio list menu.
+    PRODUCT_LIST_FALLBACK_ENABLED: bool = False
 
     # --- Phase 8: Google Drive delivery (app/services/google_drive.py, drive_layout.py) ---
     # Finished white-background images go to {phone}/Images/{day}/ in the business shared drive instead of the chat,
