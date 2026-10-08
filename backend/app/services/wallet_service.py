@@ -32,7 +32,6 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.config import settings
 from app.models.customer import Customer
 from app.models.wallet_transaction import (
     KIND_CREDIT_PAYMENT,
@@ -45,6 +44,7 @@ from app.models.wallet_transaction import (
 )
 from app.models.whatsapp_ingestion import WhatsAppIngestion
 from app.repositories.base import BaseRepository
+from app.services import pricing
 from app.utils.logger import logger, mask_phone
 from app.utils.phone import INDIA_CODE, normalize_phone
 # ─── Ingestion statuses owned by the wallet gate ─────────────────────────
@@ -63,13 +63,13 @@ BLOCKED_GENERATION_STATUSES = frozenset(
 
 
 def price_per_image() -> int:
-    """Configured price of one generated image, in whole Rupees (>= 1)."""
-    return max(int(settings.WALLET_IMAGE_PRICE_RUPEES), 1)
+    """Price of one Catalog Pack paid from the wallet, in whole Rupees (>= 1). See app/services/pricing.py."""
+    return pricing.catalog_pack_price()
 
 
 def format_rupees(amount: int) -> str:
-    """Format a rupee amount for customer-facing text (e.g. '₹1,000')."""
-    return f"₹{max(int(amount), 0):,}"
+    """Format a rupee amount for customer-facing text (e.g. '₹1,000'). See app/services/pricing.py."""
+    return pricing.format_rupees(amount)
 
 
 def _customer_repo(db: Session) -> BaseRepository:

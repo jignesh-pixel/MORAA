@@ -179,6 +179,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.bind(category="system").warning(f"Retention sweep not started: {e}")
 
+    expiry_task = None
+    try:
+        from app.services.sku_packs import run_expiry_forever
+
+        expiry_task = asyncio.create_task(run_expiry_forever())
+    except Exception as e:
+        logger.bind(category="system").warning(f"SKU credit expiry sweep not started: {e}")
+
     recovery_task = None
     try:
         from app.api.routes.meta_webhook import STUCK_WHITE_AFTER as _STUCK_AFTER
@@ -201,7 +209,7 @@ async def lifespan(app: FastAPI):
     # Shutdown. Order matters: stop the periodic jobs first, let orders the outbox sweep started finish (they still
     # need the worker pools and the provider clients), give the periodic-job leases back, and only then close the
     # pools and clients.
-    for sweep in (reconcile_task, alert_task, link_reconcile_task, recovery_task, outbox_task, retention_task):
+    for sweep in (reconcile_task, alert_task, link_reconcile_task, recovery_task, outbox_task, retention_task, expiry_task):
         if sweep is not None:
             sweep.cancel()
     try:

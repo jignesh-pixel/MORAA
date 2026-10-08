@@ -26,6 +26,8 @@ from app.services.meta_whatsapp_service import (
 )
 from app.models.whatsapp_payment_order import WhatsAppPaymentOrder
 from app.models.wallet_transaction import KIND_CREDIT_PAYMENT, KIND_DEBIT_DISPUTE, KIND_DEBIT_REFUND
+from app.models.sku_credit import SKU_CREATIVE
+from app.services import pricing, sku_packs
 from app.services.pending_payment_service import mark_pending_credited, record_pending_payment
 from app.services.wallet_service import (
     CLAWBACK_OUTCOME_DUPLICATE,
@@ -42,7 +44,7 @@ from app.utils.phone import is_plausible_phone, normalize_phone
 router = APIRouter(prefix="/api/payments", tags=["Payments"])
 
 SIGNATURE_HEADER = "X-Razorpay-Signature"
-PAISE_PER_RUPEE = 100
+PAISE_PER_RUPEE = pricing.PAISE_PER_RUPEE
 
 AUDIT_ACTION_PAYMENT_CAPTURED = "razorpay_payment_captured"
 # Captured payment the webhook could not match to any payer (no phone).
@@ -74,6 +76,18 @@ PAYMENT_TIPS_MESSAGE = (
     "Send your earring photo whenever you're ready! 📸\n"
     "(Tip: Good lighting and sharp focus produce the best studio results)"
 )
+
+# Receipt for a SKU pack payment (notes.purpose "sku_pack"): credits, not rupees, were added.
+PACK_RECEIPT_MESSAGE = (
+    "Payment Received 💳\n\n"
+    "{pack} added to your account.\n"
+    "SKUs available: {credits}\n"
+    "Valid till: {valid_till}\n\n"
+    "Send your earring photos whenever you're ready! 📸\n"
+    "(Each photo uses one SKU and makes one white-background studio image)"
+)
+# Added to the pack receipt when the customer has no email yet: their Drive image folder is shared to it.
+PACK_EMAIL_REQUEST_LINE = "\n\nPlease send us your email address so we can share your image folder with you. 📁"
 
 
 def verify_razorpay_signature(raw_body: bytes, signature_header: Optional[str]) -> bool:
@@ -304,7 +318,10 @@ def _handle_money_back_event(db: Session, payload: Dict[str, Any], event: str) -
 
     kind = KIND_DEBIT_REFUND if is_refund else KIND_DEBIT_DISPUTE
     try:
-        result = claw_back_payment(db, payment_id=payment_id, entity_id=entity_id, amount=amount, kind=kind)
+        # A SKU pack payment gives back credits; anything else is a wallet payment, exactly as before.
+        result = sku_packs.claw_back_pack(db, payment_id=payment_id, entity_id=entity_id, amount_rupees=amount, kind=kind)
+        if result is None:
+            result = claw_back_payment(db, payment_id=payment_id, entity_id=entity_id, amount=amount, kind=kind)
     except Exception as e:
         logger.error(f"Razorpay {event} {entity_id}: claw-back failed, asking Razorpay to retry: {e}")
         raise HTTPException(
@@ -369,11 +386,76 @@ def _whatsapp_pay_order_state(db: Session, payment_id: str, payload: Dict[str, A
     return "captured" if row[1] else (row[0] or "created")
 
 
+def _whole(raw: Any) -> int:
+    """A note value as a whole number (-1 when it is not one). Never raises."""
+    text = str(raw).strip() if isinstance(raw, (str, int)) and not isinstance(raw, bool) else ""
+    try:
+        return int(text) if text.isascii() and text.isdigit() else -1
+    except ValueError:                          # more digits than int() accepts
+        return -1
+
+
+def _pack_counts(payload: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+    """(white-background SKUs, Creative Studio Packs) of a SKU pack payment (notes.purpose "sku_pack"; payment notes
+    first, then the payment link's notes).
+
+    None = not a pack (a wallet recharge, as before). (0, 0) = a pack whose counts are missing or not whole numbers
+    from 0 to MAX_PACK_UNITS (at least one item): such a payment is parked for review, never credited."""
+    for path in (("payload", "payment", "entity", "notes"), ("payload", "payment_link", "entity", "notes")):
+        notes = _nested_get(payload, *path)
+        if not isinstance(notes, dict) or str(notes.get("purpose") or "").strip().lower() != sku_packs.PURPOSE_SKU_PACK:
+            continue
+        units = _whole(notes.get("units", notes.get("total_skus")))
+        creative = _whole(notes.get("creative_packs", 0))
+        limit = sku_packs.MAX_PACK_UNITS
+        if 0 <= units <= limit and 0 <= creative <= limit and units + creative >= 1:
+            return units, creative
+        return 0, 0
+    return None
+
+
+def _pack_matches_link(db: Session, payload: Dict[str, Any], units: int, amount_paid: int) -> bool:
+    """A pack is granted only for a payment of a pack link WE created, for that link's units and amount: notes on a
+    payment from anywhere else (a payment page, a checkout) are never trusted."""
+    from app.models.razorpay_payment_link import RazorpayPaymentLink
+
+    link_id = _as_id(_nested_get(payload, "payload", "payment_link", "entity", "id"))
+    if not link_id:
+        return False
+    row = db.query(RazorpayPaymentLink).filter(RazorpayPaymentLink.link_id == link_id).first()
+    return (row is not None and row.purpose == sku_packs.PURPOSE_SKU_PACK and int(row.units or 0) == int(units)
+            and int(row.amount_rupees) == int(amount_paid))
+
+
+def _grant_cart(db: Session, customer: Customer, white: int, creative: int, payment_id: str) -> None:
+    """Grant every SKU a cart payment bought, in the caller's transaction (each once: a repeat raises IntegrityError)."""
+    if white:
+        sku_packs.grant_pack_credits(db, customer, white, payment_id)
+    if creative:
+        sku_packs.grant_pack_credits(db, customer, creative, payment_id, sku=SKU_CREATIVE)
+
+
 def _resolve_customer(db: Session, sender_id: str) -> Optional[Customer]:
     if not sender_id:
         return None
 
     return find_customer_by_phone(db, sender_id)
+
+
+def _pack_receipt(db: Session, customer: Customer, units: int, creative: int = 0) -> str:
+    """The pack receipt with the credits and validity read from the ledger at send time (includes this grant)."""
+    until = sku_packs.valid_until(db, customer.id) if units else sku_packs.valid_until(db, customer.id, SKU_CREATIVE)
+    bought = [pricing.pack_title(units)] if units else []
+    if creative:
+        bought.append(f"{creative} x {pricing.CREATIVE_TITLE}")
+    text = PACK_RECEIPT_MESSAGE.format(
+        pack=" + ".join(bought),
+        credits=sku_packs.balance(db, customer.id),
+        valid_till=sku_packs.ist_date(until) if until is not None else "-",
+    )
+    if creative:
+        text += f"\nCreative Studio Packs available: {sku_packs.balance(db, customer.id, SKU_CREATIVE)}"
+    return text if getattr(customer, "email", None) else text + PACK_EMAIL_REQUEST_LINE
 
 
 async def _queue_invoice(background_tasks: BackgroundTasks, args: Dict[str, Any]) -> None:
@@ -518,23 +600,26 @@ def _payment_audit_row(
     sender_id: str,
     amount_paid: int,
     auto_provisioned: bool = False,
+    pack_units: Optional[int] = None,
+    creative_packs: int = 0,
 ) -> AuditLog:
+    details: Dict[str, Any] = {
+        "sender_id": sender_id,
+        "amount_paid": amount_paid,
+        "currency": "INR",
+        # Payer had no matching customer; money is held on an
+        # unregistered wallet row until they register.
+        "auto_provisioned": auto_provisioned,
+    }
+    if pack_units or creative_packs:
+        details.update({"purpose": sku_packs.PURPOSE_SKU_PACK, "units": pack_units, "creative_packs": creative_packs})
     return AuditLog(
         user_id=None,
         action=AUDIT_ACTION_PAYMENT_CAPTURED,
         resource_id=payment_reference,
         resource_type=AUDIT_RESOURCE_TYPE,
         status="success",
-        details=json.dumps(
-            {
-                "sender_id": sender_id,
-                "amount_paid": amount_paid,
-                "currency": "INR",
-                # Payer had no matching customer; money is held on an
-                # unregistered wallet row until they register.
-                "auto_provisioned": auto_provisioned,
-            }
-        ),
+        details=json.dumps(details),
     )
 
 
@@ -656,6 +741,31 @@ async def process_razorpay_event(
         logger.info(f"Payment {payment_reference} already processed, skipping duplicate (event={event}, no credit).")
         return {"status": "already_processed"}
 
+    # A SKU pack payment grants credits instead of rupees; its units come from the notes we set on the link.
+    pack = _pack_counts(payload)
+    pack_white, pack_creative = pack if pack else (0, 0)
+    pack_units = (pack_white + pack_creative) if pack else None     # truthy = this payment buys SKU credits
+    if pack_units == 0:
+        logger.error(
+            f"ALERT Razorpay payment {payment_reference} (₹{amount_paid}) is a SKU pack with unusable units; "
+            "NOT credited and parked for manual review."
+        )
+        record_pending_payment(
+            db, payment_id=payment_reference, amount_rupees=amount_paid, currency=currency, event=event,
+            payer_hint=sender_id, reason="bad_pack_units",
+        )
+        return {"status": "pack_units_invalid"}
+    if pack_units and not _pack_matches_link(db, payload, pack_white, amount_paid):
+        logger.error(
+            f"ALERT Razorpay payment {payment_reference} (₹{amount_paid}) says it is a SKU pack but does not match a "
+            "pack link we created; NOT credited and parked for manual review."
+        )
+        record_pending_payment(
+            db, payment_id=payment_reference, amount_rupees=amount_paid, currency=currency, event=event,
+            payer_hint=sender_id, reason="pack_unverified",
+        )
+        return {"status": "pack_unverified"}
+
     # Digits only: spaces/hyphens/brackets in the payer's number must not
     # create a second wallet row for the same phone.
     clean_sender = normalize_phone(sender_id)
@@ -666,7 +776,8 @@ async def process_razorpay_event(
     # The audit row is the idempotency claim: it is written in the SAME
     # transaction as the wallet change, and uq_audit_logs_money_once makes a
     # concurrent duplicate fail -- so a payment credits at most once.
-    db.add(_payment_audit_row(payment_reference, clean_sender, amount_paid, customer_was_created))
+    db.add(_payment_audit_row(payment_reference, clean_sender, amount_paid, customer_was_created, pack_white,
+                              pack_creative))
     try:
         # Claim first: a concurrent duplicate fails here (on PostgreSQL it
         # waits for the winner's commit, then fails) before any credit.
@@ -686,16 +797,21 @@ async def process_razorpay_event(
             business_name="Jewelry Business",
             gst_number="N/A",
             address="N/A",
-            wallet_balance=amount_paid,
+            wallet_balance=0 if pack_units else amount_paid,      # a pack buys credits, never wallet rupees
             is_registered=False,
         )
         db.add(customer)
     try:
         if customer_was_created:
             db.flush()      # assigns customer.id; a concurrent first payment conflicts here (IntegrityError)
-            record_ledger(db, customer_id=customer.id, kind=KIND_CREDIT_PAYMENT, amount=amount_paid, ref=payment_reference)
+            if pack_units:
+                _grant_cart(db, customer, pack_white, pack_creative, payment_reference)
+            else:
+                record_ledger(db, customer_id=customer.id, kind=KIND_CREDIT_PAYMENT, amount=amount_paid, ref=payment_reference)
         else:
-            if credit_wallet(db, customer.whatsapp_id, amount_paid, commit=False, ref=payment_reference) != 1:
+            if pack_units:
+                _grant_cart(db, customer, pack_white, pack_creative, payment_reference)
+            elif credit_wallet(db, customer.whatsapp_id, amount_paid, commit=False, ref=payment_reference) != 1:
                 raise RuntimeError("customer row not updated")
             if getattr(customer, "full_name", None):
                 customer_name = customer.full_name
@@ -730,23 +846,32 @@ async def process_razorpay_event(
         )
         return _retry_or_give_up(db, payment_reference, amount_paid, f"wallet credit failed: {e}")
 
-    logger.info(
-        f"Wallet credited ₹{amount_paid} for {mask_phone(clean_sender)}: event={event} "
-        f"payment_id={payment_reference} balance_after={get_balance(db, customer.whatsapp_id)}. "
-        "Now sending WhatsApp confirmation."
-    )
+    if pack_units:
+        logger.info(
+            f"SKU pack of {pack_units} granted for ₹{amount_paid} to {mask_phone(clean_sender)}: event={event} "
+            f"payment_id={payment_reference}. Now sending WhatsApp confirmation."
+        )
+    else:
+        logger.info(
+            f"Wallet credited ₹{amount_paid} for {mask_phone(clean_sender)}: event={event} "
+            f"payment_id={payment_reference} balance_after={get_balance(db, customer.whatsapp_id)}. "
+            "Now sending WhatsApp confirmation."
+        )
 
     # WhatsApp Notifications Dispatch
     try:
         # 1. Payment receipt with the balance read from the DB at send time
         # (includes this credit; never echoes the payment amount as balance).
-        await send_whatsapp_text(
-            recipient_id=clean_sender,
-            message_text=PAYMENT_TIPS_MESSAGE.format(
-                paid=f"{amount_paid:,}",
-                balance=f"{get_balance(db, customer.whatsapp_id):,}",
-            ),
-        )
+        if pack_units:
+            await send_whatsapp_text(recipient_id=clean_sender, message_text=_pack_receipt(db, customer, pack_white, pack_creative))
+        else:
+            await send_whatsapp_text(
+                recipient_id=clean_sender,
+                message_text=PAYMENT_TIPS_MESSAGE.format(
+                    paid=f"{amount_paid:,}",
+                    balance=f"{get_balance(db, customer.whatsapp_id):,}",
+                ),
+            )
 
         # 2. PDF Invoice Dispatch -- in the background after the response:
         # ERPNext Sales Invoice PDF when ERPNEXT_INVOICE_ENABLED, otherwise
@@ -771,5 +896,9 @@ async def process_razorpay_event(
         logger.info(f"Sent confirmation and tips to {mask_phone(clean_sender)}; invoice queued")
     except Exception as e:
         logger.error(f"Post-payment WhatsApp dispatch failed: {e}")
+
+    if pack_units:
+        # Usage Logs sheet row and Drive folder share (outbox jobs; no-ops unless Drive delivery is on).
+        await run_io(sku_packs.queue_followups, customer.id)
 
     return {"status": "ok"}

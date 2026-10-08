@@ -4,6 +4,8 @@ Retention (off until RETENTION_ENABLED is true; run daily by ``run_retention_for
   * customer photos from finished WhatsApp orders are deleted from disk after RETENTION_MEDIA_DAYS (the database row
     stays, marked ``expired``, so order history still reads correctly);
   * phone numbers inside audit-log details are masked after RETENTION_AUDIT_MASK_DAYS;
+  * images delivered into a customer's Google Drive folder are deleted there after DRIVE_IMAGES_RETENTION_DAYS (the
+    invoice PDFs in Drive are never touched);
   * financial records (wallet ledger, payment and refund rows, invoices) are NEVER touched here: they are kept for the
     statutory period (8 years) and only a person may remove them.
 
@@ -11,7 +13,9 @@ Erasure ("DELETE MY DATA", or ``scripts/erase_customer.py``): removes a customer
 the money trail. The wallet ledger is linked to the customer row by id, so the row stays with its name, business,
 GSTIN and address replaced and its phone number replaced by a placeholder; the phone number is removed from the
 customer's order and audit records. Payment and invoice records that carry the number are kept for tax and audit
-purposes and the customer is told so. A customer with money left in the wallet is refused (a person must settle it).
+purposes and the customer is told so. A customer with money left in the wallet or unused SKU credits is refused (a
+person must settle it). Their Google Drive folder loses its images and usage log, is unshared and renamed; the
+invoices in it stay.
 """
 
 from __future__ import annotations
@@ -64,11 +68,15 @@ def purge_expired_media(db: Session, days: Optional[int] = None, batch: int = 20
     if days <= 0:
         return 0
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    # Only photos not expired yet, oldest first: without this the same first rows came back every day and the
+    # purge stopped after one batch.
     rows = (
         db.query(WhatsAppIngestion.image_id)
-        .filter(WhatsAppIngestion.image_id.isnot(None), WhatsAppIngestion.status.in_(FINISHED_STATUSES),
-                WhatsAppIngestion.created_at < cutoff)
-        .limit(batch * 3)
+        .join(Image, Image.id == WhatsAppIngestion.image_id)
+        .filter(WhatsAppIngestion.status.in_(FINISHED_STATUSES), WhatsAppIngestion.created_at < cutoff,
+                or_(Image.processing_status.is_(None), Image.processing_status != EXPIRED))
+        .order_by(WhatsAppIngestion.created_at)
+        .limit(batch)
         .all()
     )
     expired = 0
@@ -149,6 +157,41 @@ def _delete_output_file(output) -> bool:
         return False
 
 
+def purge_drive_images(db: Session, days: Optional[int] = None, batch: int = 200) -> int:
+    """Delete delivered images from the customers' Drive folders once their order is older than ``days`` and forget
+    the Drive id. A file Drive would not delete keeps its id and is tried again at the next pass. Invoices are never
+    touched. Returns how many images were removed."""
+    from app.services import drive_layout, google_drive
+
+    days = int(settings.DRIVE_IMAGES_RETENTION_DAYS if days is None else days)
+    if days <= 0 or not google_drive.configured():
+        return 0
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    removed = 0
+    last_id = ""
+    while True:
+        rows = (
+            db.query(WhatsAppIngestion.id, WhatsAppIngestion.drive_file_id)
+            .filter(WhatsAppIngestion.drive_file_id.isnot(None), WhatsAppIngestion.created_at < cutoff,
+                    WhatsAppIngestion.id > last_id)
+            .order_by(WhatsAppIngestion.id)
+            .limit(batch)
+            .all()
+        )
+        if not rows:
+            break
+        gone = [row_id for row_id, file_id in rows if drive_layout.delete_drive_files_sync([file_id]) == 1]
+        if gone:
+            db.query(WhatsAppIngestion).filter(WhatsAppIngestion.id.in_(gone)).update(
+                {WhatsAppIngestion.drive_file_id: None}, synchronize_session=False)
+        db.commit()
+        removed += len(gone)
+        last_id = rows[-1][0]
+    if removed:
+        logger.bind(category="system").info(f"Retention: deleted {removed} Drive image(s) older than {days} days")
+    return removed
+
+
 def mask_old_audit_details(db: Session, days: Optional[int] = None, batch: int = 500) -> int:
     """Mask phone numbers in the details of audit rows older than ``days``, page by page until every old row has been
     looked at. Rows that a person still has to act on (a pending payment review, a pending clawback) keep their numbers
@@ -183,14 +226,16 @@ def mask_old_audit_details(db: Session, days: Optional[int] = None, batch: int =
 def run_retention_pass() -> Dict[str, int]:
     """One retention pass in its own session (blocking). Does nothing unless RETENTION_ENABLED."""
     if not settings.RETENTION_ENABLED:
-        return {"photos": 0, "audit_rows": 0, "chat_messages": 0, "outputs": 0}
+        return {"photos": 0, "audit_rows": 0, "chat_messages": 0, "outputs": 0, "drive_images": 0}
     from app.database import SessionLocal
 
     with SessionLocal() as db:
         photos = purge_expired_media(db)
         audit_rows = mask_old_audit_details(db)
         chat = purge_chat_history(db)
-    return {"photos": photos, "audit_rows": audit_rows, "chat_messages": chat["messages"], "outputs": chat["outputs"]}
+        drive_images = purge_drive_images(db)
+    return {"photos": photos, "audit_rows": audit_rows, "chat_messages": chat["messages"], "outputs": chat["outputs"],
+            "drive_images": drive_images}
 
 
 async def run_retention_forever() -> None:
@@ -249,16 +294,26 @@ def erase_customer(db: Session, customer: Customer) -> Dict[str, int]:
             f"Your wallet still holds ₹{int(customer.wallet_balance):,}. Wallet balances are not refunded, so please use "
             "your balance for orders first, then ask again."
         )
+    from app.models.sku_credit import SKU_CREATIVE, SKU_WHITE_BG
+    from app.services import sku_packs
+
+    credits = sku_packs.balance(db, customer.id, SKU_WHITE_BG) + sku_packs.balance(db, customer.id, SKU_CREATIVE)
+    if credits > 0:
+        raise ErasureRefused(
+            f"You still have {credits} unused image credit{'' if credits == 1 else 's'}. Credits are not refunded, so "
+            "please use them for orders first, then ask again."
+        )
     phone = customer.whatsapp_id
     variants = {phone, f"+{phone}", phone[-10:]} if phone.isdigit() else {phone}
     # Refuse while anything involving money or an order for this number is still moving: a refund, a late payment or a
     # generation in progress would otherwise land on an erased, unreachable account.
     from app.models.whatsapp_payment_order import WhatsAppPaymentOrder
+    from app.services.drive_delivery import STATUS_DRIVE_PENDING
     from app.services.meta_whatsapp_service import STUCK_PAID_STATUSES
 
     busy = db.query(WhatsAppIngestion.id).filter(
         WhatsAppIngestion.external_user_id.in_(variants),
-        WhatsAppIngestion.status.in_(tuple(STUCK_PAID_STATUSES) + ("choice_claimed", "received")),
+        WhatsAppIngestion.status.in_(tuple(STUCK_PAID_STATUSES) + ("choice_claimed", "received", STATUS_DRIVE_PENDING)),
     ).first() is not None or db.query(WhatsAppPaymentOrder.id).filter(
         WhatsAppPaymentOrder.whatsapp_id.in_(variants),
         WhatsAppPaymentOrder.status.in_(("created", "sent", "pending")),
@@ -320,11 +375,33 @@ def erase_customer(db: Session, customer: Customer) -> Dict[str, int]:
     customer.is_registered = False
     customer.is_gst_verified = False
     customer.whatsapp_id = f"erased-{customer.id}"[:100]
+    customer.drive_shared_to = None
+    has_drive = bool(customer.drive_folder_id)
     db.add(AuditLog(user_id=None, action=ERASED_ACTION, resource_id=customer.id, resource_type="customer",
                     status="success", details=f"photos={photos} orders={len(ingestions)}"))
     db.commit()
+    # Drive after the commit: the Drive step updates the customer row in its own session.
+    drive = _erase_drive(customer.id) if has_drive else 0
     logger.bind(category="system").info(f"Customer {customer.id} erased: photos={photos} orders={len(ingestions)}")
-    return {"photos": photos, "orders": len(ingestions), "audit_rows": masked_rows, "chat_messages": chat_removed}
+    return {"photos": photos, "orders": len(ingestions), "audit_rows": masked_rows, "chat_messages": chat_removed,
+            "drive": drive}
+
+
+def _erase_drive(customer_id: str) -> int:
+    """(blocking: erasure runs in a worker thread or a script) Remove the customer's Drive images and usage log,
+    unshare and rename the folder; invoices stay. A Drive failure is logged and never undoes the database erasure.
+    Returns 1 when Drive was cleaned."""
+    import asyncio
+
+    from app.services import drive_layout
+
+    try:
+        asyncio.run(drive_layout.erase_customer_drive(customer_id))
+        return 1
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"ALERT erasure of customer {customer_id}: Drive folder not cleaned ({type(e).__name__}); "
+                     "remove its images and sharing by hand")
+        return 0
 
 
 def erase_customer_by_id(customer_id: str) -> Dict[str, int]:

@@ -27,10 +27,18 @@
             "required": true
           },
           {
+            "type": "TextInput",
+            "name": "email",
+            "label": "Email",
+            "input-type": "email",
+            "required": true,
+            "helper-text": "For your image folder. A Gmail address works best."
+          },
+          {
             "type": "TextArea",
             "name": "address",
-            "label": "Address",
-            "required": true
+            "label": "Address (Optional)",
+            "required": false
           },
           {
             "type": "TextInput",
@@ -48,6 +56,7 @@
               "payload": {
                 "full_name": "${form.full_name}",
                 "business_name": "${form.business_name}",
+                "email": "${form.email}",
                 "address": "${form.address}",
                 "gst_number": "${form.gst_number}"
               }

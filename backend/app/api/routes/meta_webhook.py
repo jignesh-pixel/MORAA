@@ -25,6 +25,7 @@ import json
 from datetime import datetime, timedelta, timezone
 import re
 import uuid
+import weakref
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.responses import PlainTextResponse
@@ -51,10 +52,12 @@ from app.services.image_prevalidation_service import check_image_quality
 from app.services import meta_whatsapp_service as _mws
 from app.services.meta_whatsapp_service import (
     CATALOG_PACK_ACK_TEMPLATE,
+    COLLECTIONS_BUTTON,
     PRODUCT_BUTTON_WHITE,
     parse_product_button_id,
     process_whatsapp_white_bg,
     send_product_selection_buttons,
+    send_pack_menu,
     send_registration_flow,
     download_media,
     get_media_url,
@@ -92,6 +95,9 @@ from app.services.wallet_service import (
     price_per_image,
 )
 from app.services import bulk_orders, chat_log, consent_service, data_lifecycle, eta_service
+from app.services import pricing, razorpay_service, sku_messages, sku_packs
+from app.models.sku_credit import SKU_CREATIVE, SKU_WHITE_BG
+from app.models.whatsapp_ingestion import CREDIT_SOURCE_SKU
 from app.utils.logger import logger, mask_phone
 from app.ai.image_generation_manager import generation_capacity_blocked
 from app.utils.executors import run_cpu, run_io
@@ -230,8 +236,8 @@ async def _trigger_generation(ingestion_id: str) -> None:
 PRODUCT_LABELS = {PRODUCT_WHITE_BG: "Clean Studio Shot", PRODUCT_PACK_1: "Full Catalog Pack"}
 
 WELCOME_MESSAGE = (
-    "Welcome to Moraa Studio ✨\n\n"
-    "We transform your raw jewelry photos into studio-grade product visuals in seconds.\n\n"
+    "Welcome to Moraa Studio ✨\n"
+    "We transform your raw jewelry photos into studio-grade product visuals in seconds.\n"
     "Let’s quickly set up your account!"
 )
 
@@ -288,6 +294,22 @@ def _extract_email(text: Optional[str]) -> Optional[str]:
         if len(match.group(1)) <= 64 and len(match.group(0)) <= 254:
             return match.group(0).lower()
     return None
+
+
+async def _share_customer_folder(db: Session, cust: Customer) -> None:
+    """Phase 8: an email was just stored, so share the customer's Drive folder with it (an outbox job, see
+    drive_layout.queue_share). Nothing happens unless Drive delivery is on, and nothing here can break the chat."""
+    if not settings.DRIVE_DELIVERY_ENABLED:
+        return
+    try:
+        customer_id = cust.id
+        db.commit()                      # end this transaction: queue_share uses its own connection
+        from app.services import drive_layout
+
+        await run_io(drive_layout.queue_share, customer_id)
+    except Exception as e:  # noqa: BLE001 -- the email is saved either way; never log it
+        db.rollback()
+        logger.error(f"Drive folder share not queued: {type(e).__name__}")
 
 
 _REG_NAME_KEYS = {"name", "full name", "your name"}
@@ -408,11 +430,19 @@ async def _send_registration_confirmation(
             "Send your jewelry photo whenever you're ready to start!",
         )
         return
+    if settings.SKU_PACKS_ENABLED:
+        # Phase 8: packs instead of a wallet recharge. The collections view (native catalogue, or the list menu).
+        from app.services.meta_whatsapp_service import send_collections
+
+        await send_whatsapp_text(sender, f"You're all set, {display_name}! 🎉\n\nYour account is ready.")
+        db.commit()                      # the menu prices are read on their own connection
+        await send_collections(sender)
+        return
     confirm_msg = REGISTRATION_CONFIRMATION_TEMPLATE.format(
         name=display_name,
         balance=f"{get_balance(db, cust.whatsapp_id):,}",
     )
-    if await try_send_native_recharge(db, sender, 500, confirm_msg, site="registration"):
+    if await try_send_native_recharge(db, sender, pricing.min_recharge(), confirm_msg, site="registration"):
         return
     if await send_payment_unavailable(sender, "registration", body_text=confirm_msg):
         return
@@ -420,7 +450,7 @@ async def _send_registration_confirmation(
         pay_url = await create_recharge_payment_link(
             customer_phone=sender,
             customer_name=display_name,
-            amount=500,
+            amount=pricing.min_recharge(),
         )
     except Exception as e:
         logger.error("Failed to generate registration recharge link: {}", e)
@@ -520,6 +550,13 @@ async def _handle_registration_flow(db: Session, event: Dict[str, Any]) -> bool:
     # an invalid one leaves the profile saved as a draft (is_registered=False)
     # and sends the Re-enter / Skip buttons.
     registered_now = not gst_check_pending(raw_gst)
+    # Email for the customer's image folder (Phase 8): stored when valid; a missing or invalid one never blocks
+    # registration. A Flow Builder label becomes a key such as screen_0_Email_address_2, so any key naming
+    # "mail" is accepted too.
+    raw_email = _flow_field(data, "email", "email_address", "e_mail")
+    if raw_email is None:
+        raw_email = next((v for k, v in data.items() if "mail" in str(k).lower()), None)
+    email = _extract_email(raw_email)
 
     dedupe_key = _flow_dedupe_key(message_id) if message_id else None
     if dedupe_key and _flow_already_processed(db, dedupe_key):
@@ -555,6 +592,8 @@ async def _handle_registration_flow(db: Session, event: Dict[str, Any]) -> bool:
                 cust.gst_number = gst_number
                 cust.address = address
                 cust.is_registered = registered_now
+                if email:
+                    cust.email = email
             else:
                 cust = Customer(
                     whatsapp_id=sender.lstrip("+").strip(),
@@ -564,6 +603,7 @@ async def _handle_registration_flow(db: Session, event: Dict[str, Any]) -> bool:
                     address=address,
                     wallet_balance=0,
                     is_registered=registered_now,
+                    email=email,
                 )
                 db.add(cust)
             if dedupe_key:
@@ -594,6 +634,8 @@ async def _handle_registration_flow(db: Session, event: Dict[str, Any]) -> bool:
     if cust is None:
         logger.error(f"Registration Flow could not be saved for {mask_phone(sender)}")
         return False
+    if email:
+        await _share_customer_folder(db, cust)
 
     # GST first: "You're all set" is sent only once the GSTIN is resolved
     # (verified, accepted, skipped, or none given / check disabled).
@@ -610,7 +652,6 @@ ALREADY_CHOSEN_MESSAGE = (
 )
 UNKNOWN_CHOICE_MESSAGE = "Sorry, we couldn't find that photo. Please send it again."
 # Largest wallet recharge a customer can ask for in one message (MON-12).
-MAX_RECHARGE_RUPEES = 50_000
 CAPACITY_MESSAGE = (
     "We can't generate new images right now, so nothing was charged. "
     "Your photo is saved, so you can tap your choice again once generation is available 🙏"
@@ -641,7 +682,9 @@ def _same_sender(stored: str, sender: str) -> bool:
     return same_phone(stored, sender)
 
 
-async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Optional[str]:
+async def _ingest_image_for_choice(
+    db: Session, event: Dict[str, Any], background_tasks: Optional[BackgroundTasks] = None,
+) -> Optional[str]:
     """Store one incoming photo and send the product-choice buttons.
 
     No money moves here. Returns the ingestion id when the buttons were sent.
@@ -686,16 +729,25 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
     min_price = min(white_price, pack_price)
     customer = find_customer_by_phone(db, sender)
     balance = get_balance(db, customer.whatsapp_id) if customer else 0
+    # Phase 8: paid SKU credits (white-background shots, Creative Studio Packs) count as funds, whatever the flags.
+    white_credits = sku_packs.balance(db, customer.id) if customer else 0
+    creative_credits = sku_packs.balance(db, customer.id, SKU_CREATIVE) if customer else 0
     # Team members and trial customers with credits are never held for funds.
-    if customer is None or (balance < min_price and not ent.payment_exempt(customer)):
+    if customer is None or (balance < min_price and not ent.payment_exempt(customer)
+                            and not (white_credits or creative_credits)):
         ingestion.status = "unfunded"
         ingestion.error_message = f"Balance {balance} below minimum {min_price} at upload"
         db.commit()
+        if settings.SKU_PACKS_ENABLED:
+            # Packs instead of a wallet recharge: say so and show them.
+            await send_whatsapp_text(sender, sku_messages.buy_more(0), reply_to_message_id=message_id)
+            await send_pack_menu(sender)
+            return None
         if customer is None and is_native_pay_active(sender):
             customer = _ensure_wallet_row(db, sender)
         hold_balance = get_balance(db, customer.whatsapp_id) if customer else 0
         if customer is not None and await try_send_native_recharge(
-            db, sender, max(min_price, 500), _hold_body(min_price, hold_balance, "an order"),
+            db, sender, max(min_price, pricing.min_recharge()), _hold_body(min_price, hold_balance, "an order"),
             reply_to_message_id=message_id, site="photo_low_balance",
         ):
             return None
@@ -762,12 +814,20 @@ async def _ingest_image_for_choice(db: Session, event: Dict[str, Any]) -> Option
     ingestion.status = "awaiting_choice"
     db.commit()
 
+    # Phase 8: a customer with white-background SKU credits (and no Creative Studio Packs to choose between) gets
+    # no buttons: one credit pays for a Clean Studio Shot of this photo straight away.
+    if white_credits and not creative_credits:
+        started = await _start_sku_order(db, new_ingestion_id, customer_wallet_id, sender, message_id, background_tasks)
+        if started:
+            return new_ingestion_id
+
     # A photo that follows another waiting photo is part of a burst: hold its buttons back, the customer gets ONE
     # "N photos, Rs X: confirm?" message when they stop sending (UX-1). Paying customers only.
     if (
         bulk_orders.is_enabled()
         and not _mws.DRY_RUN_IMAGE_MODE
         and not (ent.is_admin(customer) or ent.has_trial_credits(customer))
+        and not (white_credits or creative_credits)
         and bulk_orders.is_burst(db, ingestion)
     ):
         ingestion.group_id = bulk_orders.HELD         # held back until the group prompt (or released to normal buttons)
@@ -918,7 +978,7 @@ async def _handle_bulk_choice(db: Session, sender: str, button: str, group_id: s
     if customer is None or balance < total:
         release()
         body = _hold_body(total, balance, f"{count} Clean Studio Shots")
-        top_up = max(total - balance, 500)
+        top_up = max(total - balance, pricing.min_recharge())
         if await try_send_native_recharge(db, sender, top_up, body, site="bulk_choice"):
             return []
         if await send_payment_unavailable(sender, "bulk_choice", body_text=body):
@@ -1019,7 +1079,146 @@ async def _save_customer_email(db: Session, sender: str, email: str) -> None:
         await send_whatsapp_text(sender, "Sorry, we couldn't save your email address. Please try again.")
         return
     logger.info(f"Customer email saved: sender={mask_phone(sender)} domain={domain}")
+    await _share_customer_folder(db, cust)
     await send_whatsapp_text(sender, f"Thanks! Your email address {email} has been saved ✅")
+
+
+# ─── SKU packs (Phase 8, only with SKU_PACKS_ENABLED) ────────────────────
+# A pack picked from the list menu (list_reply) or a catalogue cart (order) becomes ONE Razorpay link for the total
+# SKUs. Only the pack_N retailer ids and quantities are read; the price is always computed here (pricing.py).
+
+PACK_MENU_WORDS = {"packs", "pack", "buy", "menu", "price", "prices"}
+
+
+async def _send_pack_link(
+    db: Session, sender: str, units: int, reply_to: Optional[str] = None, creative_packs: int = 0,
+) -> bool:
+    """One payment link for a whole cart (``units`` white-background SKUs + ``creative_packs`` Creative Studio
+    Packs) as the cart summary with one pay button. No link -> an apology, never a static link."""
+    cust = _find_customer_safe(db, sender)
+    name = (cust.full_name if cust is not None else "") or "Customer"
+    total = (pricing.pack_total(units, db) if units else 0) + creative_packs * pricing.creative_pack_price()
+    db.commit()                          # the Razorpay and Meta calls below must not hold a connection
+    try:
+        url = await razorpay_service.create_pack_payment_link(
+            customer_phone=sender, customer_name=name, units=units, creative_packs=creative_packs,
+        )
+    except Exception as e:  # noqa: BLE001 -- the customer gets the apology below
+        logger.error(f"Pack payment link failed for {mask_phone(sender)}: {type(e).__name__}")
+        url = None
+    if not url:
+        await send_whatsapp_text(sender, sku_messages.pack_link_unavailable(), reply_to_message_id=reply_to)
+        return False
+    return await send_whatsapp_cta_url_button(
+        recipient_id=sender,
+        body_text=sku_messages.pack_link_body(units, total, creative_packs),
+        button_label=sku_messages.PAY_BUTTON,
+        url=url,
+        reply_to_message_id=reply_to,
+    )
+
+
+async def _handle_pack_order(db: Session, event: Dict[str, Any]) -> None:
+    """A catalogue cart: ONE link for everything in it, e.g. 2 x pack_20 + 1 x pack_5 = one link for 45 SKUs, plus
+    any Creative Studio Packs in the same total. Prices come from pricing.quote_cart, never from Meta. Nothing usable
+    -> say so and send the menu."""
+    sender = event.get("sender", "")
+    message_id = event.get("message_id") or None
+    quote = pricing.quote_cart(event.get("items"), db)
+    if quote["white_units"] + quote["creative_packs"] <= 0:
+        logger.info(f"Unreadable pack order from {mask_phone(sender)}")
+        await send_whatsapp_text(sender, sku_messages.order_unreadable(), reply_to_message_id=message_id)
+        await send_pack_menu(sender)
+        return
+    await _send_pack_link(db, sender, quote["white_units"], message_id, quote["creative_packs"])
+
+
+# ─── SKU credit orders (Phase 8) ─────────────────────────────────────────
+
+SKU_CAPACITY_MESSAGE = (
+    "We can't generate new images right now, so no SKU was used. Please send this photo again a little later 🙏"
+)
+# Bursts of photos paid by credits run a few at a time per server process, like a bulk order (BULK_CONCURRENCY).
+_sku_gates: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
+
+
+def _sku_gate() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    gate = _sku_gates.get(loop)
+    if gate is None:
+        gate = _sku_gates[loop] = asyncio.Semaphore(max(int(settings.BULK_CONCURRENCY), 1))
+    return gate
+
+
+async def _run_sku_order(job_id: Optional[int], ingestion_id: str) -> None:
+    async with _sku_gate():
+        try:
+            if job_id is not None:
+                from app.services import outbox
+
+                await outbox.run_job_now(job_id)
+            else:
+                await process_whatsapp_white_bg(ingestion_id)
+        except Exception as e:  # noqa: BLE001 -- the worker records its own failure and gives the credit back
+            logger.error(f"SKU order {ingestion_id} raised: {type(e).__name__}: {e}")
+
+
+async def _start_sku_order(
+    db: Session, ingestion_id: str, wallet_id: str, sender: str, message_id: str,
+    background_tasks: Optional[BackgroundTasks],
+) -> bool:
+    """Pay for a Clean Studio Shot of this photo with one white-background SKU credit and start it.
+
+    The credit and the order status are committed together (like a wallet debit), so a credit is never used without
+    an order. False when no usable credit was left (expired, or used meanwhile): the caller falls back to the
+    ordinary flow. No in-flight limit: a pack is meant for bursts, which run a few at a time."""
+    from sqlalchemy.exc import IntegrityError
+
+    if not _mws.DRY_RUN_IMAGE_MODE:
+        db.commit()                      # the counter lookup below uses its own connection
+        if await run_io(generation_capacity_blocked, 1):
+            db.query(WhatsAppIngestion).filter(WhatsAppIngestion.id == ingestion_id).update(
+                {WhatsAppIngestion.status: "rejected", WhatsAppIngestion.error_message: "Generation unavailable"},
+                synchronize_session=False)
+            db.commit()
+            await send_whatsapp_text(sender, SKU_CAPACITY_MESSAGE, reply_to_message_id=message_id)
+            return True
+    customer = find_customer_by_phone(db, wallet_id)
+    try:
+        moved = db.query(WhatsAppIngestion).filter(
+            WhatsAppIngestion.id == ingestion_id, WhatsAppIngestion.status == "awaiting_choice",
+        ).update({WhatsAppIngestion.status: "white_queued", WhatsAppIngestion.product_code: PRODUCT_WHITE_BG,
+                  WhatsAppIngestion.credit_source: CREDIT_SOURCE_SKU, WhatsAppIngestion.amount_charged: None},
+                 synchronize_session=False)
+        if moved != 1 or customer is None or not sku_packs.consume_credit(db, customer, ingestion_id):
+            db.rollback()
+            return False
+        db.commit()                      # credit + order status in ONE transaction
+    except IntegrityError:
+        db.rollback()
+        return False
+    customer_id = customer.id
+    left = sku_packs.balance(db, customer_id)
+    db.commit()
+    logger.info(f"SKU order queued: ingestion_id={ingestion_id} credits_left={left}")
+    from app.services import usage_log
+
+    await run_io(usage_log.queue_sync, customer_id)
+    job_id = None
+    if settings.OUTBOX_ENABLED:
+        from app.services import outbox
+
+        # A long delay: the bounded runner starts it; the outbox sweep only picks it up if this process dies first.
+        job_id = await run_io(outbox.enqueue_order_run, "white", ingestion_id, 900)
+    receipt = sku_messages.photo_received(left)
+    if customer is not None and not customer.email:
+        receipt += "\n\n" + sku_messages.ask_email()
+    await send_whatsapp_text(sender, receipt, reply_to_message_id=message_id)
+    if background_tasks is not None:
+        background_tasks.add_task(_run_sku_order, job_id, ingestion_id)
+    else:
+        asyncio.ensure_future(_run_sku_order(job_id, ingestion_id))
+    return True
 
 
 def _queue_order_run(background_tasks: BackgroundTasks, job: Tuple[Any, str]) -> None:
@@ -1190,6 +1389,15 @@ async def _handle_product_choice(
         elif ent.trial_credits_available(db, customer, product, exclude_ingestion_id=ingestion_id):
             free_access = "trial"
 
+    if not free_access and customer is not None and not dry_run:
+        sku = SKU_CREATIVE if product == PRODUCT_PACK_1 else SKU_WHITE_BG
+        try:
+            if sku_packs.balance(db, customer.id, sku) > 0 and sku_packs.consume_credit(db, customer, ingestion_id, sku):
+                free_access = CREDIT_SOURCE_SKU           # committed with the order status below
+        except Exception as e:  # noqa: BLE001 -- no credit used: the wallet path below decides
+            db.rollback()
+            logger.error(f"SKU credit for order {ingestion_id} not used: {type(e).__name__}")
+
     if free_access:
         charged = True
     elif customer is None:
@@ -1216,7 +1424,7 @@ async def _handle_product_choice(
         db.commit()
         balance = get_balance(db, customer.whatsapp_id) if customer else 0
         if await try_send_native_recharge(
-            db, sender, max(price, 500), _hold_body(price, balance, label), reply_to_message_id=quote_id,
+            db, sender, max(price, pricing.min_recharge()), _hold_body(price, balance, label), reply_to_message_id=quote_id,
             site="product_choice",
         ):
             return None
@@ -1233,7 +1441,11 @@ async def _handle_product_choice(
 
     try:
         db.refresh(ingestion)
-        ingestion.amount_charged = 0 if (dry_run or free_access) else price
+        if free_access == CREDIT_SOURCE_SKU:
+            ingestion.amount_charged = None              # paid by a SKU credit: no rupees to refund
+            ingestion.credit_source = CREDIT_SOURCE_SKU
+        else:
+            ingestion.amount_charged = 0 if (dry_run or free_access) else price
         ingestion.status = "white_queued" if product == PRODUCT_WHITE_BG else "pack_queued"
         db.commit()                      # debit + ledger row + status in ONE transaction
     except Exception:
@@ -1288,7 +1500,9 @@ async def _handle_product_choice(
             _recorded_runs[ingestion_id] = run_id
 
     if product == PRODUCT_WHITE_BG:
-        if free_access == "trial":
+        if free_access == CREDIT_SOURCE_SKU:
+            cost_note = ", 1 SKU credit"
+        elif free_access == "trial":
             cost_note = ", complimentary trial credit"
         elif free_access == "admin":
             cost_note = ", team access - no charge"
@@ -1438,9 +1652,10 @@ async def receive_webhook(
             if event_type == "status":
                 continue
 
-            # Meta re-delivers a message it did not get a fast answer for. Text, button and form replies
-            # are handled once per message id (photos have their own unique-id guard further down).
-            if event_type in ("text", "interactive"):
+            # Meta re-delivers a message it did not get a fast answer for. Text, button, list and form replies
+            # (and catalogue orders, with SKU packs on) are handled once per message id (photos have their own
+            # unique-id guard further down).
+            if event_type in ("text", "interactive") or (event_type == "order" and settings.SKU_PACKS_ENABLED):
                 message_id = event.get("message_id", "")
                 if not claim_message(db, message_id):
                     logger.info("Duplicate delivery of a {} message ignored", event_type)
@@ -1484,6 +1699,8 @@ async def receive_webhook(
                         except Exception as e:  # never let the email break registration
                             db.rollback()
                             logger.error(f"Registration email save failed for {mask_phone(sender)}: {type(e).__name__}")
+                        else:
+                            await _share_customer_folder(db, cust)
 
                     # GST first; the confirmation waits for GST resolution.
                     await verify_after_registration(
@@ -1506,6 +1723,12 @@ async def receive_webhook(
                     await _save_customer_email(db, sender, email)
                     continue
 
+                # SKU packs: "packs", "buy", "price"... (the whole message) -> the pack menu. It collects no data.
+                if settings.SKU_PACKS_ENABLED and lower_text in PACK_MENU_WORDS:
+                    db.commit()          # the menu prices are read on their own connection
+                    await send_pack_menu(sender)
+                    continue
+
                 if re.search(r"\b(hi|hii|hello|hey|start)\b", lower_text):
                     if await _consent_gate(db, sender):
                         continue
@@ -1523,22 +1746,27 @@ async def receive_webhook(
                             "falling back to text registration: sender={}", mask_phone(sender)
                         )
                     await send_whatsapp_text(sender, REGISTRATION_REQUEST_MESSAGE)
+                    # SKU packs: a registered customer without an email is asked for one (their image folder).
+                    if (settings.SKU_PACKS_ENABLED and greet_cust is not None and greet_cust.is_registered
+                            and not greet_cust.email):
+                        await send_whatsapp_text(sender, sku_messages.ask_email())
                     continue
 
                 recharge_match = re.search(r"\b(?:recharge|pay|add)\s*(?:rs\.?|inr|₹)?\s*(\d+)\b", lower_text)
                 if recharge_match:
                     requested_amount = int(recharge_match.group(1))
-                    if requested_amount < 500:
+                    if requested_amount < pricing.min_recharge():
                         await send_whatsapp_text(
                             sender,
-                            "Minimum recharge amount is ₹500 ⚠️\nPlease enter an amount of ₹500 or more."
+                            f"Minimum recharge amount is {pricing.format_rupees(pricing.min_recharge())} ⚠️\n"
+                            f"Please enter an amount of {pricing.format_rupees(pricing.min_recharge())} or more."
                         )
                         continue
-                    if requested_amount > MAX_RECHARGE_RUPEES:
+                    if requested_amount > pricing.max_recharge():
                         await send_whatsapp_text(
                             sender,
-                            f"The maximum recharge amount is ₹{MAX_RECHARGE_RUPEES:,} ⚠️\n"
-                            f"Please enter an amount of ₹{MAX_RECHARGE_RUPEES:,} or less."
+                            f"The maximum recharge amount is {pricing.format_rupees(pricing.max_recharge())} ⚠️\n"
+                            f"Please enter an amount of {pricing.format_rupees(pricing.max_recharge())} or less."
                         )
                         continue
 
@@ -1570,10 +1798,30 @@ async def receive_webhook(
                     )
                     continue
 
+                # SKU packs: any other text gets the pack menu.
+                if settings.SKU_PACKS_ENABLED:
+                    db.commit()          # the menu prices are read on their own connection
+                    await send_pack_menu(sender)
                 continue
 
             if event_type == "interactive" and event.get("subtype") == "nfm_reply":
                 await _handle_registration_flow(db, event)
+                continue
+
+            # SKU packs: a pack picked from the list menu -> one payment link for it. Other list rows are ignored.
+            if event_type == "interactive" and event.get("subtype") == "list_reply":
+                row_id = (event.get("list_reply") or {}).get("id")
+                units = pricing.units_for_retailer_id(row_id)
+                creative = 1 if str(row_id or "").lower() == pricing.CREATIVE_RETAILER_ID else 0
+                if settings.SKU_PACKS_ENABLED and (units or creative):
+                    await _send_pack_link(db, event.get("sender", ""), units or 0, event.get("message_id") or None,
+                                          creative)
+                continue
+
+            # SKU packs: a catalogue cart -> one payment link for every SKU in it.
+            if event_type == "order":
+                if settings.SKU_PACKS_ENABLED:
+                    await _handle_pack_order(db, event)
                 continue
 
             if event_type == "interactive" and event.get("subtype") == "button_reply":
@@ -1582,6 +1830,13 @@ async def receive_webhook(
                 sender = event.get("sender", "")
 
                 if await handle_gst_button(db, sender, b_id, on_complete=_confirmation_for(db, sender)):
+                    continue
+
+                if b_id == COLLECTIONS_BUTTON:
+                    from app.services.meta_whatsapp_service import send_catalogue
+
+                    db.commit()          # the menu prices are read on their own connection
+                    await send_catalogue(sender)
                     continue
 
                 if b_id in (consent_service.CONSENT_YES, consent_service.CONSENT_NO):
@@ -1651,7 +1906,7 @@ async def receive_webhook(
             )
             db.commit()
             continue
-        ingestion_id = await _ingest_image_for_choice(db, img_ev)
+        ingestion_id = await _ingest_image_for_choice(db, img_ev, background_tasks)
         if ingestion_id:
             awaiting.append(ingestion_id)
 
@@ -1720,6 +1975,7 @@ def retry_delivery(
         .filter(WalletTransaction.ingestion_id == ingestion.id, WalletTransaction.kind == KIND_REFUND_ORDER)
         .first()
         is not None
+        or sku_packs.credit_returned(db, ingestion.id)
     )
     if refunded:
         return {

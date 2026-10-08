@@ -343,8 +343,12 @@ class ERPNextService:
         gstin: Optional[str],
         amount: float,
         payment_id: str,
+        lines: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Tuple[bytes, str]]:
         """Bill one captured payment in ERPNext and return (pdf_bytes, invoice_name).
+
+        ``lines`` (a SKU pack purchase) are the invoice items ({"item_code", "qty", "rate"}); without them the
+        payment is one wallet-recharge line, as before.
 
         Idempotent on ``payment_id`` (stored in the invoice's ``po_no``): a
         retry reuses the existing invoice and never bills twice. Returns None
@@ -355,7 +359,9 @@ class ERPNextService:
             self._log_missing_config_once()
             return None
         item_code = str(_cfg("ERPNEXT_RECHARGE_ITEM_CODE")).strip()
-        if not (whatsapp_id and payment_id and item_code) or not amount or amount <= 0:
+        if lines is not None and not all(line.get("item_code") and line.get("qty", 0) > 0 for line in lines):
+            lines = []                           # a pack line without an item code cannot be billed
+        if not (whatsapp_id and payment_id and (lines if lines is not None else item_code)) or not amount or amount <= 0:
             logger.bind(category=_LOG_CATEGORY).warning(
                 f"ERPNext billing skipped: missing input (payment={payment_id!r}, item={item_code!r})"
             )
@@ -363,7 +369,7 @@ class ERPNextService:
         try:
             job_timeout = float(_cfg("ERPNEXT_JOB_TIMEOUT_SECONDS", 60.0) or 60.0)
             return await asyncio.wait_for(
-                self._bill_payment(whatsapp_id, customer_name, gstin, float(amount), payment_id, item_code),
+                self._bill_payment(whatsapp_id, customer_name, gstin, float(amount), payment_id, item_code, lines),
                 timeout=job_timeout,
             )
         except Exception as exc:  # noqa: BLE001 — includes TimeoutError / ERPNextError / httpx errors
@@ -380,6 +386,7 @@ class ERPNextService:
         amount: float,
         payment_id: str,
         item_code: str,
+        lines: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[bytes, str]:
         async with httpx.AsyncClient(
             base_url=self.base_url, headers=self._auth_headers(), timeout=self.timeout
@@ -388,7 +395,7 @@ class ERPNextService:
             if invoice is None:
                 customer = await self._upsert_billing_customer(client, whatsapp_id, customer_name, gstin)
                 invoice_name = await self._create_submitted_invoice(
-                    client, customer, item_code, amount, payment_id, gstin=gstin
+                    client, customer, item_code, amount, payment_id, gstin=gstin, lines=lines
                 )
             else:
                 invoice_name = invoice["name"]
@@ -504,6 +511,7 @@ class ERPNextService:
     async def _create_submitted_invoice(
         self, client: httpx.AsyncClient, customer: str, item_code: str, amount: float, payment_id: str,
         gstin: Optional[str] = None,
+        lines: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         if not customer:
             raise ERPNextError("customer upsert returned no name")
@@ -511,8 +519,8 @@ class ERPNextService:
             "company": self.company,
             "customer": customer,
             "po_no": payment_id,
-            "remarks": f"Moraa GemVision wallet recharge. Razorpay payment {payment_id}",
-            "items": [{"item_code": item_code, "qty": 1, "rate": float(amount)}],
+            "remarks": f"Moraa GemVision {'SKU pack' if lines else 'wallet recharge'}. Razorpay payment {payment_id}",
+            "items": [dict(line) for line in lines] if lines else [{"item_code": item_code, "qty": 1, "rate": float(amount)}],
             "docstatus": 1,  # insert + submit in one request (rolled back together on error)
         }
         template = str(_cfg("ERPNEXT_TAX_TEMPLATE")).strip()

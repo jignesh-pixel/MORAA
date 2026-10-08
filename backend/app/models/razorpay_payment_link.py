@@ -28,6 +28,9 @@ class RazorpayPaymentLink(Base):
     whatsapp_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     amount_rupees: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default=LINK_CREATED, index=True)
+    # Phase 8 (migration 0023): NULL = wallet recharge (as before); "sku_pack" = a pack of ``units`` SKU credits.
+    purpose: Mapped[str] = mapped_column(String(16), nullable=True)
+    units: Mapped[int] = mapped_column(Integer, nullable=True)
     next_check_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     check_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(

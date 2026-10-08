@@ -338,19 +338,23 @@ def link_output_media(output_id: Optional[str], media_id: Optional[str]) -> None
         _fail(e)
 
 
-def upsert_invoice(payment_id: str, phone: str, amount: int, status: str, erpnext_invoice: Optional[str] = None) -> None:
+def upsert_invoice(payment_id: str, phone: str, amount: int, status: str, erpnext_invoice: Optional[str] = None,
+                   drive_file_id: Optional[str] = None, drive_link: Optional[str] = None) -> None:
     try:
         with _session() as db:
             for _ in range(2):                     # a second pass if a concurrent retry inserted it first
                 row = db.query(InvoiceRecord).filter(InvoiceRecord.payment_id == payment_id).first()
                 if row is None:
                     row = InvoiceRecord(payment_id=payment_id, customer_phone=normalize_phone(phone), amount_rupees=int(amount),
-                                        status=status, erpnext_invoice=erpnext_invoice)
+                                        status=status, erpnext_invoice=erpnext_invoice, drive_file_id=drive_file_id,
+                                        drive_link=drive_link)
                     db.add(row)
                 else:
                     row.status = status
                     if erpnext_invoice:
                         row.erpnext_invoice = erpnext_invoice
+                    if drive_file_id:
+                        row.drive_file_id, row.drive_link = drive_file_id, drive_link
                 try:
                     db.commit()
                     break

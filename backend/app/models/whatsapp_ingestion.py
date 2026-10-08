@@ -22,6 +22,9 @@ from app.database import Base
 PRODUCT_PACK_1 = "PACK_1"
 PRODUCT_WHITE_BG = "WHITE_BG"
 
+# credit_source of an order paid by a SKU pack credit (Phase 8): its refund gives the credit back, never rupees.
+CREDIT_SOURCE_SKU = "sku"
+
 
 class WhatsAppIngestion(Base):
     """Records an incoming WhatsApp message and its internal processing state.
@@ -137,6 +140,15 @@ class WhatsAppIngestion(Base):
         nullable=True,
         comment="Rupees actually debited for this order; refunds use this. NULL = legacy",
     )
+
+    # ── Phase 8 (migration 0023) ───────────────────────────────────────
+    credit_source: Mapped[str] = mapped_column(
+        String(16), nullable=True, comment="What paid for the order: wallet | sku | trial | admin. NULL = legacy"
+    )
+    delivery_channel: Mapped[str] = mapped_column(
+        String(16), nullable=True, comment="Where the finished image went: whatsapp | drive"
+    )
+    drive_file_id: Mapped[str] = mapped_column(String(200), nullable=True, comment="Delivered image in the customer's Drive folder")
 
     # ── Timestamps ─────────────────────────────────────────────────────
     created_at: Mapped[datetime] = mapped_column(

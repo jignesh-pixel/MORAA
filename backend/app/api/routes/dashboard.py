@@ -72,6 +72,11 @@ def audit(
     return {"orders": svc.audit(db, days, status_filter, limit, offset)}
 
 
+@router.get("/stats", summary="SKU packs sold, their revenue and the credits customers still hold")
+def stats(_: User = Depends(require_dashboard_user), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    return svc.sku_stats(db)
+
+
 @router.get("/media/{kind}/{media_id}", summary="One image, by a short-lived signed address")
 def media(kind: str, media_id: str, exp: int, sig: str, db: Session = Depends(get_db)):
     if not svc.media_signature_ok(kind, media_id, exp, sig):

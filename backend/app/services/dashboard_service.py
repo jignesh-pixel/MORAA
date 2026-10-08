@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -261,6 +262,12 @@ def profile(db: Session, phone: str) -> Optional[Dict[str, Any]]:
             "gstin": customer.gst_number, "gst_verified": bool(customer.is_gst_verified), "address": customer.address,
             "tier": customer.tier, "balance": int(customer.wallet_balance or 0), "customer_since": _iso(customer.created_at),
         })
+        from app.models.sku_credit import SKU_CREATIVE, SKU_WHITE_BG
+        from app.services import google_drive, sku_packs
+
+        result["sku_credits"] = {"white_bg": sku_packs.balance(db, customer.id, SKU_WHITE_BG),
+                                 "creative_pack": sku_packs.balance(db, customer.id, SKU_CREATIVE)}
+        result["drive_folder"] = google_drive.folder_link(customer.drive_folder_id) if customer.drive_folder_id else None
         txs = db.query(WalletTransaction).filter(
             WalletTransaction.customer_id == customer.id, WalletTransaction.created_at >= since
         ).order_by(WalletTransaction.created_at.desc()).all()
@@ -291,6 +298,31 @@ def profile(db: Session, phone: str) -> Optional[Dict[str, Any]]:
         .order_by(InvoiceRecord.created_at.desc()).all()
     ]
     return result
+
+
+# ── SKU pack stats ───────────────────────────────────────────────────────────────────────────────────────
+
+def sku_stats(db: Session) -> Dict[str, Any]:
+    """Packs sold and their revenue (captured pack payments) and the credits customers still hold (ledger sum)."""
+    from app.models.audit_log import AuditLog
+    from app.models.sku_credit import SKU_CREATIVE, SKU_WHITE_BG, CustomerSkuCredit
+    from app.services.sku_packs import PAYMENT_CAPTURED_ACTION, PURPOSE_SKU_PACK
+
+    packs = revenue = 0
+    rows = db.query(AuditLog.details).filter(
+        AuditLog.action == PAYMENT_CAPTURED_ACTION, AuditLog.details.contains(f'"purpose": "{PURPOSE_SKU_PACK}"'))
+    for (details,) in rows.yield_per(500):
+        try:
+            data = json.loads(details)
+        except (TypeError, ValueError):
+            continue
+        if data.get("purpose") == PURPOSE_SKU_PACK:
+            packs += 1
+            revenue += int(data.get("amount_paid") or 0)
+    outstanding = dict(db.query(CustomerSkuCredit.sku, func.coalesce(func.sum(CustomerSkuCredit.quantity), 0))
+                       .group_by(CustomerSkuCredit.sku).all())
+    credits = {sku: max(int(outstanding.get(sku) or 0), 0) for sku in (SKU_WHITE_BG, SKU_CREATIVE)}
+    return {"packs_sold": packs, "pack_revenue": revenue, "credits_outstanding": credits}
 
 
 # ── weekly audit ─────────────────────────────────────────────────────────────────────────────────────────

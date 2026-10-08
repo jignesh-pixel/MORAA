@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phase 8 Audit Report</title>
+<style>
+  :root { --fg:#1a2230; --muted:#5b6474; --line:#d8dde5; --green:#1e7a46; --amber:#a86a00; --red:#b42318; }
+  body { font: 15px/1.6 "Segoe UI", "Helvetica Neue", Arial, sans-serif; color: var(--fg); background: #fff; max-width: 980px; margin: 0 auto; padding: 32px 20px 80px; }
+  h1 { font-size: 30px; margin: 0 0 4px; } h2 { font-size: 21px; margin: 34px 0 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+  h3 { font-size: 16px; margin: 18px 0 4px; } p, li { max-width: 76ch; } .muted { color: var(--muted); }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; margin: 8px 0 14px; }
+  th, td { border: 1px solid var(--line); padding: 6px 9px; text-align: left; vertical-align: top; }
+  th { background: #f4f6f9; }
+  .g, .a, .r { font-weight: 700; } .g { color: var(--green); } .a { color: var(--amber); } .r { color: var(--red); }
+  .tag { display: inline-block; font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 10px; border: 1px solid currentColor; }
+  code { font-family: Consolas, monospace; font-size: 0.88em; background: #eef1f5; padding: 0 4px; border-radius: 3px; }
+  .box { border: 1px solid var(--line); border-radius: 6px; padding: 10px 14px; background: #fafbfc; }
+  @media print { body { max-width: none; padding: 0; } h2 { break-after: avoid; } table { break-inside: avoid; } }
+</style>
+</head>
+<body>
+<h1>Phase 8 Audit Report</h1>
+<p class="muted">Whole backend after Phase 8 (SKU packs, WhatsApp catalogue cart, Google Drive delivery) · branch <code>phase-8-sku-drive</code> · 7–8 Oct 2026 · checked against code and tests only: no real Google, Meta or Razorpay calls were made</p>
+
+<div class="box">
+<p><strong>Verdict in one paragraph.</strong> The money side is solid: a payment adds credits once, a photo uses one credit, a failed image gives its credit back once, and the books (credit ledger, wallet, invoices) agree. The serious problems the audit found were fixed before this report. Phase 8 is <strong>ready for a supervised real-world test with the switches on for test phones only</strong>. It is <strong>not ready for full public traffic at 100 images a minute</strong>: Google's per-drive file limit and the background queue's speed need a decision and some work first (sections 3 and 4). With both new switches off (the default), customers see no change.</p>
+</div>
+
+<h2>1. Traffic light per area</h2>
+<table>
+<tr><th>Area</th><th>Status</th><th>In plain words</th></tr>
+<tr><td>Money correctness (credits, payments, refunds)</td><td class="g">GREEN</td><td>Credits are added once, used once, returned once. Fixed: pack payments are now only honoured when they match a link we created; staff "retry" can no longer give a free image after a credit was returned.</td></tr>
+<tr><td>Prices</td><td class="g">GREEN</td><td>One place sets prices; a test fails the build if a rupee amount is typed anywhere else. Fixed: payment links now expire after 48 hours, so an old quote cannot be paid after a price rise.</td></tr>
+<tr><td>Invoices and GST</td><td class="a">AMBER</td><td>Invoice lines add up exactly to what was paid with the current setting. Needs the accountant: item code, HSN/SAC, invoice timing. One setting (<code>ERPNEXT_PRICES_INCLUDE_TAX=false</code>) would cause paise differences.</td></tr>
+<tr><td>Image delivery (Drive)</td><td class="a">AMBER</td><td>Works on test fakes, with WhatsApp as the safety net. Fixed: images now go to Drive only when the customer can actually open their folder. Not yet tried with a real Google account.</td></tr>
+<tr><td>Capacity at 100 images/minute</td><td class="r">RED</td><td>A Google shared drive holds 400,000 items: at full speed with 90-day storage it fills in about 3 days. The background queue is too slow for that volume. Needs a decision (section 4).</td></tr>
+<tr><td>Privacy (DPDP)</td><td class="a">AMBER</td><td>Erasure removes photos, the usage sheet and sharing, and keeps invoices. Open: an email typed in chat changes who sees the folder without a confirmation step; Drive clean-up is not retried if Google fails during erasure.</td></tr>
+<tr><td>Security</td><td class="g">GREEN</td><td>The Google key is read from a file and never logged; folders are never shared publicly; Meta cart prices are ignored. Fixed: key files are kept out of git and the Docker image.</td></tr>
+<tr><td>Operations</td><td class="a">AMBER</td><td>Alerts exist for Drive failures and stuck deliveries. Open: a broken Google key shows up as slow delivery (about 2 hours) instead of an immediate alert.</td></tr>
+</table>
+
+<h2>2. Money at risk</h2>
+<table>
+<tr><th>Issue</th><th>Rupees at risk</th><th>Status</th></tr>
+<tr><td>A payment carrying "pack" notes but not paid through our link could have added credits (up to 10,000 per payment)</td><td>Up to about ₹2 lakh per payment, only with a misconfigured payment page</td><td><span class="tag g">Fixed</span></td></tr>
+<tr><td>Staff "retry" on a failed order re-ran it after the credit was returned</td><td>₹20 + about ₹3 provider cost per white image; ₹500 + 7 provider calls per Creative pack</td><td><span class="tag g">Fixed</span></td></tr>
+<tr><td>Unpaid links stayed payable at the old price after a price rise</td><td>₹5 per SKU on a ₹20→₹25 rise; up to ₹50,000 on a 10,000-SKU link</td><td><span class="tag g">Fixed</span> (48-hour links)</td></tr>
+<tr><td>Customers holding credits were offered the cash "bulk" prompt (₹50 per photo)</td><td>₹30 overcharge per photo, refund requests</td><td><span class="tag g">Fixed</span></td></tr>
+<tr><td>Chargeback after using all credits (customer keeps the images)</td><td>The whole pack (₹2,000 for 100 SKUs) + Razorpay fee + about ₹300 provider cost</td><td><span class="tag a">Open</span>: same policy as the wallet today; owner decision</td></tr>
+<tr><td>A credit returned just after expiry is expired again</td><td>₹20 per case</td><td><span class="tag a">Open</span> (rare)</td></tr>
+<tr><td>Delivery failing after the image was generated returns the credit but the AI call was already paid</td><td>About ₹3 per white image</td><td><span class="tag a">Accepted</span> (existing policy: never leave a customer without image or credit)</td></tr>
+</table>
+
+<h2>3. Findings by business impact</h2>
+<h3 class="r">Must decide before full launch</h3>
+<ol>
+  <li><strong>The shared drive fills up at full speed.</strong> At 100 images a minute (about 144,000 a day) and 90-day storage, Google's 400,000-item limit is reached in about 3 days; after that uploads fail and everything falls back to WhatsApp. Options: keep images for 1–2 days in Drive (customers download), spread customers over several shared drives, or a different store (Google Cloud Storage, Cloudflare R2). At today's real volume this is far away. <em>Owner + developer.</em></li>
+  <li><strong>The background queue is too slow for full traffic.</strong> One queue per server handles roughly 25–30 jobs a minute; full traffic needs around 200 (sheet updates, ready messages, uploads). Ready messages would fall behind. Fix: run several jobs at once and update sheets less often. <em>Developer.</em></li>
+  <li><strong>Google Sheets limit.</strong> About 60 writes a minute per service account; the Usage Logs sheet updates exceed that with 100 active customers a minute. Fix: batch updates. <em>Developer.</em></li>
+</ol>
+<h3 class="a">Fix soon (not blocking a test launch)</h3>
+<ol start="4">
+  <li><strong>Email typed in chat moves the folder.</strong> Any email in any message replaces the stored one and the folder is shared to it (the old one loses access). Add a "Is this your email? Yes / No" step. <em>Owner (wording) + developer.</em></li>
+  <li><strong>Drive clean-up during "DELETE MY DATA" is tried once.</strong> If Google fails, the folder stays shared; only an alert is logged. Add a retry job. <em>Developer.</em></li>
+  <li><strong>A broken Google key delays every image by about 2 hours</strong> before the WhatsApp fallback. Test the key at start-up and fall back at once when Google refuses it. <em>Developer.</em></li>
+  <li><strong>Drive image deletion after 90 days only runs with <code>RETENTION_ENABLED=true</code></strong> (documented now). The deletion runs one file at a time and would be slow at full volume. <em>Operator + developer.</em></li>
+  <li><strong>Customers with both white and Creative credits</strong> get the two buttons for each photo (by design), and a Creative pack paid by one credit runs 7 AI calls (by design). Confirm this is what you want. <em>Owner.</em></li>
+  <li><strong>Old archive copies in the personal Google account</strong> (from before Phase 8, if the archive was ever switched on) are no longer managed; export and delete them by hand. <em>Owner.</em></li>
+</ol>
+<h3 class="g">Fixed during this audit</h3>
+<ul>
+  <li>Pack payments must match a pack link we created (purpose, units, amount), else they are parked for review.</li>
+  <li>Images and invoices go to Drive only when the customer's folder is shared with their email; otherwise WhatsApp as before, and a share is queued.</li>
+  <li>Staff retry refuses orders whose SKU credit was returned.</li>
+  <li>Pack links expire after 48 hours (inside the 3-day payment check window).</li>
+  <li>Credit holders never get the cash bulk prompt.</li>
+  <li>The WhatsApp fallback claims the order first, so two servers cannot send the same image twice.</li>
+  <li>The Drive upload no longer occupies an image-generation slot.</li>
+  <li>An old stuck order no longer blocks a customer's "ready" message forever.</li>
+  <li>Folder sharing is retried correctly when a customer switches back to an earlier email, and emails are no longer stored in queue keys.</li>
+  <li>Photo clean-up on the server stopped after its first batch (an older bug): fixed.</li>
+  <li>Google key files are kept out of git and out of the Docker image.</li>
+</ul>
+
+<h2>4. Prioritised to-do list</h2>
+<table>
+<tr><th>#</th><th>Action</th><th>Owner</th><th>When</th></tr>
+<tr><td>1</td><td>Decide how long images stay in Drive and whether one shared drive is enough (finding 1)</td><td>Owner</td><td>Before full launch</td></tr>
+<tr><td>2</td><td>Accountant: ERPNext item code, HSN/SAC, invoice timing; keep <code>ERPNEXT_PRICES_INCLUDE_TAX=true</code></td><td>Owner + accountant</td><td>Before real money</td></tr>
+<tr><td>3</td><td>Google set-up (shared drive, service account, key, sharing policy) and one real-world test session (checklist in the developer plan)</td><td>Owner + developer</td><td>Next</td></tr>
+<tr><td>4</td><td>Meta: approve the <code>sku_batch_ready</code> template, publish the Flow with email, create the catalogue (<code>pack_5/20/50/100</code>, <code>creative_pack_1</code>)</td><td>Owner</td><td>Next</td></tr>
+<tr><td>5</td><td>Queue speed and sheet batching (findings 2–3); start-up key check (6); erasure retry (5)</td><td>Developer</td><td>Before full launch</td></tr>
+<tr><td>6</td><td>Email confirmation step (4) and consent wording mentioning Drive (lawyer)</td><td>Owner + developer</td><td>Before full launch</td></tr>
+<tr><td>7</td><td>Decide the chargeback policy for packs (hold large packs, or accept the risk)</td><td>Owner</td><td>Any time</td></tr>
+</table>
+
+<h2>5. How this was checked</h2>
+<ul>
+  <li>Three independent read-only reviews of the whole backend (money, resources and reliability, security and privacy), each finding confirmed in the code; the severe ones were fixed and re-tested.</li>
+  <li>Automated tests on SQLite and PostgreSQL, including: one link for a 45-SKU + Creative cart; duplicate payment messages add credits once; 100 orders against 20 credits use exactly 20; a failed image returns exactly one credit; Drive failure falls back to WhatsApp and both failing returns the credit once; four parallel workers create one folder set; the usage sheet matches the credit ledger and re-syncing adds nothing; a refused share never makes a folder public; erasure keeps invoices.</li>
+  <li>Frozen image prompts unchanged (<code>changed: 0</code>); migration and model match on PostgreSQL.</li>
+  <li>Not checked: real Google folders and sharing, the real WhatsApp catalogue, real Razorpay payments, real ERPNext. Those need the real-world session.</li>
+</ul>
+</body>
+</html>

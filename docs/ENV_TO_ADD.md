@@ -60,11 +60,45 @@ DASHBOARD_ALLOWED_EMAILS=you@gmail.com,partner@gmail.com
 GOOGLE_CLIENT_ID=<optional: Google OAuth client id for "Sign in with Google">
 # frontend (frontend/.env.local): NEXT_PUBLIC_API_URL=http://localhost:8000   NEXT_PUBLIC_GOOGLE_CLIENT_ID=<same client id>
 
-# Google Drive archive (optional, off until all are set); uses the Drive owner's account
+# Google Drive archive (optional); uses the business service account of the Phase 8 section below
 DRIVE_ENABLED=true
-GOOGLE_DRIVE_CLIENT_ID=<oauth client id>
-GOOGLE_DRIVE_CLIENT_SECRET=<oauth client secret>
-GOOGLE_DRIVE_REFRESH_TOKEN=<refresh token of the Drive owner's account>
 DRIVE_FOLDER_ID=<id of the Drive folder to archive into>
 ```
 Create the first login with `python scripts/create_dashboard_user.py --email you@example.com` (it asks for the password on the keyboard).
+
+## Phase 8: SKU packs and Google Drive delivery (all off by default)
+Switch on step by step (see `docs/PHASE_8_DEVELOPER_PLAN.html`, section 9). With both flags false nothing changes for customers.
+
+```
+# Packs (1/5/20/50/100 SKUs, price per SKU incl. GST). The price below is only the first seed:
+# after `python scripts/set_price.py --sku-price N` the database price is used.
+SKU_PACKS_ENABLED=false
+SKU_PRICE_RUPEES=20
+SKU_PACK_SIZES=1,5,20,50,100
+ECOM_PACK1_ENABLED=false            # show the 1-SKU pack in the WhatsApp menu
+SKU_GST_PERCENT=18
+SKU_CREDIT_VALIDITY_DAYS=90
+SKU_ERPNEXT_ITEM_CODE=              # ERPNext item for packs (empty = ERPNEXT_RECHARGE_ITEM_CODE)
+META_CATALOG_ID=                    # WhatsApp catalogue updated by set_price.py
+
+# Wallet recharge limits (unchanged values, now settings)
+MIN_RECHARGE_RUPEES=500
+MAX_RECHARGE_RUPEES=50000
+
+# Google Drive delivery through the BUSINESS Workspace service account (no personal account anywhere)
+DRIVE_DELIVERY_ENABLED=false
+GOOGLE_SA_KEY_FILE=/run/secrets/moraa-drive-sa.json   # the downloaded JSON key; outside the code folder; never commit it
+DRIVE_SHARED_DRIVE_ID=<id from the shared drive's URL>
+DRIVE_IMAGES_RETENTION_DAYS=90       # only runs with RETENTION_ENABLED=true (set it, or Drive images are kept forever)
+BATCH_NOTIFY_DELAY_SECONDS=60
+BATCH_NOTIFY_TEMPLATE_NAME=sku_batch_ready   # Meta utility template (folder link, SKUs left); empty = alert only
+BATCH_NOTIFY_TEMPLATE_LANG=en
+
+# The dashboard archive now uses the same service account; DRIVE_FOLDER_ID is a folder inside the shared drive.
+DRIVE_ENABLED=false
+DRIVE_FOLDER_ID=
+```
+
+Remove these from `.env` (personal Google account, retired): `GOOGLE_DRIVE_CLIENT_ID`, `GOOGLE_DRIVE_CLIENT_SECRET`, `GOOGLE_DRIVE_REFRESH_TOKEN`. An old `.env` that still has them starts fine; they are ignored.
+
+Docker: mount the key file read-only into the `api` service (for example `- ./secrets/moraa-drive-sa.json:/run/secrets/moraa-drive-sa.json:ro`) and set `GOOGLE_SA_KEY_FILE` to that path.

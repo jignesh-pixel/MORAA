@@ -39,6 +39,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models.audit_log import AuditLog
 from app.models.whatsapp_payment_order import WhatsAppPaymentOrder
+from app.services import pricing
 from app.services.meta_whatsapp_service import _post_message_payload, send_whatsapp_text
 from app.models.wallet_transaction import KIND_CREDIT_WHATSAPP_PAY
 from app.services.wallet_service import credit_wallet, find_customer_by_phone, get_balance
@@ -50,7 +51,6 @@ _plog = logger.bind(category="payments")
 
 GRAPH_BASE = "https://graph.facebook.com/v21.0"
 INR_OFFSET = 100
-MIN_RECHARGE_RUPEES = 500
 
 # Must equal payment_routes.AUDIT_ACTION_PAYMENT_CAPTURED / AUDIT_RESOURCE_TYPE:
 # sharing the claim is what makes a double credit impossible.
@@ -235,7 +235,7 @@ async def try_send_native_recharge(
             # wallet row required for crediting; link path handles placeholders
             _log_native_skip(recipient_id, site, "gate5_no_customer: no wallet row for this number")
             return False
-        amount = max(int(amount_rupees), MIN_RECHARGE_RUPEES)
+        amount = max(int(amount_rupees), pricing.min_recharge())
         expiry = max(int(settings.WHATSAPP_PAY_ORDER_EXPIRY_SECONDS), 300)
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=expiry)
         order = WhatsAppPaymentOrder(

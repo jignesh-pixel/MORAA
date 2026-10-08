@@ -58,12 +58,13 @@ class FlowParsingTests(unittest.TestCase):
     def test_g_button_reply_and_other_interactive_unchanged(self):
         btn = {"type": "interactive", "id": "wamid.b", "from": SENDER, "timestamp": "1",
                "interactive": {"type": "button_reply", "button_reply": {"id": "gv_white:x", "title": "t"}}}
-        lst = {"type": "interactive", "id": "wamid.l", "from": SENDER, "timestamp": "1",
-               "interactive": {"type": "list_reply", "list_reply": {"id": "a"}}}
-        ev = parse_webhook_entry(_payload(btn, lst)["entry"][0])
+        other = {"type": "interactive", "id": "wamid.l", "from": SENDER, "timestamp": "1",
+                 "interactive": {"type": "product_list", "product_list": {}}}
+        ev = parse_webhook_entry(_payload(btn, other)["entry"][0])
         self.assertEqual(ev[0]["subtype"], "button_reply")
         self.assertEqual(ev[0]["button_reply"], {"id": "gv_white:x", "title": "t"})
-        self.assertEqual((ev[1]["type"], ev[1]["raw_type"]), ("unsupported", "interactive:list_reply"))
+        # list_reply is parsed since Phase 8 (tests/test_pack_menu.py); other interactive kinds stay unsupported.
+        self.assertEqual((ev[1]["type"], ev[1]["raw_type"]), ("unsupported", "interactive:product_list"))
 
 
 class FlowSenderTests(unittest.IsolatedAsyncioTestCase):

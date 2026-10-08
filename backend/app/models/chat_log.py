@@ -72,6 +72,8 @@ class InvoiceRecord(Base):
     amount_rupees: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(10), nullable=False, default="pending", comment="pending, sent, failed")
     erpnext_invoice: Mapped[str] = mapped_column(String(100), nullable=True)
+    drive_file_id: Mapped[str] = mapped_column(String(200), nullable=True, comment="PDF in the customer's Invoices folder (0023)")
+    drive_link: Mapped[str] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 

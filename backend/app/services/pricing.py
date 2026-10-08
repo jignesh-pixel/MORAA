@@ -1,0 +1,271 @@
+"""The one place that knows prices (Phase 8).
+
+Every rupee amount the backend charges, quotes or invoices comes from here: the per-SKU pack price (database row in
+``price_settings``, seeded from ``SKU_PRICE_RUPEES``), pack totals, the GST split for invoices, the wallet product
+prices and recharge limits (settings), and the text that shows them. ``tests/test_no_hardcoded_rupees.py`` fails the
+build if another file hard-codes a rupee amount.
+
+Prices are whole rupees, GST included, everywhere except ``gst_split`` (paise precision for invoices).
+"""
+
+import json
+from datetime import datetime, timezone
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Any, Dict, List, Optional, Tuple
+
+from app.config import settings
+from app.models.sku_credit import PRICE_KEY_SKU, PriceSetting
+from app.utils.logger import logger
+
+PACK_RETAILER_PREFIX = "pack_"
+PAISE_PER_RUPEE = 100
+PRICE_CHANGED_ACTION = "price_changed"
+
+
+def _stored_price(key: str, db: Any = None) -> Optional[int]:
+    """The price saved in price_settings, or None (no row, or the database cannot answer)."""
+    try:
+        if db is not None:
+            value = db.query(PriceSetting.price_rupees).filter(PriceSetting.sku == key).scalar()
+        else:
+            from app.database import SessionLocal
+
+            with SessionLocal() as session:
+                value = session.query(PriceSetting.price_rupees).filter(PriceSetting.sku == key).scalar()
+    except Exception as e:  # noqa: BLE001 -- a price lookup must never break a chat; the configured price is used
+        logger.warning(f"Stored price lookup failed ({type(e).__name__}); using the configured price")
+        if db is not None:
+            db.rollback()
+        return None
+    return int(value) if value is not None else None
+
+
+# ── SKU packs ─────────────────────────────────────────────────────────────────────────────────────────────
+
+def sku_price(db: Any = None) -> int:
+    """Price of one SKU in whole rupees, GST included: the stored price, else SKU_PRICE_RUPEES."""
+    stored = _stored_price(PRICE_KEY_SKU, db)
+    return stored if stored is not None and stored > 0 else max(int(settings.SKU_PRICE_RUPEES), 1)
+
+
+def pack_sizes() -> List[int]:
+    """Pack sizes that can be bought (SKU_PACK_SIZES), smallest first."""
+    sizes = set()
+    for part in str(settings.SKU_PACK_SIZES or "").split(","):
+        part = part.strip()
+        if part.isdigit() and int(part) > 0:
+            sizes.add(int(part))
+    return sorted(sizes)
+
+
+def menu_pack_sizes() -> List[int]:
+    """Pack sizes shown in menus: every size, except the 1-SKU pack unless ECOM_PACK1_ENABLED."""
+    return [s for s in pack_sizes() if s != 1 or settings.ECOM_PACK1_ENABLED]
+
+
+def is_pack_size(units: Any) -> bool:
+    return isinstance(units, int) and not isinstance(units, bool) and units in pack_sizes()
+
+
+def pack_total(units: int, db: Any = None) -> int:
+    """Rupees for ``units`` SKUs at today's price (GST included)."""
+    return max(int(units), 0) * sku_price(db)
+
+
+def pack_retailer_id(units: int) -> str:
+    return f"{PACK_RETAILER_PREFIX}{int(units)}"
+
+
+def units_for_retailer_id(retailer_id: Any) -> Optional[int]:
+    """``pack_20`` -> 20 when 20 is a pack size, else None. Prices are never taken from Meta: only the id is used."""
+    text = str(retailer_id or "").strip().lower()
+    if not text.startswith(PACK_RETAILER_PREFIX):
+        return None
+    number = text[len(PACK_RETAILER_PREFIX):]
+    return int(number) if number.isdigit() and is_pack_size(int(number)) else None
+
+
+# Creative Studio Pack 1 (the 7-style photoshoot of one photo) as a catalogue item. One unit = one photo's pack.
+CREATIVE_RETAILER_ID = "creative_pack_1"
+CREATIVE_TITLE = "Creative Studio Pack 1"
+MAX_CART_UNITS = 10000
+
+
+def creative_pack_price() -> int:
+    """One Creative Studio Pack bought in a cart (the same price as the Full Catalog Pack from the wallet)."""
+    return catalog_pack_price()
+
+
+def quote_cart(items: Any, db: Any = None) -> Dict[str, Any]:
+    """Price a WhatsApp catalogue cart on the server (Meta's prices are never used).
+
+    ``items`` = [{"retailer_id", "quantity"}]. pack_N items add N white-background SKUs per quantity, creative_pack_1
+    items add Creative Studio Packs; unknown ids and quantities that are not positive whole numbers are skipped, and
+    each total is capped at MAX_CART_UNITS. Returns {"white_units", "creative_packs", "white_total", "creative_total",
+    "total", "lines": [{"retailer_id", "quantity"}]}."""
+    white = creative = 0
+    lines: List[Dict[str, Any]] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        quantity = item.get("quantity")
+        if isinstance(quantity, str) and quantity.strip().isdecimal():
+            quantity = int(quantity)
+        if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 1:
+            continue
+        retailer_id = str(item.get("retailer_id") or "").strip().lower()
+        size = units_for_retailer_id(retailer_id)
+        if size:
+            white += size * quantity
+        elif retailer_id == CREATIVE_RETAILER_ID:
+            creative += quantity
+        else:
+            continue
+        lines.append({"retailer_id": retailer_id, "quantity": quantity})
+    white, creative = min(white, MAX_CART_UNITS), min(creative, MAX_CART_UNITS)
+    white_total = pack_total(white, db) if white else 0
+    creative_total = creative * creative_pack_price()
+    return {"white_units": white, "creative_packs": creative, "white_total": white_total,
+            "creative_total": creative_total, "total": white_total + creative_total, "lines": lines}
+
+
+def pack_title(units: int) -> str:
+    """"20 SKUs" (fits a WhatsApp list row title, 24 characters)."""
+    return f"{int(units)} SKU" + ("" if int(units) == 1 else "s")
+
+
+def pack_description(units: int, db: Any = None) -> str:
+    """"20 white-background shots · ₹400" (a WhatsApp list row description, 72 characters)."""
+    shots = "shot" if int(units) == 1 else "shots"
+    return f"{int(units)} white-background {shots} · {format_rupees(pack_total(units, db))}"
+
+
+def credit_value(db: Any = None) -> int:
+    """What one credit is worth in rupees (for the dashboard and reconciliation)."""
+    return sku_price(db)
+
+
+# ── GST and invoices ──────────────────────────────────────────────────────────────────────────────────────
+
+def gst_split(total_rupees: Any) -> Tuple[Decimal, Decimal]:
+    """Split a GST-inclusive amount into (net, tax), in rupees with paise. net + tax == total exactly."""
+    total = Decimal(str(total_rupees)).quantize(Decimal("0.01"))
+    rate = Decimal(max(int(settings.SKU_GST_PERCENT), 0))
+    net = (total * Decimal(100) / (Decimal(100) + rate)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return net, total - net
+
+
+def erpnext_pack_line(units: int, unit_price: int) -> Dict[str, Any]:
+    """ERPNext invoice line for a pack: quantity = SKUs, rate = the price per SKU that was paid.
+
+    With ERPNEXT_PRICES_INCLUDE_TAX the GST-inclusive rate is sent and ERPNext splits the tax; otherwise the net rate
+    is sent and ERPNext adds the tax lines from the template."""
+    rate = Decimal(int(unit_price))
+    if not settings.ERPNEXT_PRICES_INCLUDE_TAX:
+        rate = gst_split(rate)[0]
+    item_code = (settings.SKU_ERPNEXT_ITEM_CODE or settings.ERPNEXT_RECHARGE_ITEM_CODE or "").strip()
+    return {"item_code": item_code, "qty": int(units), "rate": float(rate)}
+
+
+# ── Wallet products and recharges (unchanged amounts, now read from one place) ────────────────────────────
+
+def white_bg_price() -> int:
+    """Clean Studio Shot paid from the wallet."""
+    return max(int(settings.WHITE_BG_PRICE_RUPEES), 1)
+
+
+def catalog_pack_price() -> int:
+    """Full Catalog Pack paid from the wallet."""
+    return max(int(settings.WALLET_IMAGE_PRICE_RUPEES), 1)
+
+
+def min_recharge() -> int:
+    return max(int(settings.MIN_RECHARGE_RUPEES), 1)
+
+
+def max_recharge() -> int:
+    return max(int(settings.MAX_RECHARGE_RUPEES), min_recharge())
+
+
+def format_rupees(amount: Any) -> str:
+    """₹1,000 (whole rupees, never negative)."""
+    return f"₹{max(int(amount), 0):,}"
+
+
+# ── Changing the price ────────────────────────────────────────────────────────────────────────────────────
+
+def set_sku_price(db: Any, price: int, changed_by: str) -> Tuple[int, int]:
+    """Store a new per-SKU price (from this moment) and an audit row with the old and new price. Commits.
+
+    Returns (old price, new price). Packs already paid keep the credits they bought."""
+    from app.models.audit_log import AuditLog
+
+    price = int(price)
+    if price < 1:
+        raise ValueError("The SKU price must be at least 1 rupee")
+    old = sku_price(db)
+    now = datetime.now(timezone.utc)
+    row = db.get(PriceSetting, PRICE_KEY_SKU)
+    if row is None:
+        db.add(PriceSetting(sku=PRICE_KEY_SKU, price_rupees=price, effective_from=now, changed_by=changed_by[:100]))
+    else:
+        row.price_rupees, row.effective_from, row.changed_by = price, now, changed_by[:100]
+    db.add(AuditLog(
+        action=PRICE_CHANGED_ACTION, resource_type="price_setting", resource_id=PRICE_KEY_SKU, status="success",
+        details=json.dumps({"key": PRICE_KEY_SKU, "old": old, "new": price, "by": changed_by[:100],
+                            "effective_from": now.isoformat()}),
+    ))
+    db.commit()
+    return old, price
+
+
+def catalogue_requests(unit_price: int) -> List[Dict[str, Any]]:
+    """Graph API batch requests that set each pack's catalogue price (paise, INR) by its retailer id."""
+    return [
+        {"method": "UPDATE", "retailer_id": pack_retailer_id(size),
+         "data": {"price": size * int(unit_price) * 100, "currency": "INR", "name": pack_title(size)}}
+        for size in pack_sizes()
+    ]
+
+
+def push_catalogue_prices(unit_price: int, client: Any = None) -> bool:
+    """Update the pack prices in the WhatsApp catalogue (META_CATALOG_ID). True when Meta accepted them; False when
+    the catalogue is not configured or Meta refused (the caller tells the operator to change them by hand). Blocking."""
+    import httpx
+
+    catalog_id, token = settings.META_CATALOG_ID.strip(), settings.META_WHATSAPP_TOKEN.strip()
+    if not catalog_id or not token:
+        return False
+    owns_client = client is None
+    client = client or httpx.Client(timeout=20.0)
+    try:
+        response = client.post(
+            f"https://graph.facebook.com/v21.0/{catalog_id}/batch",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"requests": catalogue_requests(unit_price)},
+        )
+    except httpx.HTTPError as e:
+        logger.error(f"Catalogue price update failed ({type(e).__name__})")
+        return False
+    finally:
+        if owns_client:
+            client.close()
+    if response.status_code != 200:
+        logger.error(f"Catalogue price update refused (HTTP {response.status_code})")
+        return False
+    return True
+
+
+def price_summary(db: Any = None) -> Dict[str, Any]:
+    """Prices for the dashboard and the catalogue sync."""
+    unit = sku_price(db)
+    return {
+        "sku_price": unit,
+        "gst_percent": int(settings.SKU_GST_PERCENT),
+        "packs": {size: size * unit for size in pack_sizes()},
+        "menu_sizes": menu_pack_sizes(),
+        "white_bg_price": white_bg_price(),
+        "catalog_pack_price": catalog_pack_price(),
+        "min_recharge": min_recharge(),
+        "max_recharge": max_recharge(),
+    }

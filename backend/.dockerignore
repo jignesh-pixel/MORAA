@@ -13,3 +13,8 @@ task*_outputs
 prompt_experiment_outputs
 task*.py
 prompt_experiment*.py
+
+# Google service-account keys (Phase 8): never bake them into the image
+secrets/
+*service-account*.json
+*-sa.json
