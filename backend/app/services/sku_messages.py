@@ -107,14 +107,15 @@ def photo_received(balance_left: int) -> str:
     return f"Photo received ✅ 1 SKU used, {max(int(balance_left), 0)} left."
 
 
-def ready_message(link: str, balance_left: int, name: str = "", email: str = "") -> str:
-    """The batch-ready message. With the customer's email it opens with the line saying the images went to it (the
-    Drive folder is shared with that address)."""
-    ready = f"Your images are ready! 📁 Download from your Drive: {link}. You have {_skus(balance_left)} left."
-    if not email:
-        return ready
-    first = (name or "").strip().split()[0] if (name or "").strip() else "Customer"
-    return f"Dear {first}, your images have been sent to your email {email}.\n\n{ready}"
+def ready_message(link: str, balance_left: int = 0, name: str = "", email: str = "") -> str:
+    """The batch-ready message: the customer's Drive folder link (also shared with their email address)."""
+    customer = (name or "").strip() or "Customer"
+    return (
+        f"Dear {customer},\n\n"
+        "Your batch photos are ready!\n"
+        f"You can download them from this drive link: {link} which is also sent on your email id.\n\n"
+        "Thanks for choosing Moraa Studio ✨"
+    )
 
 
 def held_photos_started(started: int, waiting: int, balance_left: int) -> str:

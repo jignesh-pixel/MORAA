@@ -113,8 +113,7 @@ async def handle_outbox_job(payload: Dict[str, Any]) -> bool:
     if state["in_flight"]:
         await run_io(schedule, customer_id, 1)                 # still working: look again after the next quiet time
         return True
-    folder_id, _label = await drive_layout.ensure_day_folder(customer_id, _aware(state["day"]))
-    link = folder_link(folder_id)
+    link = folder_link((await drive_layout.ensure_customer_folders(customer_id))["root"])     # the parent folder
     last_inbound = _aware(state["last_inbound"])
     if last_inbound is not None and datetime.now(timezone.utc) - last_inbound < SERVICE_WINDOW:
         text = sku_messages.ready_message(link, state["balance"], state.get("name", ""), state.get("email", ""))

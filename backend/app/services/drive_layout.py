@@ -1,9 +1,11 @@
 """Each customer's folders in the business shared drive (Phase 8).
 
-    {phone}/                         root, shared with the customer's email as reader (never "anyone with the link")
-      Images/{7 Oct 2026}/001.png    one folder per IST day; deleted after DRIVE_IMAGES_RETENTION_DAYS
+    {Customer Name} - {phone}/       root, shared with the customer's email as reader (never "anyone with the link")
+      Generated Images/{2026-10-07}/001.png   one folder per IST day; deleted after DRIVE_IMAGES_RETENTION_DAYS
       Invoices/                      invoice PDFs, kept (8-year accounting rule)
-      Usage Logs                     Google Sheet, a view of customer_sku_credits (app/services/usage_log.py)
+      Activity & Generation Logs/Activity Log   Google Sheet, a view of customer_sku_credits (app/services/usage_log.py)
+
+Folders made before this naming keep the names they have ("{phone}", "Images", "7 Oct 2026"); only their ids matter.
 
 The folder ids are stored on the customer (migration 0022). They are created once: a per-customer lock in this
 process, then ONE guarded UPDATE (``WHERE drive_folder_id IS NULL``); a process that loses that race deletes the set
@@ -26,10 +28,11 @@ from app.utils.executors import run_io
 from app.utils.logger import logger, mask_phone
 
 IST = timezone(timedelta(hours=5, minutes=30))
-IMAGES_FOLDER = "Images"
+IMAGES_FOLDER = "Generated Images"
 INVOICES_FOLDER = "Invoices"
-USAGE_LOG_NAME = "Usage Logs"
-USAGE_LOG_HEADER = ["Time (IST)", "Event", "Images used", "Balance left"]
+LOGS_FOLDER = "Activity & Generation Logs"
+USAGE_LOG_NAME = "Activity Log"
+USAGE_LOG_HEADER = ["Time (IST)", "Task", "Images used", "SKU balance left"]
 SHARE_KIND = "drive_share"
 IMAGE_EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}
 
@@ -68,13 +71,19 @@ def customer_lock(customer_id: str) -> asyncio.Lock:
     return lock
 
 
+def root_name(name: Optional[str], phone: str) -> str:
+    """The customer's root folder name: "{Customer Name} - {phone}", or just the phone when there is no name yet."""
+    clean = re.sub(r"[\/]+", " ", (name or "")).strip()[:80]
+    return f"{clean} - {phone}" if clean else phone
+
+
 def day_label(when: Optional[datetime] = None) -> str:
-    """The IST day folder name, e.g. "7 Oct 2026" (no leading zero). A naive time is taken as UTC."""
+    """The IST day folder name, e.g. "2026-10-07". A naive time is taken as UTC."""
     moment = when or datetime.now(timezone.utc)
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
     day = moment.astimezone(IST)
-    return f"{day.day} {day:%b %Y}"
+    return f"{day:%Y-%m-%d}"
 
 
 # ── the customer row (blocking, short sessions) ────────────────────────────────────────────────────────────
@@ -87,7 +96,7 @@ def _customer(customer_id: str) -> Optional[Dict[str, Optional[str]]]:
         c = db.get(Customer, customer_id)
         if c is None:
             return None
-        return {"phone": c.whatsapp_id, "email": c.email, "shared_to": c.drive_shared_to, "root": c.drive_folder_id,
+        return {"phone": c.whatsapp_id, "name": c.full_name, "email": c.email, "shared_to": c.drive_shared_to, "root": c.drive_folder_id,
                 "images": c.drive_images_folder_id, "invoices": c.drive_invoices_folder_id, "sheet": c.drive_sheet_id}
 
 
@@ -144,12 +153,13 @@ async def ensure_customer_folders(customer_id: str) -> Dict[str, str]:
         found = _folder_set(info)
         if found:
             return found
-        root = await google_drive.create_folder(info["phone"], google_drive.shared_drive_id())
+        root = await google_drive.create_folder(root_name(info["name"], info["phone"]), google_drive.shared_drive_id())
         try:
             ids = {"root": root,
                    "images": await google_drive.create_folder(IMAGES_FOLDER, root),
                    "invoices": await google_drive.create_folder(INVOICES_FOLDER, root),
-                   "sheet": await google_drive.create_sheet(USAGE_LOG_NAME, root)}
+                   "sheet": await google_drive.create_sheet(
+                       USAGE_LOG_NAME, await google_drive.create_folder(LOGS_FOLDER, root))}
             await google_drive.sheet_append(ids["sheet"], [USAGE_LOG_HEADER])
             stored = await run_io(_store_folders, customer_id, ids)
         except Exception:

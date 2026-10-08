@@ -22,6 +22,7 @@ from app.models.sku_credit import (
     ACTION_REFUND,
     CustomerSkuCredit,
 )
+from app.models.customer import Customer
 from app.services import drive_layout, google_drive
 from app.services.google_drive import DriveError
 from app.utils.executors import run_io
@@ -53,7 +54,9 @@ def rows_for(db: Session, customer_id: str) -> List[List[Any]]:
     """The sheet's data rows for this customer, from the ledger (created_at, id order)."""
     rows = (db.query(CustomerSkuCredit).filter(CustomerSkuCredit.customer_id == customer_id)
             .order_by(CustomerSkuCredit.created_at, CustomerSkuCredit.id).all())
-    return [[_ist(r.created_at), _event(r), _IMAGES_USED.get(r.action, 0), int(r.balance_after)] for r in rows]
+    registered = db.query(Customer.created_at).filter(Customer.id == customer_id).scalar()
+    first = [[_ist(registered), "Account registered", 0, 0]] if registered is not None else []
+    return first + [[_ist(r.created_at), _event(r), _IMAGES_USED.get(r.action, 0), int(r.balance_after)] for r in rows]
 
 
 def _rows(customer_id: str) -> List[List[Any]]:

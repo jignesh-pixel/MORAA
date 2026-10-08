@@ -68,8 +68,7 @@ class MessageCopyTests(unittest.TestCase):
         self.assertLessEqual(len(sku_messages.PAY_BUTTON), 20)
         self.assertIn(pricing.format_rupees(800), sku_messages.pack_link_body(40, 800))
         self.assertIn("1 SKU used, 13 left", sku_messages.photo_received(13))
-        self.assertEqual(sku_messages.ready_message("https://d/x", 13),
-                         "Your images are ready! 📁 Download from your Drive: https://d/x. You have 13 SKUs left.")
+        self.assertIn("https://d/x", sku_messages.ready_message("https://d/x", 13))
         self.assertIn("13 SKUs left", sku_messages.buy_more(13))
         self.assertIn("used all", sku_messages.buy_more(0))
         for text in (sku_messages.pack_menu_body(), sku_messages.pack_link_unavailable(), sku_messages.ask_email(),

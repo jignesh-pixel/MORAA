@@ -245,12 +245,12 @@ class HeldPhotoTests(_JourneyBase):
 
 
 class ReadyMessageTests(PackWebhookBase):
-    def test_with_an_email_the_message_names_the_customer_and_the_address(self):
+    def test_the_message_is_the_exact_drive_link_copy(self):
         text = sku_messages.ready_message("https://d/x", 13, "Anurag Mehta", "anurag@example.com")
-        self.assertEqual(text, "Dear Anurag, your images have been sent to your email anurag@example.com.\n\n"
-                               "Your images are ready! 📁 Download from your Drive: https://d/x. You have 13 SKUs left.")
+        self.assertEqual(text, "Dear Anurag Mehta,\n\nYour batch photos are ready!\n"
+                               "You can download them from this drive link: https://d/x which is also sent on your "
+                               "email id.\n\nThanks for choosing Moraa Studio ✨")
 
-    def test_without_an_email_it_is_the_plain_ready_line(self):
-        self.assertEqual(sku_messages.ready_message("https://d/x", 1),
-                         "Your images are ready! 📁 Download from your Drive: https://d/x. You have 1 SKU left.")
+    def test_without_a_name_the_greeting_says_customer(self):
+        self.assertTrue(sku_messages.ready_message("https://d/x", 1).startswith("Dear Customer,\n\n"))
 

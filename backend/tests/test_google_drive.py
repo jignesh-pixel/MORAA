@@ -472,8 +472,10 @@ class CustomerFolderTests(DriveDbTestBase):
 
         results = asyncio.run(four())
         self.assertEqual(len({tuple(sorted(r.items())) for r in results}), 1)
-        self.assertEqual(self.google.created, [(PHONE, FOLDER_MIME), ("Images", FOLDER_MIME), ("Invoices", FOLDER_MIME),
-                                               ("Usage Logs", SHEET_MIME)])
+        self.assertEqual(self.google.created, [(f"T - {PHONE}", FOLDER_MIME), ("Generated Images", FOLDER_MIME),
+                                               ("Invoices", FOLDER_MIME),
+                                               ("Activity & Generation Logs", FOLDER_MIME),
+                                               ("Activity Log", SHEET_MIME)])
         ids = results[0]
         row = self.customer(customer_id)
         self.assertEqual((row.drive_folder_id, row.drive_images_folder_id, row.drive_invoices_folder_id, row.drive_sheet_id),
@@ -507,8 +509,8 @@ class CustomerFolderTests(DriveDbTestBase):
     def test_day_folders_use_the_ist_date_and_files_are_numbered(self):
         customer_id = self.make_customer()
         when = datetime(2026, 10, 6, 20, 0, tzinfo=timezone.utc)        # 7 Oct 2026, 01:30 in India
-        self.assertEqual(drive_layout.day_label(when), "7 Oct 2026")
-        self.assertEqual(drive_layout.day_label(datetime(2026, 1, 5, 6, 0)), "5 Jan 2026")
+        self.assertEqual(drive_layout.day_label(when), "2026-10-07")
+        self.assertEqual(drive_layout.day_label(datetime(2026, 1, 5, 6, 0)), "2026-01-05")
 
         async def uploads():
             first = await drive_layout.upload_delivery_image(customer_id, self.image("a.png"), "image/png", when)
@@ -523,13 +525,13 @@ class CustomerFolderTests(DriveDbTestBase):
         first, more, next_day, day = asyncio.run(uploads())
         self.assertEqual(first["name"], "001.png")
         self.assertEqual(sorted(u["name"] for u in more), ["002.png", "003.jpg"])
-        self.assertEqual(day, (first["day_folder_id"], "7 Oct 2026"))
+        self.assertEqual(day, (first["day_folder_id"], "2026-10-07"))
         self.assertEqual({u["day_folder_id"] for u in more}, {first["day_folder_id"]})
         self.assertEqual(first["day_folder_link"], f"https://drive.google.com/drive/folders/{first['day_folder_id']}")
         images = self.customer(customer_id).drive_images_folder_id
         self.assertEqual(self.google.files[first["day_folder_id"]]["parents"], [images])
-        self.assertEqual((next_day["name"], self.google.files[next_day["day_folder_id"]]["name"]), ("001.png", "8 Oct 2026"))
-        self.assertEqual(len([n for n, m in self.google.created if m == FOLDER_MIME and n == "7 Oct 2026"]), 1)
+        self.assertEqual((next_day["name"], self.google.files[next_day["day_folder_id"]]["name"]), ("001.png", "2026-10-08"))
+        self.assertEqual(len([n for n, m in self.google.created if m == FOLDER_MIME and n == "2026-10-07"]), 1)
 
     def test_an_invoice_goes_into_invoices(self):
         customer_id = self.make_customer()

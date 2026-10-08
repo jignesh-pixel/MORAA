@@ -48,7 +48,8 @@ class UsageLogTests(DriveDbTestBase):
         self.ledger(ACTION_REFUND, 1, 4, "ing_2")
         with self.Session() as db:
             rows = usage_log.rows_for(db, self.customer_id)
-        self.assertEqual(rows, [
+        self.assertEqual(rows[0][1:], ["Account registered", 0, 0])
+        self.assertEqual(rows[1:], [
             ["07 Oct 2026 10:00", "Pack purchased (5 SKUs)", 0, 5],
             ["07 Oct 2026 10:01", "Image created", 1, 4],
             ["07 Oct 2026 10:02", "Image created", 1, 3],
@@ -60,10 +61,10 @@ class UsageLogTests(DriveDbTestBase):
         self.ledger(ACTION_CONSUME, -1, 4, "ing_1")
         asyncio.run(drive_layout.ensure_customer_folders(self.customer_id))
         before = self.appends()
-        self.assertEqual(asyncio.run(usage_log.sync(self.customer_id)), 2)
+        self.assertEqual(asyncio.run(usage_log.sync(self.customer_id)), 3)
         self.assertEqual(self.appends(), before + 1)
         self.assertEqual(self.sheet()[0], drive_layout.USAGE_LOG_HEADER)
-        self.assertEqual(len(self.sheet()), 3)
+        self.assertEqual(len(self.sheet()), 4)
 
         self.ledger(ACTION_CONSUME, -1, 3, "ing_2")
         self.assertEqual(asyncio.run(usage_log.sync(self.customer_id)), 1)
@@ -72,7 +73,7 @@ class UsageLogTests(DriveDbTestBase):
 
         self.assertEqual(asyncio.run(usage_log.sync(self.customer_id)), 0)   # up to date: nothing appended
         self.assertEqual(self.appends(), before + 2)
-        self.assertEqual(len(self.sheet()), 4)
+        self.assertEqual(len(self.sheet()), 5)
 
     def test_rebuild_rewrites_the_header_and_every_row(self):
         self.ledger(ACTION_PURCHASE, 5, 5, "pay_1")
@@ -80,7 +81,7 @@ class UsageLogTests(DriveDbTestBase):
         asyncio.run(usage_log.sync(self.customer_id))
         self.sheet()[1] = ["someone typed here"]
         self.sheet().append(["and here"])
-        self.assertEqual(asyncio.run(usage_log.rebuild(self.customer_id)), 2)
+        self.assertEqual(asyncio.run(usage_log.rebuild(self.customer_id)), 3)
         with self.Session() as db:
             expected = [drive_layout.USAGE_LOG_HEADER] + usage_log.rows_for(db, self.customer_id)
         self.assertEqual(self.sheet(), expected)
