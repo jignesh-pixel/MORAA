@@ -431,6 +431,34 @@ class JourneyTests(PackWebhookBase):
                                                         (mws.COLLECTION_CATALOG, "Catalog Pack")])
         self.assertIn("Ecomm Pack 1", body)
 
+    def test_collections_are_one_native_product_list_with_both_sections(self):
+        import asyncio
+
+        with patch.object(settings, "META_CATALOG_ID", "CAT1"),                 patch.object(mws, "_post_message_payload", new=AsyncMock(return_value=True)) as post,                 patch.object(mws, "send_list_message", new=AsyncMock(return_value=True)) as listing,                 patch("app.database.SessionLocal", _session_factory(self)):
+            self.assertTrue(asyncio.run(mws.send_collections(SENDER, intro="Photo received")))
+        listing.assert_not_awaited()
+        payload = post.await_args.args[0]
+        interactive = payload["interactive"]
+        self.assertEqual(payload["type"], "interactive")
+        self.assertEqual(interactive["type"], "product_list")
+        self.assertEqual(interactive["header"]["type"], "text")
+        self.assertTrue(interactive["body"]["text"].startswith("Photo received"))
+        self.assertEqual(interactive["action"]["catalog_id"], "CAT1")
+        sections = interactive["action"]["sections"]
+        self.assertEqual([sec["title"] for sec in sections],
+                         [sku_messages.STUDIO_COLLECTION_TITLE[:24], sku_messages.CATALOG_COLLECTION_TITLE[:24]])
+        self.assertEqual([i["product_retailer_id"] for i in sections[0]["product_items"]],
+                         mws._collection_retailer_ids(mws.COLLECTION_STUDIO))
+        self.assertEqual([i["product_retailer_id"] for i in sections[1]["product_items"]],
+                         mws._collection_retailer_ids(mws.COLLECTION_CATALOG))
+
+    def test_a_refused_product_list_falls_back_to_the_radio_list(self):
+        import asyncio
+
+        with patch.object(settings, "META_CATALOG_ID", "CAT1"),                 patch.object(mws, "_post_message_payload", new=AsyncMock(return_value=False)),                 patch.object(mws, "send_list_message", new=AsyncMock(return_value=True)) as listing,                 patch("app.database.SessionLocal", _session_factory(self)):
+            self.assertTrue(asyncio.run(mws.send_collections(SENDER)))
+        listing.assert_awaited_once()
+
     def test_tapping_the_old_view_collections_button_sends_the_list(self):
         tap = {"type": "interactive", "id": "wamid.coll1", "from": SENDER, "timestamp": "1",
                "interactive": {"type": "button_reply", "button_reply": {"id": mws.COLLECTIONS_BUTTON, "title": "View Collections"}}}
