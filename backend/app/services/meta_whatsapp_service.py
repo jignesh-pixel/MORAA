@@ -846,63 +846,18 @@ def _collection_rows() -> List[Tuple[str, str, str]]:
         ]
 
 
-async def _send_collections_list(
+async def send_collections(
     recipient_id: str, reply_to_message_id: Optional[str] = None, intro: str = "",
 ) -> bool:
-    """The older "View Collections" radio list (COLLECTION_STUDIO / COLLECTION_CATALOG come back as a
-    ``list_reply``). Kept as the fallback when the catalogue message cannot be sent."""
+    """The "View Collections" list: 1. Studio Shot, 2. Catalog Pack (Ecomm Pack 1). Picking one and tapping Send
+    comes back as a ``list_reply`` with COLLECTION_STUDIO / COLLECTION_CATALOG (``send_collection_products``).
+    ``intro`` opens the body (e.g. the photo receipt), so it stays one message."""
     rows = await run_io(_collection_rows)
     body = await run_io(sku_messages.collections_body)
     if intro:
         body = f"{intro}\n\n{body}"
     return await send_list_message(recipient_id, body, COLLECTIONS_LIST_BUTTON, rows,
                                    reply_to_message_id=reply_to_message_id)
-
-
-async def send_collections(
-    recipient_id: str, reply_to_message_id: Optional[str] = None, intro: str = "",
-) -> bool:
-    """Both collections (1. Studio Shot, 2. Catalog Pack) as ONE native multi-product message
-    (``interactive.type = "product_list"``): the customer taps "View items", sets each tier's quantity with + / -
-    and sends the cart, which comes back as an ``order``. Sections list ``product_retailer_id`` values (the
-    WhatsApp API takes no catalogue set ids here; the sets only group the same items in Commerce Manager).
-    ``intro`` opens the body (e.g. the photo receipt), so it stays one message. Without META_CATALOG_ID, or if
-    Meta refuses the message, the radio list."""
-    catalog_id = (settings.META_CATALOG_ID or "").strip()
-    if not recipient_id or not catalog_id:
-        return await _send_collections_list(recipient_id, reply_to_message_id, intro)
-    sections = []
-    for collection_id, title in (
-        (COLLECTION_STUDIO, sku_messages.STUDIO_COLLECTION_TITLE),
-        (COLLECTION_CATALOG, sku_messages.CATALOG_COLLECTION_TITLE),
-    ):
-        retailer_ids = _collection_retailer_ids(collection_id)
-        if retailer_ids:
-            sections.append({
-                "title": title[:24],
-                "product_items": [{"product_retailer_id": rid} for rid in retailer_ids],
-            })
-    # Meta: at most 30 products over at most 10 sections.
-    if not sections or sum(len(sec["product_items"]) for sec in sections) > 30:
-        return await _send_collections_list(recipient_id, reply_to_message_id, intro)
-    body = await run_io(sku_messages.collections_body)
-    if intro:
-        body = f"{intro}\n\n{body}"
-    payload = {
-        "messaging_product": "whatsapp",
-        "recipient_type": "individual",
-        "to": recipient_id,
-        "type": "interactive",
-        "interactive": {
-            "type": "product_list",
-            "header": {"type": "text", "text": "Moraa Studio packs"},
-            "body": {"text": body[:1024]},
-            "action": {"catalog_id": catalog_id, "sections": sections},
-        },
-    }
-    if await _post_message_payload(payload, "collections product list", reply_to_message_id=reply_to_message_id):
-        return True
-    return await _send_collections_list(recipient_id, reply_to_message_id, intro)   # refused: the list still works
 
 
 def _collection_retailer_ids(collection_id: str) -> List[str]:

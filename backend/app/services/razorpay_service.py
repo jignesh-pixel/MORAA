@@ -31,6 +31,16 @@ def razorpay_mode() -> str:
     return "unconfigured"
 
 
+def _error_reason(response: httpx.Response) -> str:
+    """Razorpay's own error code and description (e.g. BAD_REQUEST_ERROR: test mode limit reached), so a failed link
+    is diagnosable from the log. Contains no key, secret or customer data."""
+    try:
+        error = (response.json() or {}).get("error") or {}
+        return f"{error.get('code', '?')}: {error.get('description', '?')}"[:300]
+    except Exception:  # noqa: BLE001 -- a non-JSON body must not hide the original failure
+        return "unreadable response"
+
+
 async def _post_payment_link(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Create a Razorpay Payment Link over async HTTP with a hard timeout (EXT-5).
 
@@ -51,7 +61,10 @@ async def _post_payment_link(payload: Dict[str, Any]) -> Optional[Dict[str, Any]
         ) as client:
             response = await client.post(RAZORPAY_PAYMENT_LINKS_URL, json=payload)
         if response.status_code not in (200, 201):
-            logger.error(f"Razorpay payment link creation failed: status={response.status_code}")
+            logger.error(
+                f"Razorpay payment link creation failed: status={response.status_code} "
+                f"mode={razorpay_mode()} reason={_error_reason(response)}"
+            )
             return None
         data = response.json()
         return data if isinstance(data, dict) else None

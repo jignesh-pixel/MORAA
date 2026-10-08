@@ -431,33 +431,27 @@ class JourneyTests(PackWebhookBase):
                                                         (mws.COLLECTION_CATALOG, "Catalog Pack")])
         self.assertIn("Ecomm Pack 1", body)
 
-    def test_collections_are_one_native_product_list_with_both_sections(self):
+    def test_collections_stay_the_two_step_list_even_with_a_catalogue(self):
         import asyncio
 
         with patch.object(settings, "META_CATALOG_ID", "CAT1"),                 patch.object(mws, "_post_message_payload", new=AsyncMock(return_value=True)) as post,                 patch.object(mws, "send_list_message", new=AsyncMock(return_value=True)) as listing,                 patch("app.database.SessionLocal", _session_factory(self)):
-            self.assertTrue(asyncio.run(mws.send_collections(SENDER, intro="Photo received")))
-        listing.assert_not_awaited()
-        payload = post.await_args.args[0]
-        interactive = payload["interactive"]
-        self.assertEqual(payload["type"], "interactive")
-        self.assertEqual(interactive["type"], "product_list")
-        self.assertEqual(interactive["header"]["type"], "text")
-        self.assertTrue(interactive["body"]["text"].startswith("Photo received"))
-        self.assertEqual(interactive["action"]["catalog_id"], "CAT1")
-        sections = interactive["action"]["sections"]
-        self.assertEqual([sec["title"] for sec in sections],
-                         [sku_messages.STUDIO_COLLECTION_TITLE[:24], sku_messages.CATALOG_COLLECTION_TITLE[:24]])
-        self.assertEqual([i["product_retailer_id"] for i in sections[0]["product_items"]],
-                         mws._collection_retailer_ids(mws.COLLECTION_STUDIO))
-        self.assertEqual([i["product_retailer_id"] for i in sections[1]["product_items"]],
-                         mws._collection_retailer_ids(mws.COLLECTION_CATALOG))
+            asyncio.run(mws.send_collections(SENDER, intro="Photo received"))
+        post.assert_not_awaited()
+        self.assertEqual(listing.await_args.args[2], "View Collections")
+        self.assertTrue(listing.await_args.args[1].startswith("Photo received"))
 
-    def test_a_refused_product_list_falls_back_to_the_radio_list(self):
+    def test_picking_a_collection_sends_only_that_collections_items_as_a_product_list(self):
         import asyncio
 
-        with patch.object(settings, "META_CATALOG_ID", "CAT1"),                 patch.object(mws, "_post_message_payload", new=AsyncMock(return_value=False)),                 patch.object(mws, "send_list_message", new=AsyncMock(return_value=True)) as listing,                 patch("app.database.SessionLocal", _session_factory(self)):
-            self.assertTrue(asyncio.run(mws.send_collections(SENDER)))
-        listing.assert_awaited_once()
+        for collection, expected in ((mws.COLLECTION_STUDIO, "studio_sku_"), (mws.COLLECTION_CATALOG, "sku_pack_")):
+            with patch.object(settings, "META_CATALOG_ID", "CAT1"),                     patch.object(mws, "_post_message_payload", new=AsyncMock(return_value=True)) as post:
+                asyncio.run(mws.send_collection_products(SENDER, collection))
+            interactive = post.await_args.args[0]["interactive"]
+            self.assertEqual(interactive["type"], "product_list")
+            self.assertEqual(interactive["action"]["catalog_id"], "CAT1")
+            (section,) = interactive["action"]["sections"]
+            ids = [i["product_retailer_id"] for i in section["product_items"]]
+            self.assertTrue(ids and all(i.startswith(expected) for i in ids))
 
     def test_tapping_the_old_view_collections_button_sends_the_list(self):
         tap = {"type": "interactive", "id": "wamid.coll1", "from": SENDER, "timestamp": "1",
