@@ -196,30 +196,33 @@ class FlowWebhookTests(FundedSlotGateTestCase):
         self.assertEqual(self.cta.await_count, 1)
 
     def test_i_hi_sends_flow_for_new_user(self):
+        # ONE message: the Flow carries the welcome copy as its body (no separate welcome text).
         self._post(_text("Hi"))
         self.flow.assert_awaited_once_with(SENDER)
-        self.assertEqual(len(self.sent_texts), 1)
-        self.assertTrue(self.sent_texts[0].startswith("Welcome to Moraa Studio"))
+        self.assertEqual(self.sent_texts, [])
+        self.assertEqual(mws.REGISTRATION_FLOW_BODY, mws.WELCOME_MESSAGE)
+        self.assertEqual(mws.REGISTRATION_FLOW_CTA, "Setup Account")
 
     def test_j_hi_falls_back_to_text_when_flow_not_sent(self):
         self.flow.return_value = False  # unconfigured Flow ID or Meta rejection
         self._post(_text("Hi"))
-        self.assertEqual(len(self.sent_texts), 2)
-        self.assertTrue(self.sent_texts[1].startswith("Quick Setup 📋\n\nPlease reply with your details:"))
+        self.assertEqual(len(self.sent_texts), 1)
+        self.assertTrue(self.sent_texts[0].startswith("Welcome to Moraa Studio"))
+        self.assertIn("Quick Setup 📋\n\nPlease reply with your details:", self.sent_texts[0])
 
     def test_j_real_sender_without_flow_id_falls_back(self):
         self.flow.side_effect = mws.send_registration_flow  # real helper, unconfigured
         with patch.object(settings, "META_REGISTRATION_FLOW_ID", ""):
             self._post(_text("Hi"))
-        self.assertEqual(len(self.sent_texts), 2)
-        self.assertTrue(self.sent_texts[1].startswith("Quick Setup"))
+        self.assertEqual(len(self.sent_texts), 1)
+        self.assertIn("Quick Setup", self.sent_texts[0])
 
     def test_registered_customer_hi_is_unchanged(self):
         _make_customer(self.session, balance=500)
         self._post(_text("hello"))
         self.flow.assert_not_awaited()
-        self.assertEqual(len(self.sent_texts), 2)
-        self.assertTrue(self.sent_texts[1].startswith("Quick Setup"))
+        self.assertEqual(len(self.sent_texts), 1)
+        self.assertIn("Quick Setup", self.sent_texts[0])
 
 
 if __name__ == "__main__":

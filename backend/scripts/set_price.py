@@ -39,6 +39,10 @@ def main(argv=None) -> int:
         print(f"Price per SKU: {current} -> {args.sku_price} rupees (GST included)")
         for size in pricing.pack_sizes():
             print(f"  {pricing.pack_title(size)}: {size * args.sku_price} rupees")
+        catalog_unit = pricing.creative_pack_price()
+        print(f"{pricing.CREATIVE_TITLE} tiers stay at {catalog_unit} rupees per SKU (CATALOG_PACK_SKU_PRICE):")
+        for size in pricing.pack_sizes():
+            print(f"  {pricing.pack_title(size)}: {size * catalog_unit} rupees")
         if args.dry_run:
             print("Dry run: nothing changed.")
             return 0

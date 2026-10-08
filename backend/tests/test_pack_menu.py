@@ -33,26 +33,26 @@ def _order(items, message_id="wamid.order1", sender=SENDER):
 
 def _pack_settings(**overrides):
     values = dict(SKU_PACKS_ENABLED=True, SKU_PRICE_RUPEES=20, SKU_PACK_SIZES="1,5,20,50,100",
-                  ECOM_PACK1_ENABLED=False)
+                  ECOM_PACK1_ENABLED=False, CATALOG_PACK_SKU_PRICE=500)
     values.update(overrides)
     return [patch.object(settings, k, v) for k, v in values.items()]
 
 
 class ParseTests(unittest.TestCase):
     def test_list_reply_is_parsed(self):
-        ev = parse_webhook_entry(_payload(_list_reply("pack_20"))["entry"][0])
+        ev = parse_webhook_entry(_payload(_list_reply("studio_sku_20"))["entry"][0])
         self.assertEqual(len(ev), 1)
         self.assertEqual((ev[0]["type"], ev[0]["subtype"], ev[0]["message_id"], ev[0]["sender"], ev[0]["timestamp"]),
                          ("interactive", "list_reply", "wamid.list1", SENDER, "1700000200"))
-        self.assertEqual(ev[0]["list_reply"], {"id": "pack_20", "title": "20 SKUs"})
+        self.assertEqual(ev[0]["list_reply"], {"id": "studio_sku_20", "title": "20 SKUs"})
 
     def test_order_is_parsed_and_its_prices_are_dropped(self):
-        ev = parse_webhook_entry(_payload(_order([("pack_20", 2), ("pack_5", 1)]))["entry"][0])
+        ev = parse_webhook_entry(_payload(_order([("studio_sku_20", 2), ("studio_sku_5", 1)]))["entry"][0])
         self.assertEqual(len(ev), 1)
         self.assertEqual((ev[0]["type"], ev[0]["message_id"], ev[0]["sender"], ev[0]["catalog_id"]),
                          ("order", "wamid.order1", SENDER, "CAT1"))
-        self.assertEqual(ev[0]["items"], [{"retailer_id": "pack_20", "quantity": 2},
-                                          {"retailer_id": "pack_5", "quantity": 1}])
+        self.assertEqual(ev[0]["items"], [{"retailer_id": "studio_sku_20", "quantity": 2},
+                                          {"retailer_id": "studio_sku_5", "quantity": 1}])
 
     def test_order_without_items_is_safe(self):
         msg = {"type": "order", "id": "wamid.o", "from": SENDER, "timestamp": "1"}
@@ -99,9 +99,12 @@ class SenderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(inter["body"]["text"], sku_messages.pack_menu_body())
         self.assertEqual(inter["action"]["button"], sku_messages.PACK_MENU_BUTTON)
         rows = inter["action"]["sections"][0]["rows"]
-        self.assertEqual([r["id"] for r in rows], ["pack_5", "pack_20", "pack_50", "pack_100", "creative_pack_1"])
-        self.assertEqual(rows[1]["title"], "20 SKUs")
+        self.assertEqual([r["id"] for r in rows], ["studio_sku_5", "studio_sku_20", "studio_sku_50", "studio_sku_100",
+                                                   "sku_pack_5", "sku_pack_20", "sku_pack_50", "sku_pack_100"])
+        self.assertEqual(rows[1]["title"], "Studio Shot · 20 SKUs")
+        self.assertEqual(rows[5]["title"], "Catalog Pack · 20 SKUs")
         self.assertIn(pricing.format_rupees(400), rows[1]["description"])          # 20 x 20, computed here
+        self.assertIn(pricing.format_rupees(10000), rows[5]["description"])     # 20 x 500: Catalog Pack tier
         for r in rows:
             self.assertLessEqual(len(r["title"]), 24)
             self.assertLessEqual(len(r["description"]), 72)
@@ -109,8 +112,9 @@ class SenderTests(unittest.IsolatedAsyncioTestCase):
     async def test_pack_1_is_shown_only_when_enabled(self):
         payload = await self._menu(ECOM_PACK1_ENABLED=True)
         rows = payload["interactive"]["action"]["sections"][0]["rows"]
-        self.assertEqual(rows[0]["id"], "pack_1")
-        self.assertEqual(rows[0]["title"], "1 SKU")
+        self.assertEqual(len(rows), 10)                          # 5 tiers x 2 collections: Meta's list maximum
+        self.assertEqual((rows[0]["id"], rows[5]["id"]), ("studio_sku_1", "sku_pack_1"))
+        self.assertEqual(rows[0]["title"], "Studio Shot · 1 SKU")
 
     async def test_list_message_trims_to_meta_limits(self):
         post = AsyncMock(return_value=True)
@@ -135,6 +139,13 @@ class SenderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["template"]["components"],
                          [{"type": "body", "parameters": [{"type": "text", "text": "https://d/x"},
                                                           {"type": "text", "text": "13"}]}])
+
+
+def _session_factory(test):
+    """SessionLocal stand-in bound to the test database (for helpers that open their own session)."""
+    from sqlalchemy.orm import sessionmaker
+
+    return sessionmaker(bind=test.engine)
 
 
 class PackWebhookBase(FundedSlotGateTestCase):
@@ -180,45 +191,45 @@ class PackWebhookBase(FundedSlotGateTestCase):
 class PackWebhookTests(PackWebhookBase):
     def test_list_reply_pack_5_sends_one_link_for_5(self):
         _make_customer(self.session, balance=0)
-        self._post(_list_reply("pack_5"))
+        self._post(_list_reply("studio_sku_5"))
         self._assert_one_link(5, 100)
         self.assertEqual(self.cta.await_args.kwargs["reply_to_message_id"], "wamid.list1")
         self.menu.assert_not_awaited()
 
     def test_order_2_x_pack_20_is_one_link_for_40(self):
         _make_customer(self.session, balance=0)
-        self._post(_order([("pack_20", 2)]))
+        self._post(_order([("studio_sku_20", 2)]))
         self._assert_one_link(40, 800)
         self.assertIn("Total Amount: ₹800 (incl. GST)", self.cta.await_args.kwargs["body_text"])
 
     def test_order_ignores_unknown_ids_and_bad_quantities(self):
         _make_customer(self.session, balance=0)
-        self._post(_order([("pack_20", 1), ("ring_7", 3), ("pack_7", 1), ("pack_5", 0), ("pack_5", -1),
-                           ("pack_5", True), ("pack_5", 1.5), ("pack_5", "2"), ("pack_50", None)]))
+        self._post(_order([("studio_sku_20", 1), ("ring_7", 3), ("studio_sku_7", 1), ("studio_sku_5", 0), ("studio_sku_5", -1),
+                           ("studio_sku_5", True), ("studio_sku_5", 1.5), ("studio_sku_5", "2"), ("studio_sku_50", None)]))
         self._assert_one_link(30, 600)                    # 20 + 2 x 5
 
     def test_order_total_is_capped(self):
         _make_customer(self.session, balance=0)
-        self._post(_order([("pack_100", 10 ** 9)]))
+        self._post(_order([("studio_sku_100", 10 ** 9)]))
         self.assertEqual(self.pack_link.await_args.kwargs["units"], 10_000)
 
     def test_unreadable_order_gets_a_message_and_the_menu_but_no_link(self):
-        self._post(_order([("ring_7", 2), ("pack_20", 0)]))
+        self._post(_order([("ring_7", 2), ("studio_sku_20", 0)]))
         self.assertEqual(self.sent_texts, [sku_messages.order_unreadable()])
         self.menu.assert_awaited_once_with(SENDER)
         self.pack_link.assert_not_awaited()
         self.cta.assert_not_awaited()
 
     def test_pack_1_works_by_id_although_hidden_from_the_menu(self):
-        self._post(_list_reply("pack_1"))
-        self._post(_order([("pack_1", 3)], message_id="wamid.order.p1"))
+        self._post(_list_reply("studio_sku_1"))
+        self._post(_order([("studio_sku_1", 3)], message_id="wamid.order.p1"))
         self.assertEqual([c.kwargs["units"] for c in self.pack_link.await_args_list], [1, 3])
         self.assertEqual(self.pack_link.await_args_list[0].kwargs["customer_name"], "Customer")   # unknown sender
         self.assertEqual([c.kwargs["body_text"].split("Total Amount: ")[1].split(" ")[0]
                           for c in self.cta.await_args_list], ["₹20", "₹60"])
 
     def test_other_list_rows_are_ignored(self):
-        self._post(_list_reply("pack_7"), _list_reply("something_else", message_id="wamid.list2"))
+        self._post(_list_reply("studio_sku_7"), _list_reply("something_else", message_id="wamid.list2"))
         self.pack_link.assert_not_awaited()
         self.cta.assert_not_awaited()
         self.menu.assert_not_awaited()
@@ -226,21 +237,21 @@ class PackWebhookTests(PackWebhookBase):
 
     def test_no_link_means_an_apology_and_no_button(self):
         self.pack_link.return_value = None
-        self._post(_list_reply("pack_20"))
+        self._post(_list_reply("studio_sku_20"))
         self.pack_link.side_effect = RuntimeError("razorpay down")
-        self._post(_list_reply("pack_20", message_id="wamid.list2"))
+        self._post(_list_reply("studio_sku_20", message_id="wamid.list2"))
         self.assertEqual(self.sent_texts, [sku_messages.pack_link_unavailable()] * 2)
         self.cta.assert_not_awaited()
 
     def test_the_stored_price_is_used_never_the_cart_price(self):
         self.session.add(PriceSetting(sku=PRICE_KEY_SKU, price_rupees=25))
         self.session.commit()
-        self._post(_order([("pack_20", 2)]))
+        self._post(_order([("studio_sku_20", 2)]))
         self.assertIn("Total Amount: ₹1,000 (incl. GST)", self.cta.await_args.kwargs["body_text"])
 
     def test_a_duplicate_order_delivery_is_handled_once(self):
-        self._post(_order([("pack_20", 2)], message_id="wamid.dup"))
-        self._post(_order([("pack_20", 2)], message_id="wamid.dup"))
+        self._post(_order([("studio_sku_20", 2)], message_id="wamid.dup"))
+        self._post(_order([("studio_sku_20", 2)], message_id="wamid.dup"))
         self.pack_link.assert_awaited_once()
         self.cta.assert_awaited_once()
 
@@ -265,10 +276,10 @@ class PackWebhookTests(PackWebhookBase):
     def test_registered_customer_without_email_is_asked_for_it_once(self):
         _make_customer(self.session, balance=0)
         self._post(_text("hi", message_id="wamid.h1"))
-        self.assertEqual(len(self.sent_texts), 3)
+        self.assertEqual(len(self.sent_texts), 1)                    # welcome, form and email ask: ONE message
         self.assertTrue(self.sent_texts[0].startswith("Welcome"))
-        self.assertTrue(self.sent_texts[1].startswith("Quick Setup"))
-        self.assertEqual(self.sent_texts[2], sku_messages.ask_email())
+        self.assertIn("Quick Setup", self.sent_texts[0])
+        self.assertTrue(self.sent_texts[0].endswith(sku_messages.ask_email()))
         self.menu.assert_not_awaited()
 
     def test_no_email_ask_with_an_email_or_for_a_new_sender(self):
@@ -296,8 +307,8 @@ class PacksOffTests(PackWebhookBase):
 
     def test_everything_new_is_silent(self):
         _make_customer(self.session, balance=0)
-        self._post(_list_reply("pack_5"))
-        self._post(_order([("pack_20", 2)]))
+        self._post(_list_reply("studio_sku_5"))
+        self._post(_order([("studio_sku_20", 2)]))
         self._post(_order([("ring_7", 1)], message_id="wamid.order2"))
         self._post(_text("packs", message_id="wamid.t1"))
         self._post(_text("what do you do?", message_id="wamid.t2"))
@@ -308,8 +319,9 @@ class PacksOffTests(PackWebhookBase):
     def test_greeting_is_unchanged(self):
         _make_customer(self.session, balance=0)
         self._post(_text("hi", message_id="wamid.h1"))
-        self.assertEqual(len(self.sent_texts), 2)
-        self.assertTrue(self.sent_texts[1].startswith("Quick Setup"))
+        self.assertEqual(len(self.sent_texts), 1)
+        self.assertIn("Quick Setup", self.sent_texts[0])
+        self.assertNotIn(sku_messages.ask_email(), self.sent_texts[0])
 
 
 if __name__ == "__main__":
@@ -319,47 +331,97 @@ if __name__ == "__main__":
 class CartTests(PackWebhookBase):
     def test_mixed_cart_is_one_link_with_one_grand_total(self):
         _make_customer(self.session, balance=0)
-        self._post(_order([("pack_20", 2), ("pack_5", 1), ("creative_pack_1", 2)]))
+        self._post(_order([("studio_sku_20", 2), ("studio_sku_5", 1), ("sku_pack_20", 1), ("sku_pack_1", 2)]))
         self.pack_link.assert_awaited_once()
         self.assertEqual(self.pack_link.await_args.kwargs["units"], 45)
-        self.assertEqual(self.pack_link.await_args.kwargs["creative_packs"], 2)
-        body = self.cta.await_args.kwargs["body_text"]
-        total = 45 * pricing.sku_price() + 2 * pricing.creative_pack_price()
-        self.assertIn("Total SKUs: 45", body)
-        self.assertIn(f"Total Amount: {pricing.format_rupees(total)} (incl. GST)", body)
+        self.assertEqual(self.pack_link.await_args.kwargs["creative_packs"], 22)
+        kwargs = self.cta.await_args.kwargs
+        self.assertEqual(kwargs["button_label"], "Place Order")
+        self.assertEqual(kwargs["body_text"], "\n".join([                  # 45 x 20 + 22 x 500 = 11,900
+            "Your Cart is ready!", "Studio Shot: 45 SKUs", "Catalog Pack: 22 SKUs", "Total SKUs: 67",
+            "Total Amount: ₹11,900 (incl. GST)", "Click below to complete your payment:"]))
+
+    def test_catalog_pack_only_cart(self):
+        _make_customer(self.session, balance=0)
+        self._post(_order([("sku_pack_50", 1), ("sku_pack_5", 2)]))
+        self.assertEqual((self.pack_link.await_args.kwargs["units"], self.pack_link.await_args.kwargs["creative_packs"]),
+                         (0, 60))
+        self.assertIn("Total Amount: ₹30,000 (incl. GST)", self.cta.await_args.kwargs["body_text"])     # 60 x 500
+
+    def test_the_first_catalogues_pack_ids_still_count_as_studio_shot(self):
+        _make_customer(self.session, balance=0)
+        self._post(_order([("pack_20", 1)]))
+        self.assertEqual(self.pack_link.await_args.kwargs["units"], 20)
 
     def test_quote_cart_ignores_meta_prices_and_unknown_items(self):
-        quote = pricing.quote_cart([{"retailer_id": "pack_20", "quantity": 2, "item_price": 1},
-                                    {"retailer_id": "PACK_5", "quantity": 1},
-                                    {"retailer_id": "creative_pack_1", "quantity": "1"},
+        quote = pricing.quote_cart([{"retailer_id": "studio_sku_20", "quantity": 2, "item_price": 1},
+                                    {"retailer_id": "STUDIO_SKU_5", "quantity": 1},
+                                    {"retailer_id": "sku_pack_5", "quantity": "1"},
+                                    {"retailer_id": "sku_pack_7", "quantity": 1},          # not a tier
+                                    {"retailer_id": "creative_pack_1", "quantity": 1},     # retired id
                                     {"retailer_id": "ring", "quantity": 4}])
-        self.assertEqual((quote["white_units"], quote["creative_packs"]), (45, 1))
-        self.assertEqual(quote["total"], 45 * pricing.sku_price() + pricing.creative_pack_price())
+        self.assertEqual((quote["white_units"], quote["creative_packs"]), (45, 5))
+        self.assertEqual((quote["white_total"], quote["creative_total"], quote["total"]), (900, 2500, 3400))
+
+    def test_catalog_pack_tiers_are_500_per_sku_and_studio_shot_stays_20(self):
+        studio = {n: pricing.quote_cart([{"retailer_id": f"studio_sku_{n}", "quantity": 1}])["total"]
+                  for n in (1, 5, 20, 50, 100)}
+        catalog = {n: pricing.quote_cart([{"retailer_id": f"sku_pack_{n}", "quantity": 1}])["total"]
+                   for n in (1, 5, 20, 50, 100)}
+        self.assertEqual(studio, {1: 20, 5: 100, 20: 400, 50: 1000, 100: 2000})
+        self.assertEqual(catalog, {1: 500, 5: 2500, 20: 10000, 50: 25000, 100: 50000})
+
+    def test_the_catalog_pack_price_is_a_setting(self):
+        from app.services import billing_service
+
+        with patch.object(settings, "CATALOG_PACK_SKU_PRICE", 450):
+            self.assertEqual(pricing.quote_cart([{"retailer_id": "sku_pack_20", "quantity": 1}])["total"], 9000)
+            self.assertEqual(pricing.catalogue_requests(20)[7]["data"]["price"], 9000 * pricing.PAISE_PER_RUPEE)
+            lines = billing_service.pack_invoice_lines(20, 2, 20 * 20 + 2 * 450)
+        self.assertEqual([line["qty"] for line in lines], [20, 2])
+        self.assertEqual(round(sum(line["qty"] * line["rate"] for line in lines)), 20 * 20 + 2 * 450)
+
+    def test_every_catalogue_tier_id_is_read(self):
+        for size in (1, 5, 20, 50, 100):
+            self.assertEqual(pricing.parse_retailer_id(f"studio_sku_{size}"), ("white_bg", size))
+            self.assertEqual(pricing.parse_retailer_id(f"sku_pack_{size}"), ("creative_pack", size))
+        for bad in ("studio_sku_3", "sku_pack_", "sku_pack_x", "creative_pack_1", None, 20):
+            self.assertIsNone(pricing.parse_retailer_id(bad))
+
+    def test_catalogue_price_sync_covers_both_collections(self):
+        ids = [r["retailer_id"] for r in pricing.catalogue_requests(20)]
+        self.assertEqual(ids, [f"studio_sku_{n}" for n in (1, 5, 20, 50, 100)]
+                         + [f"sku_pack_{n}" for n in (1, 5, 20, 50, 100)])
+        requests = pricing.catalogue_requests(20)
+        self.assertEqual(requests[2]["data"]["price"], 400 * pricing.PAISE_PER_RUPEE)            # studio_sku_20
+        self.assertEqual(requests[7]["data"]["price"], 10000 * pricing.PAISE_PER_RUPEE)          # sku_pack_20
 
 
 class JourneyTests(PackWebhookBase):
     def test_45_skus_cost_900_in_one_link(self):
         _make_customer(self.session, balance=0)
-        self._post(_order([("pack_20", 2), ("pack_5", 1)]))
+        self._post(_order([("studio_sku_20", 2), ("studio_sku_5", 1)]))
         self.assertEqual(self.pack_link.await_args.kwargs["units"], 45)
         self.assertIn("Total Amount: ₹900 (incl. GST)", self.cta.await_args.kwargs["body_text"])
 
-    def test_collections_message_has_one_view_collections_button(self):
+    def test_collections_message_is_a_view_collections_list_of_two(self):
         import asyncio
 
-        with patch.object(mws, "send_reply_buttons", new=AsyncMock(return_value=True)) as buttons:
+        with patch.object(mws, "send_list_message", new=AsyncMock(return_value=True)) as listing, \
+                patch("app.database.SessionLocal", _session_factory(self)):
             asyncio.run(mws.send_collections(SENDER))
-        recipient, body, rows = buttons.await_args.args
-        self.assertEqual(rows, [(mws.COLLECTIONS_BUTTON, "View Collections")])
-        self.assertIn("E-commerce Only", body)
-        self.assertIn(pricing.CREATIVE_TITLE, body)
+        recipient, body, button, rows = listing.await_args.args
+        self.assertEqual(button, "View Collections")
+        self.assertEqual([(r[0], r[1]) for r in rows], [(mws.COLLECTION_STUDIO, "Studio Shot"),
+                                                        (mws.COLLECTION_CATALOG, "Catalog Pack")])
+        self.assertIn("Ecomm Pack 1", body)
 
-    def test_tapping_view_collections_opens_the_catalogue(self):
+    def test_tapping_the_old_view_collections_button_sends_the_list(self):
         tap = {"type": "interactive", "id": "wamid.coll1", "from": SENDER, "timestamp": "1",
                "interactive": {"type": "button_reply", "button_reply": {"id": mws.COLLECTIONS_BUTTON, "title": "View Collections"}}}
-        with patch.object(mws, "send_catalogue", new=AsyncMock(return_value=True)) as catalogue:
+        with patch.object(self.webhook_module, "send_collections", new=AsyncMock(return_value=True)) as listing:
             self._post(tap)
-        catalogue.assert_awaited_once_with(SENDER)
+        listing.assert_awaited_once_with(SENDER)
 
     def test_without_a_catalogue_the_catalogue_is_the_list_menu(self):
         import asyncio

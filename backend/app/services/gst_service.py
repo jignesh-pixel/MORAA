@@ -200,7 +200,9 @@ async def verify_gstin(raw_gstin: Any, provider: Optional[GstProvider] = None) -
     if not GSTIN_FORMAT_RE.match(gstin):
         return GstVerificationResult(INVALID_FORMAT, gstin)
     provider = provider or get_gst_provider()
-    timeout = float(getattr(settings, "GST_API_TIMEOUT_SECONDS", 8.0) or 8.0)
+    if isinstance(provider, NoGstProvider):
+        return GstVerificationResult(UNAVAILABLE, gstin, detail="no GST lookup provider configured")
+    timeout =float(getattr(settings, "GST_API_TIMEOUT_SECONDS", 8.0) or 8.0)
     try:
         payload = await asyncio.wait_for(provider.lookup(gstin), timeout=timeout)
     except GstLookupNotFound as e:
@@ -222,6 +224,11 @@ async def verify_gstin(raw_gstin: Any, provider: Optional[GstProvider] = None) -
 # State lives in the existing onboarding_sessions table (one row per
 # WhatsApp number). Only AWAITING_GSTIN changes routing: the next text
 # message is treated as a GSTIN. Every other state keeps today's flow.
+#
+# The format check (Step A) ALWAYS runs: a malformed GSTIN never completes
+# registration, whatever GST_VERIFICATION_ENABLED says. That flag only
+# switches the registry lookup (Step B); with it off, a well-formed GSTIN is
+# kept as entered (unverified) and onboarding continues.
 
 STATE_AWAITING_GSTIN = "AWAITING_GSTIN"
 STATE_REGISTERED = "REGISTERED"   # profile done -> recharge / send photo
@@ -245,11 +252,16 @@ def verification_enabled() -> bool:
     return bool(getattr(settings, "GST_VERIFICATION_ENABLED", False))
 
 
+def is_no_gst_answer(raw_gstin: Any) -> bool:
+    """Empty / "NA" / "none" / "skip": the customer gave no GSTIN."""
+    return str(raw_gstin or "").strip().lower() in _NO_GST_ANSWERS
+
+
 def gst_check_pending(raw_gstin: Any) -> bool:
-    """True when a submitted GSTIN still has to go through process_gstin
-    (verification on and a non-empty answer), i.e. registration must NOT be
-    marked complete yet. Empty / "NA" / "skip" answers return False."""
-    return verification_enabled() and str(raw_gstin or "").strip().lower() not in _NO_GST_ANSWERS
+    """True when a submitted GSTIN still has to go through process_gstin (any
+    non-empty answer), i.e. registration must NOT be marked complete yet.
+    Empty / "NA" / "skip" answers return False."""
+    return not is_no_gst_answer(raw_gstin)
 
 
 def _session(db, whatsapp_id: str, create: bool = False):
@@ -267,8 +279,6 @@ def _set_state(db, whatsapp_id: str, state: str) -> None:
 
 
 def is_awaiting_gstin(db, sender: str) -> bool:
-    if not verification_enabled():
-        return False
     from app.services.wallet_service import find_customer_by_phone
 
     try:
@@ -326,7 +336,8 @@ async def process_gstin(
         customer = find_customer_by_phone(db, sender)
         if customer is None:
             return None
-        provider = get_gst_provider()
+        # Registry lookup only when verification is on; the format check runs either way.
+        provider = get_gst_provider() if verification_enabled() else NoGstProvider()
         result = await verify_gstin(raw_gstin, provider)
 
         if result.verified:
@@ -390,13 +401,10 @@ async def verify_after_registration(
     """Called right after a profile is saved (text form or WhatsApp Flow).
 
     ``on_complete`` (the "You're all set" confirmation) runs only once the GST
-    step is resolved -- immediately when verification is off or no GSTIN was
-    given, and never while an invalid GSTIN is awaiting a retry / skip.
+    step is resolved -- immediately when no GSTIN was given, and never while an
+    invalid GSTIN is awaiting a retry / skip (with or without verification).
     """
-    if not verification_enabled():
-        await _complete(on_complete)
-        return
-    if str(raw_gstin or "").strip().lower() in _NO_GST_ANSWERS:
+    if is_no_gst_answer(raw_gstin):
         from app.services.wallet_service import find_customer_by_phone
 
         customer = find_customer_by_phone(db, sender)
@@ -410,7 +418,7 @@ async def verify_after_registration(
 
 async def handle_gst_button(db, sender: str, button_id: str, on_complete: OnComplete = None) -> bool:
     """Re-enter / Skip buttons. Returns True when the button was ours."""
-    if button_id not in (BTN_GST_REENTER, BTN_GST_SKIP) or not verification_enabled():
+    if button_id not in (BTN_GST_REENTER, BTN_GST_SKIP):
         return False
     from app.services.wallet_service import find_customer_by_phone
 

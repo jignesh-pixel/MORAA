@@ -807,11 +807,16 @@ def _pack_menu_rows() -> List[Tuple[str, str, str]]:
     from app.database import SessionLocal
 
     with SessionLocal() as db:
+        sizes = pricing.menu_pack_sizes()
         return [
-            (pricing.pack_retailer_id(n), pricing.pack_title(n), pricing.pack_description(n, db))
-            for n in pricing.menu_pack_sizes()
-        ] + [(pricing.CREATIVE_RETAILER_ID, pricing.CREATIVE_TITLE[:24],
-              f"7 photoshoot styles of one photo · {pricing.format_rupees(pricing.creative_pack_price())}")]
+            (pricing.pack_retailer_id(n), f"{pricing.STUDIO_TITLE} · {pricing.pack_title(n)}",
+             pricing.pack_description(n, db))
+            for n in sizes
+        ] + [
+            (pricing.catalog_retailer_id(n), f"{pricing.CREATIVE_TITLE} · {pricing.pack_title(n)}",
+             sku_messages.catalog_tier_description(n))
+            for n in sizes
+        ]
 
 
 async def send_pack_menu(recipient_id: str, reply_to_message_id: Optional[str] = None) -> bool:
@@ -823,15 +828,84 @@ async def send_pack_menu(recipient_id: str, reply_to_message_id: Optional[str] =
     )
 
 
-COLLECTIONS_BUTTON = "gv_collections"
+COLLECTIONS_BUTTON = "gv_collections"          # the earlier reply button; still answered for messages already sent
+COLLECTIONS_LIST_BUTTON = "View Collections"
+COLLECTION_STUDIO = "gv_col_studio"
+COLLECTION_CATALOG = "gv_col_catalog"
+COLLECTION_IDS = (COLLECTION_STUDIO, COLLECTION_CATALOG)
 
 
-async def send_collections(recipient_id: str, reply_to_message_id: Optional[str] = None) -> bool:
-    """After registration: the two collections with one "View Collections" button. Tapping it opens the catalogue
-    (``send_catalogue``)."""
+def _collection_rows() -> List[Tuple[str, str, str]]:
+    """(row id, title, description) for the two collections, priced from one session. Blocking."""
+    from app.database import SessionLocal
+
+    with SessionLocal() as db:
+        return [
+            (COLLECTION_STUDIO, sku_messages.STUDIO_COLLECTION_TITLE, sku_messages.studio_collection_row(db)),
+            (COLLECTION_CATALOG, sku_messages.CATALOG_COLLECTION_TITLE, sku_messages.catalog_collection_row()),
+        ]
+
+
+async def send_collections(
+    recipient_id: str, reply_to_message_id: Optional[str] = None, intro: str = "",
+) -> bool:
+    """The "View Collections" list: 1. Studio Shot, 2. Catalog Pack (Ecomm Pack 1). Picking one and tapping Send
+    comes back as a ``list_reply`` with COLLECTION_STUDIO / COLLECTION_CATALOG (``send_collection_products``).
+    ``intro`` opens the body (e.g. the photo receipt), so it stays one message."""
+    rows = await run_io(_collection_rows)
     body = await run_io(sku_messages.collections_body)
-    return await send_reply_buttons(recipient_id, body, [(COLLECTIONS_BUTTON, "View Collections")],
-                                    reply_to_message_id=reply_to_message_id)
+    if intro:
+        body = f"{intro}\n\n{body}"
+    return await send_list_message(recipient_id, body, COLLECTIONS_LIST_BUTTON, rows,
+                                   reply_to_message_id=reply_to_message_id)
+
+
+def _collection_retailer_ids(collection_id: str) -> List[str]:
+    """Catalogue items of one collection: its SKU tiers (studio_sku_N for Studio Shot, sku_pack_N for Catalog
+    Pack)."""
+    if collection_id == COLLECTION_STUDIO:
+        return [pricing.pack_retailer_id(n) for n in pricing.menu_pack_sizes()]
+    if collection_id == COLLECTION_CATALOG:
+        return [pricing.catalog_retailer_id(n) for n in pricing.menu_pack_sizes()]
+    return []
+
+
+async def send_collection_products(
+    recipient_id: str, collection_id: str, reply_to_message_id: Optional[str] = None,
+) -> bool:
+    """A picked collection's products as WhatsApp's multi-product message ("View items"): the customer sets each
+    tier's quantity with + / -, then sends the cart (an ``order``). Prices shown there come from the catalogue
+    (``set_price.py`` keeps them equal to pricing.py); the cart is always re-priced by the server. Without
+    META_CATALOG_ID, or if Meta refuses the message, the list menu."""
+    retailer_ids = _collection_retailer_ids(collection_id)
+    catalog_id = (settings.META_CATALOG_ID or "").strip()
+    if not retailer_ids:
+        return False
+    if not catalog_id:
+        return await send_pack_menu(recipient_id, reply_to_message_id)
+    studio = collection_id == COLLECTION_STUDIO
+    title = sku_messages.STUDIO_COLLECTION_TITLE if studio else sku_messages.CATALOG_COLLECTION_TITLE
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient_id,
+        "type": "interactive",
+        "interactive": {
+            "type": "product_list",
+            "header": {"type": "text", "text": title[:60]},
+            "body": {"text": await run_io(sku_messages.studio_tiers_body if studio else sku_messages.catalog_pack_body)},
+            "action": {
+                "catalog_id": catalog_id,
+                "sections": [{
+                    "title": title[:24],
+                    "product_items": [{"product_retailer_id": rid} for rid in retailer_ids[:30]],
+                }],
+            },
+        },
+    }
+    if await _post_message_payload(payload, "collection products", reply_to_message_id=reply_to_message_id):
+        return True
+    return await send_pack_menu(recipient_id, reply_to_message_id)       # products refused: the list still works
 
 
 async def send_catalogue(recipient_id: str, reply_to_message_id: Optional[str] = None) -> bool:
@@ -849,8 +923,8 @@ async def send_catalogue(recipient_id: str, reply_to_message_id: Optional[str] =
             "body": {"text": await run_io(sku_messages.collections_body)},
             "action": {
                 "name": "catalog_message",
-                "parameters": {"thumbnail_product_retailer_id": pricing.pack_retailer_id(pricing.menu_pack_sizes()[0])
-                               if pricing.menu_pack_sizes() else pricing.CREATIVE_RETAILER_ID},
+                "parameters": {"thumbnail_product_retailer_id": pricing.pack_retailer_id(
+                    (pricing.menu_pack_sizes() or pricing.pack_sizes() or [1])[0])},
             },
         },
     }
@@ -863,10 +937,13 @@ async def send_catalogue(recipient_id: str, reply_to_message_id: Optional[str] =
 
 REGISTRATION_FLOW_TOKEN_PREFIX = "moraa_reg_"
 REGISTRATION_FLOW_CTA = "Setup Account"
-REGISTRATION_FLOW_BODY = (
-    "Quick Setup 📋\n\n"
-    "Tap below to share your name, brand name, address and GSTIN (optional)."
+WELCOME_MESSAGE = (
+    "Welcome to Moraa Studio ✨\n"
+    "We transform your raw jewelry photos into studio-grade product visuals in seconds.\n"
+    "Let’s quickly set up your account!"
 )
+# Onboarding is ONE message: the welcome copy is the Flow's body and "Setup Account" its button.
+REGISTRATION_FLOW_BODY = WELCOME_MESSAGE
 
 
 async def send_registration_flow(

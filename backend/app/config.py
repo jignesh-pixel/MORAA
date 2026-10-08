@@ -396,6 +396,9 @@ class Settings(BaseSettings):
     # Price of one SKU in whole rupees, GST included. Only the FIRST seed: once scripts/set_price.py has written a
     # price to the price_settings table, the database value is used.
     SKU_PRICE_RUPEES: int = 20
+    # Price of one Catalog Pack SKU (sku_pack_N: one photo in 7 photoshoot styles) in whole rupees, GST included.
+    # Its tiers are N x this price. Kept apart from SKU_PRICE_RUPEES, which prices Studio Shot (studio_sku_N).
+    CATALOG_PACK_SKU_PRICE: int = 500
     SKU_PACK_SIZES: str = "1,5,20,50,100"
     # The 1-SKU pack can always be bought by retailer id (pack_1) but is only shown in menus when this is true.
     ECOM_PACK1_ENABLED: bool = False

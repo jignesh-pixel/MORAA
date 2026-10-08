@@ -95,12 +95,12 @@ def _pack_line(qty: int, total: int, description: str) -> Dict[str, Any]:
 
 def pack_invoice_lines(white_units: int, creative_packs: int, amount: int) -> List[Dict[str, Any]]:
     """ERPNext lines for a pack payment that add up exactly to ``amount``: white-background SKUs (qty = units, at the
-    unit price actually paid) and Creative Studio Packs (qty = packs, at the creative pack price). The white unit
+    unit price actually paid) and Catalog Pack SKUs (qty = packs, at the creative pack price). The white unit
     price is (amount - creative total) / units, so a price change between the order and the invoice never shows."""
     from app.services.pricing import CREATIVE_TITLE, creative_pack_price, pack_title
 
     white_label = f"White-background SKUs ({pack_title(white_units)})"
-    creative_label = f"{CREATIVE_TITLE} x {creative_packs}"
+    creative_label = f"{CREATIVE_TITLE} SKUs ({pack_title(creative_packs)})"
     if not white_units:
         return [_pack_line(creative_packs, amount, creative_label)]
     creative_total = creative_packs * creative_pack_price()
@@ -118,7 +118,7 @@ def pack_description(white_units: int, creative_packs: int) -> str:
 
     parts = [f"{pack_title(white_units)} (white background)"] if white_units else []
     if creative_packs:
-        parts.append(f"{creative_packs} x {CREATIVE_TITLE}")
+        parts.append(f"{CREATIVE_TITLE} {pack_title(creative_packs)}")
     return " + ".join(parts)
 
 

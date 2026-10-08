@@ -396,7 +396,7 @@ def _whole(raw: Any) -> int:
 
 
 def _pack_counts(payload: Dict[str, Any]) -> Optional[Tuple[int, int]]:
-    """(white-background SKUs, Creative Studio Packs) of a SKU pack payment (notes.purpose "sku_pack"; payment notes
+    """(white-background SKUs, Catalog Pack SKUs) of a SKU pack payment (notes.purpose "sku_pack"; payment notes
     first, then the payment link's notes).
 
     None = not a pack (a wallet recharge, as before). (0, 0) = a pack whose counts are missing or not whole numbers
@@ -445,16 +445,16 @@ def _resolve_customer(db: Session, sender_id: str) -> Optional[Customer]:
 def _pack_receipt(db: Session, customer: Customer, units: int, creative: int = 0) -> str:
     """The pack receipt with the credits and validity read from the ledger at send time (includes this grant)."""
     until = sku_packs.valid_until(db, customer.id) if units else sku_packs.valid_until(db, customer.id, SKU_CREATIVE)
-    bought = [pricing.pack_title(units)] if units else []
+    bought = [f"{pricing.STUDIO_TITLE} {pricing.pack_title(units)}"] if units else []
     if creative:
-        bought.append(f"{creative} x {pricing.CREATIVE_TITLE}")
+        bought.append(f"{pricing.CREATIVE_TITLE} {pricing.pack_title(creative)}")
     text = PACK_RECEIPT_MESSAGE.format(
         pack=" + ".join(bought),
         credits=sku_packs.balance(db, customer.id),
         valid_till=sku_packs.ist_date(until) if until is not None else "-",
     )
     if creative:
-        text += f"\nCreative Studio Packs available: {sku_packs.balance(db, customer.id, SKU_CREATIVE)}"
+        text += f"\n{pricing.CREATIVE_TITLE} SKUs available: {sku_packs.balance(db, customer.id, SKU_CREATIVE)}"
     return text if getattr(customer, "email", None) else text + PACK_EMAIL_REQUEST_LINE
 
 
@@ -900,5 +900,10 @@ async def process_razorpay_event(
     if pack_units:
         # Usage Logs sheet row and Drive folder share (outbox jobs; no-ops unless Drive delivery is on).
         await run_io(sku_packs.queue_followups, customer.id)
+        if pack_white:
+            # Photos sent before paying start now with the new SKUs; their images go to the customer's Drive folder.
+            from app.api.routes.meta_webhook import start_held_photos
+
+            await start_held_photos(db, clean_sender, background_tasks)
 
     return {"status": "ok"}

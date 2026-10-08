@@ -223,7 +223,8 @@ class OnboardingFlowTests(FundedSlotGateTestCase):
         c = self._cust()
         self.assertEqual((c.gst_number, c.is_gst_verified, c.business_name), (GOOD, False, "Moraa Jewels"))
         self.assertEqual((self.provider.calls, self.button_msgs), ([], []))
-        self.assertIsNone(self._state())
+        # The format check runs with the flag off too: a well-formed GSTIN is accepted (unverified), no lookup.
+        self.assertEqual(self._state(), gst.STATE_REGISTERED)
 
     # ── Onboarding completion waits for GST resolution ──
     USER_FORM = "Name: MOCK VERIFIED USER\nbusiness: Test Jeweller\nGST: {gst}\nBusiness Address: JOGESHWARI-E TEST"
@@ -289,10 +290,20 @@ class OnboardingFlowTests(FundedSlotGateTestCase):
         self._text(self.USER_FORM.format(gst="NA"), "wamid.i7")
         self.assertEqual((self._confirmations(), self.button_msgs, self.provider.calls), (1, [], []))
 
-    def test_flag_off_confirms_immediately(self):
+    def test_flag_off_still_rejects_a_malformed_gstin(self):
+        # Verification off only skips the registry lookup: "INVALID1263" still gets Re-enter / Skip, no confirmation.
         with patch.object(settings, "GST_VERIFICATION_ENABLED", False):
             self._text(self.USER_FORM.format(gst="INVALID1263"), "wamid.i8")
-        self.assertEqual((self._confirmations(), self.button_msgs), (1, []))
+            self.assertEqual(self._confirmations(), 0)
+            self.assertEqual([b for _body, b in self.button_msgs], [gst.GST_BUTTONS])
+            self.assertEqual(self.provider.calls, [])
+            self._button("btn_gst_skip", "wamid.i9")
+        self.assertEqual(self._confirmations(), 1)
+
+    def test_flag_off_confirms_a_well_formed_gstin_immediately(self):
+        with patch.object(settings, "GST_VERIFICATION_ENABLED", False):
+            self._text(self.USER_FORM.format(gst=GOOD), "wamid.i10")
+        self.assertEqual((self._confirmations(), self.button_msgs, self.provider.calls), (1, [], []))
 
     def test_invalid_gst_in_flow_waits_for_skip(self):
         self._flow({"full_name": "Anurag Mehta", "business_name": "Moraa", "address": "Surat", "gst_number": "27ABC123"})

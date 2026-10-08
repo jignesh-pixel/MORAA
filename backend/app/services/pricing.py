@@ -14,9 +14,14 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import settings
-from app.models.sku_credit import PRICE_KEY_SKU, PriceSetting
+from app.models.sku_credit import PRICE_KEY_SKU, SKU_CREATIVE, SKU_WHITE_BG, PriceSetting
 from app.utils.logger import logger
 
+# Retailer ids in the Meta catalogue (Commerce Manager). Studio Shot tiers ("studio_sku_20") buy white-background
+# SKUs; Catalog Pack tiers ("sku_pack_20") buy Catalog Pack SKUs. Each tier is a pack size from SKU_PACK_SIZES.
+STUDIO_RETAILER_PREFIX = "studio_sku_"
+CATALOG_RETAILER_PREFIX = "sku_pack_"
+# The first catalogue's Studio Shot ids ("pack_20"): still read in carts and list replies sent before the switch.
 PACK_RETAILER_PREFIX = "pack_"
 PAISE_PER_RUPEE = 100
 PRICE_CHANGED_ACTION = "price_changed"
@@ -73,35 +78,55 @@ def pack_total(units: int, db: Any = None) -> int:
 
 
 def pack_retailer_id(units: int) -> str:
-    return f"{PACK_RETAILER_PREFIX}{int(units)}"
+    """Studio Shot tier id in the catalogue: ``studio_sku_20``."""
+    return f"{STUDIO_RETAILER_PREFIX}{int(units)}"
 
 
-def units_for_retailer_id(retailer_id: Any) -> Optional[int]:
-    """``pack_20`` -> 20 when 20 is a pack size, else None. Prices are never taken from Meta: only the id is used."""
-    text = str(retailer_id or "").strip().lower()
-    if not text.startswith(PACK_RETAILER_PREFIX):
-        return None
-    number = text[len(PACK_RETAILER_PREFIX):]
+def catalog_retailer_id(units: int) -> str:
+    """Catalog Pack tier id in the catalogue: ``sku_pack_20``."""
+    return f"{CATALOG_RETAILER_PREFIX}{int(units)}"
+
+
+def _tier_units(text: str, prefix: str) -> Optional[int]:
+    number = text[len(prefix):] if text.startswith(prefix) else ""
     return int(number) if number.isdigit() and is_pack_size(int(number)) else None
 
 
-# Creative Studio Pack 1 (the 7-style photoshoot of one photo) as a catalogue item. One unit = one photo's pack.
-CREATIVE_RETAILER_ID = "creative_pack_1"
-CREATIVE_TITLE = "Creative Studio Pack 1"
+def parse_retailer_id(retailer_id: Any) -> Optional[Tuple[str, int]]:
+    """``studio_sku_20`` -> (white_bg, 20), ``sku_pack_5`` -> (creative_pack, 5); None for anything else (or a size
+    that is not a pack size). Prices are never taken from Meta: only the id is used."""
+    text = str(retailer_id or "").strip().lower()
+    for prefix, sku in ((STUDIO_RETAILER_PREFIX, SKU_WHITE_BG), (CATALOG_RETAILER_PREFIX, SKU_CREATIVE),
+                        (PACK_RETAILER_PREFIX, SKU_WHITE_BG)):
+        units = _tier_units(text, prefix)
+        if units:
+            return sku, units
+    return None
+
+
+def units_for_retailer_id(retailer_id: Any) -> Optional[int]:
+    """White-background SKUs of a Studio Shot tier id (``studio_sku_20`` -> 20), else None."""
+    parsed = parse_retailer_id(retailer_id)
+    return parsed[1] if parsed and parsed[0] == SKU_WHITE_BG else None
+
+
+# Catalog Pack (Ecomm Pack 1): one Catalog Pack SKU = one photo's 7-style catalogue pack, sold in the same tiers.
+STUDIO_TITLE = "Studio Shot"
+CREATIVE_TITLE = "Catalog Pack"
 MAX_CART_UNITS = 10000
 
 
 def creative_pack_price() -> int:
-    """One Creative Studio Pack bought in a cart (the same price as the Full Catalog Pack from the wallet)."""
-    return catalog_pack_price()
+    """One Catalog Pack SKU (sku_pack_N tiers cost N x this), GST included: CATALOG_PACK_SKU_PRICE."""
+    return max(int(settings.CATALOG_PACK_SKU_PRICE), 1)
 
 
 def quote_cart(items: Any, db: Any = None) -> Dict[str, Any]:
     """Price a WhatsApp catalogue cart on the server (Meta's prices are never used).
 
-    ``items`` = [{"retailer_id", "quantity"}]. pack_N items add N white-background SKUs per quantity, creative_pack_1
-    items add Creative Studio Packs; unknown ids and quantities that are not positive whole numbers are skipped, and
-    each total is capped at MAX_CART_UNITS. Returns {"white_units", "creative_packs", "white_total", "creative_total",
+    ``items`` = [{"retailer_id", "quantity"}]. studio_sku_N items add N white-background SKUs per quantity,
+    sku_pack_N items add N Catalog Pack SKUs; unknown ids and quantities that are not positive whole numbers are
+    skipped, and each total is capped at MAX_CART_UNITS. Returns {"white_units", "creative_packs", "white_total", "creative_total",
     "total", "lines": [{"retailer_id", "quantity"}]}."""
     white = creative = 0
     lines: List[Dict[str, Any]] = []
@@ -114,17 +139,18 @@ def quote_cart(items: Any, db: Any = None) -> Dict[str, Any]:
         if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 1:
             continue
         retailer_id = str(item.get("retailer_id") or "").strip().lower()
-        size = units_for_retailer_id(retailer_id)
-        if size:
-            white += size * quantity
-        elif retailer_id == CREATIVE_RETAILER_ID:
-            creative += quantity
-        else:
+        parsed = parse_retailer_id(retailer_id)
+        if parsed is None:
             continue
+        sku, size = parsed
+        if sku == SKU_WHITE_BG:
+            white += size * quantity
+        else:
+            creative += size * quantity
         lines.append({"retailer_id": retailer_id, "quantity": quantity})
     white, creative = min(white, MAX_CART_UNITS), min(creative, MAX_CART_UNITS)
     white_total = pack_total(white, db) if white else 0
-    creative_total = creative * creative_pack_price()
+    creative_total = creative * creative_pack_price() if creative else 0
     return {"white_units": white, "creative_packs": creative, "white_total": white_total,
             "creative_total": creative_total, "total": white_total + creative_total, "lines": lines}
 
@@ -219,11 +245,16 @@ def set_sku_price(db: Any, price: int, changed_by: str) -> Tuple[int, int]:
     return old, price
 
 
-def catalogue_requests(unit_price: int) -> List[Dict[str, Any]]:
-    """Graph API batch requests that set each pack's catalogue price (paise, INR) by its retailer id."""
+def catalogue_requests(unit_price: int, catalog_unit_price: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Graph API batch requests that set every tier's catalogue price (paise, INR) by its retailer id: Studio Shot
+    tiers at ``unit_price`` per SKU, Catalog Pack tiers at ``catalog_unit_price`` (default CATALOG_PACK_SKU_PRICE)."""
+    catalog_unit = int(catalog_unit_price) if catalog_unit_price is not None else creative_pack_price()
     return [
-        {"method": "UPDATE", "retailer_id": pack_retailer_id(size),
-         "data": {"price": size * int(unit_price) * 100, "currency": "INR", "name": pack_title(size)}}
+        {"method": "UPDATE", "retailer_id": retailer_id(size),
+         "data": {"price": size * int(price) * PAISE_PER_RUPEE, "currency": "INR",
+                  "name": f"{title} {pack_title(size)}"}}
+        for title, retailer_id, price in ((STUDIO_TITLE, pack_retailer_id, unit_price),
+                                          (CREATIVE_TITLE, catalog_retailer_id, catalog_unit))
         for size in pack_sizes()
     ]
 
@@ -258,11 +289,13 @@ def push_catalogue_prices(unit_price: int, client: Any = None) -> bool:
 
 def price_summary(db: Any = None) -> Dict[str, Any]:
     """Prices for the dashboard and the catalogue sync."""
-    unit = sku_price(db)
+    unit, catalog_unit = sku_price(db), creative_pack_price()
     return {
         "sku_price": unit,
+        "catalog_pack_sku_price": catalog_unit,
         "gst_percent": int(settings.SKU_GST_PERCENT),
         "packs": {size: size * unit for size in pack_sizes()},
+        "catalog_packs": {size: size * catalog_unit for size in pack_sizes()},
         "menu_sizes": menu_pack_sizes(),
         "white_bg_price": white_bg_price(),
         "catalog_pack_price": catalog_pack_price(),

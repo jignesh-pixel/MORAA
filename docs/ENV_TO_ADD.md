@@ -74,12 +74,16 @@ Switch on step by step (see `docs/PHASE_8_DEVELOPER_PLAN.html`, section 9). With
 # after `python scripts/set_price.py --sku-price N` the database price is used.
 SKU_PACKS_ENABLED=false
 SKU_PRICE_RUPEES=20
+CATALOG_PACK_SKU_PRICE=500         # Catalog Pack (sku_pack_N) price per SKU; tiers are N x this
 SKU_PACK_SIZES=1,5,20,50,100
-ECOM_PACK1_ENABLED=false            # show the 1-SKU pack in the WhatsApp menu
+ECOM_PACK1_ENABLED=true             # show the 1-SKU tier (Studio Shot products and the list menu)
 SKU_GST_PERCENT=18
 SKU_CREDIT_VALIDITY_DAYS=90
 SKU_ERPNEXT_ITEM_CODE=              # ERPNext item for packs (empty = ERPNEXT_RECHARGE_ITEM_CODE)
-META_CATALOG_ID=                    # WhatsApp catalogue updated by set_price.py
+META_CATALOG_ID=1853082239018330    # WhatsApp catalogue updated by set_price.py
+# Catalogue retailer ids the bot sends and reads (tiers 1, 5, 20, 50, 100 from SKU_PACK_SIZES):
+#   Studio Shot  (product set 1632701381728170): studio_sku_1 ... studio_sku_100
+#   Catalog Pack (product set 1723543628708334): sku_pack_1 ... sku_pack_100
 
 # Wallet recharge limits (unchanged values, now settings)
 MIN_RECHARGE_RUPEES=500
@@ -88,7 +92,7 @@ MAX_RECHARGE_RUPEES=50000
 # Google Drive delivery through the BUSINESS Workspace service account (no personal account anywhere)
 DRIVE_DELIVERY_ENABLED=false
 GOOGLE_SA_KEY_FILE=/run/secrets/moraa-drive-sa.json   # the downloaded JSON key; outside the code folder; never commit it
-DRIVE_SHARED_DRIVE_ID=<id from the shared drive's URL>
+DRIVE_SHARED_DRIVE_ID=0AAZFDiQDkZfNUk9PVA
 DRIVE_IMAGES_RETENTION_DAYS=90       # only runs with RETENTION_ENABLED=true (set it, or Drive images are kept forever)
 BATCH_NOTIFY_DELAY_SECONDS=60
 BATCH_NOTIFY_TEMPLATE_NAME=sku_batch_ready   # Meta utility template (folder link, SKUs left); empty = alert only

@@ -82,6 +82,7 @@ def _state(customer_id: str) -> Optional[Dict[str, Any]]:
             "phone": customer.whatsapp_id, "in_flight": int(in_flight), "count": count,
             "day": newest.updated_at if newest is not None else None,
             "balance": sku_packs.balance(db, customer_id), "last_inbound": last_inbound,
+            "name": customer.full_name or "", "email": customer.email or "",
         }
 
 
@@ -116,7 +117,8 @@ async def handle_outbox_job(payload: Dict[str, Any]) -> bool:
     link = folder_link(folder_id)
     last_inbound = _aware(state["last_inbound"])
     if last_inbound is not None and datetime.now(timezone.utc) - last_inbound < SERVICE_WINDOW:
-        if not await send_whatsapp_text(state["phone"], sku_messages.ready_message(link, state["balance"])):
+        text = sku_messages.ready_message(link, state["balance"], state.get("name", ""), state.get("email", ""))
+        if not await send_whatsapp_text(state["phone"], text):
             raise RuntimeError("ready message not sent")
         channel = "text"
     elif (settings.BATCH_NOTIFY_TEMPLATE_NAME or "").strip():

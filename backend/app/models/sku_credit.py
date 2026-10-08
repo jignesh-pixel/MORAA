@@ -27,7 +27,7 @@ ACTION_EXPIRE = "expire"         # -balance (expiry reference)
 ACTION_CLAWBACK = "clawback"     # -n (Razorpay refund / dispute id): the payer got the money back
 
 SKU_WHITE_BG = "white_bg"        # one white-background e-com shot
-SKU_CREATIVE = "creative_pack"   # one Creative Studio Pack: the 7-style photoshoot of one photo
+SKU_CREATIVE = "creative_pack"   # one Catalog Pack SKU: the 7-style photoshoot of one photo
 
 PRICE_KEY_SKU = "sku_unit"       # price_settings key for the price of one SKU (GST included)
 

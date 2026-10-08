@@ -115,8 +115,9 @@ class EmailWebhookTests(FundedSlotGateTestCase):
         self.assertEqual(self.link.await_args.kwargs["amount"], 500)
         self.cta.assert_awaited_once()
         self._post("hi", "wamid.h1")
+        self.assertEqual(len(self.sent_texts), 1)                    # welcome and form: ONE message
         self.assertTrue(self.sent_texts[0].startswith("Welcome to Moraa Studio"))
-        self.assertTrue(self.sent_texts[1].startswith("Quick Setup"))
+        self.assertIn("Quick Setup", self.sent_texts[0])
         self.assertIsNone(self._cust().email)
 
     def test_f_registration_text_with_email_registers_and_saves_it(self):

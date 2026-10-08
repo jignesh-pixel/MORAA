@@ -324,7 +324,7 @@ def claw_back_pack(
         except (TypeError, ValueError, AttributeError):
             paid = 0
         if paid <= 0:   # no record of what was paid: value it at today's prices
-            paid = sum(pricing.pack_total(units, db) if sku == SKU_WHITE_BG else units * pricing.catalog_pack_price()
+            paid = sum(pricing.pack_total(units, db) if sku == SKU_WHITE_BG else units * pricing.creative_pack_price()
                        for _cid, sku, units in purchases)
         earlier_refunds = [
             row[0]

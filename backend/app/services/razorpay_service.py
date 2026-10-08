@@ -135,18 +135,18 @@ async def create_pack_payment_link(
         logger.warning(f"SKU pack link refused: units={units!r} creative_packs={creative_packs!r}")
         return None
     unit_total = await run_io(pricing.pack_total, units) if units else 0
-    amount = unit_total + creative_packs * pricing.creative_pack_price()
+    amount = unit_total + (pricing.creative_pack_price() * creative_packs if creative_packs else 0)
     summary = {"white_bg": units, "creative_pack": creative_packs, "total": amount}
-    parts = [pricing.pack_title(units)] if units else []
+    parts = [f"{pricing.STUDIO_TITLE} {pricing.pack_title(units)}"] if units else []
     if creative_packs:
-        parts.append(f"{creative_packs} x {pricing.CREATIVE_TITLE}")
+        parts.append(f"{pricing.CREATIVE_TITLE} {pricing.pack_title(creative_packs)}")
     link = await _post_payment_link(
         {
             "amount": int(amount) * 100,
             "currency": "INR",
             "accept_partial": False,
             "expire_by": int(time.time()) + PACK_LINK_VALID_SECONDS,
-            "description": f"Moraa Studio {' + '.join(parts)}"[:2048],
+            "description": f"Moraa Studio: {' + '.join(parts)}"[:2048],
             "customer": {
                 "name": customer_name or "Customer",
                 "contact": customer_phone,

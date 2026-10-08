@@ -52,13 +52,17 @@ from app.services.image_prevalidation_service import check_image_quality
 from app.services import meta_whatsapp_service as _mws
 from app.services.meta_whatsapp_service import (
     CATALOG_PACK_ACK_TEMPLATE,
+    COLLECTION_IDS,
     COLLECTIONS_BUTTON,
+    send_collection_products,
+    send_collections,
     PRODUCT_BUTTON_WHITE,
     parse_product_button_id,
     process_whatsapp_white_bg,
     send_product_selection_buttons,
     send_pack_menu,
     send_registration_flow,
+    WELCOME_MESSAGE,
     download_media,
     get_media_url,
     parse_webhook_entry,
@@ -234,12 +238,6 @@ async def _trigger_generation(ingestion_id: str) -> None:
 # a button is tapped, through wallet_service.charge_customer_balance.
 
 PRODUCT_LABELS = {PRODUCT_WHITE_BG: "Clean Studio Shot", PRODUCT_PACK_1: "Full Catalog Pack"}
-
-WELCOME_MESSAGE = (
-    "Welcome to Moraa Studio ✨\n"
-    "We transform your raw jewelry photos into studio-grade product visuals in seconds.\n"
-    "Let’s quickly set up your account!"
-)
 
 REGISTRATION_REQUEST_MESSAGE = (
     "Quick Setup 📋\n\n"
@@ -431,12 +429,9 @@ async def _send_registration_confirmation(
         )
         return
     if settings.SKU_PACKS_ENABLED:
-        # Phase 8: packs instead of a wallet recharge. The collections view (native catalogue, or the list menu).
-        from app.services.meta_whatsapp_service import send_collections
-
-        await send_whatsapp_text(sender, f"You're all set, {display_name}! 🎉\n\nYour account is ready.")
+        # Phase 8: packs instead of a wallet recharge: "You're all set" opens the "View Collections" list.
         db.commit()                      # the menu prices are read on their own connection
-        await send_collections(sender)
+        await send_collections(sender, intro=f"You're all set, {display_name}! 🎉\n\nYour account is ready.")
         return
     confirm_msg = REGISTRATION_CONFIRMATION_TEMPLATE.format(
         name=display_name,
@@ -729,11 +724,14 @@ async def _ingest_image_for_choice(
     min_price = min(white_price, pack_price)
     customer = find_customer_by_phone(db, sender)
     balance = get_balance(db, customer.whatsapp_id) if customer else 0
-    # Phase 8: paid SKU credits (white-background shots, Creative Studio Packs) count as funds, whatever the flags.
+    # Phase 8: paid SKU credits (white-background shots, Catalog Pack SKUs) count as funds, whatever the flags.
     white_credits = sku_packs.balance(db, customer.id) if customer else 0
     creative_credits = sku_packs.balance(db, customer.id, SKU_CREATIVE) if customer else 0
+    # SKU packs: a customer without credits is not turned away for funds. The photo is stored and held, the customer
+    # gets the "View Collections" list, and the photo is made as soon as a pack is paid (start_held_photos).
+    sku_mode = settings.SKU_PACKS_ENABLED and customer is not None and not ent.payment_exempt(customer)
     # Team members and trial customers with credits are never held for funds.
-    if customer is None or (balance < min_price and not ent.payment_exempt(customer)
+    if customer is None or (not sku_mode and balance < min_price and not ent.payment_exempt(customer)
                             and not (white_credits or creative_credits)):
         ingestion.status = "unfunded"
         ingestion.error_message = f"Balance {balance} below minimum {min_price} at upload"
@@ -814,12 +812,21 @@ async def _ingest_image_for_choice(
     ingestion.status = "awaiting_choice"
     db.commit()
 
-    # Phase 8: a customer with white-background SKU credits (and no Creative Studio Packs to choose between) gets
+    # Phase 8: a customer with white-background SKU credits (and no Catalog Pack SKUs to choose between) gets
     # no buttons: one credit pays for a Clean Studio Shot of this photo straight away.
     if white_credits and not creative_credits:
         started = await _start_sku_order(db, new_ingestion_id, customer_wallet_id, sender, message_id, background_tasks)
         if started:
             return new_ingestion_id
+
+    # SKU packs, no credits: the photo waits for a pack. ONE "View Collections" list per burst of photos (a photo
+    # that follows another held photo gets none: the list on the first one is still open).
+    if sku_mode and not (white_credits or creative_credits):
+        if not _has_other_held_photo(db, sender, customer_wallet_id, new_ingestion_id):
+            db.commit()                  # the list prices are read on their own connection
+            if not await send_collections(sender, reply_to_message_id=message_id, intro=sku_messages.photos_held()):
+                logger.error(f"Collections list NOT sent: ingestion_id={new_ingestion_id}")
+        return new_ingestion_id
 
     # A photo that follows another waiting photo is part of a burst: hold its buttons back, the customer gets ONE
     # "N photos, Rs X: confirm?" message when they stop sending (UX-1). Paying customers only.
@@ -1093,11 +1100,12 @@ PACK_MENU_WORDS = {"packs", "pack", "buy", "menu", "price", "prices"}
 async def _send_pack_link(
     db: Session, sender: str, units: int, reply_to: Optional[str] = None, creative_packs: int = 0,
 ) -> bool:
-    """One payment link for a whole cart (``units`` white-background SKUs + ``creative_packs`` Creative Studio
+    """One payment link for a whole cart (``units`` white-background SKUs + ``creative_packs`` Catalog Pack
     Packs) as the cart summary with one pay button. No link -> an apology, never a static link."""
     cust = _find_customer_safe(db, sender)
     name = (cust.full_name if cust is not None else "") or "Customer"
-    total = (pricing.pack_total(units, db) if units else 0) + creative_packs * pricing.creative_pack_price()
+    total = (pricing.pack_total(units, db) if units else 0) + (
+        creative_packs * pricing.creative_pack_price() if creative_packs else 0)
     db.commit()                          # the Razorpay and Meta calls below must not hold a connection
     try:
         url = await razorpay_service.create_pack_payment_link(
@@ -1120,7 +1128,7 @@ async def _send_pack_link(
 
 async def _handle_pack_order(db: Session, event: Dict[str, Any]) -> None:
     """A catalogue cart: ONE link for everything in it, e.g. 2 x pack_20 + 1 x pack_5 = one link for 45 SKUs, plus
-    any Creative Studio Packs in the same total. Prices come from pricing.quote_cart, never from Meta. Nothing usable
+    any Catalog Pack SKUs in the same total. Prices come from pricing.quote_cart, never from Meta. Nothing usable
     -> say so and send the menu."""
     sender = event.get("sender", "")
     message_id = event.get("message_id") or None
@@ -1163,15 +1171,107 @@ async def _run_sku_order(job_id: Optional[int], ingestion_id: str) -> None:
             logger.error(f"SKU order {ingestion_id} raised: {type(e).__name__}: {e}")
 
 
+# A photo sent without SKUs waits this long for a pack payment (a pack link lives 48 hours).
+HELD_PHOTO_WINDOW = timedelta(hours=48)
+# At most this many held photos are started by one payment (the rest wait for the next one).
+MAX_HELD_PHOTOS_PER_PAYMENT = 200
+# Photos within this time of each other are one burst: only the first gets the "View Collections" list.
+HELD_BURST_WINDOW = timedelta(minutes=10)
+
+
+def _phone_variants(*phones: str) -> List[str]:
+    """The forms one number is stored in (digits, +digits): ingestion rows keep the sender exactly as Meta sent it."""
+    out = set()
+    for phone in phones:
+        digits = (phone or "").strip().lstrip("+")
+        if digits:
+            out.update({digits, f"+{digits}"})
+    return sorted(out)
+
+
+def _held_photos_query(db: Session, sender: str, wallet_id: str):
+    since = datetime.now(timezone.utc) - HELD_PHOTO_WINDOW
+    return db.query(WhatsAppIngestion).filter(
+        WhatsAppIngestion.external_user_id.in_(_phone_variants(sender, wallet_id)),
+        WhatsAppIngestion.status == "awaiting_choice",
+        WhatsAppIngestion.image_id.isnot(None),
+        WhatsAppIngestion.group_id.is_(None),
+        WhatsAppIngestion.created_at >= since,
+    )
+
+
+def _has_other_held_photo(db: Session, sender: str, wallet_id: str, ingestion_id: str) -> bool:
+    """True when another photo of this burst is already waiting for a pack (so the list was just sent)."""
+    since = datetime.now(timezone.utc) - HELD_BURST_WINDOW
+    try:
+        return _held_photos_query(db, sender, wallet_id).filter(
+            WhatsAppIngestion.id != ingestion_id, WhatsAppIngestion.created_at >= since,
+        ).first() is not None
+    except Exception as e:  # noqa: BLE001 -- when unsure, send the list
+        db.rollback()
+        logger.error(f"Held photo lookup failed for {mask_phone(sender)}: {type(e).__name__}")
+        return False
+
+
+async def start_held_photos(db: Session, phone: str, background_tasks: Optional[BackgroundTasks] = None) -> int:
+    """After a pack payment: start the photos this customer sent before paying (held, ``awaiting_choice``), oldest
+    first, one white-background SKU each, as far as the credits go. One summary message instead of a receipt per
+    photo. Returns how many were started. Never raises: the payment is already granted either way."""
+    if not settings.SKU_PACKS_ENABLED:
+        return 0
+    try:
+        customer = find_customer_by_phone(db, phone)
+        if customer is None:
+            return 0
+        wallet_id, customer_id = customer.whatsapp_id, customer.id
+        held = [
+            (row.id, row.external_user_id, row.external_message_id)
+            for row in _held_photos_query(db, phone, wallet_id)
+            .order_by(WhatsAppIngestion.created_at.asc())
+            .limit(MAX_HELD_PHOTOS_PER_PAYMENT)
+            .all()
+            if _same_sender(row.external_user_id, wallet_id)
+        ]
+        credits = sku_packs.balance(db, customer_id)
+        db.commit()
+        if not held or credits <= 0:
+            return 0
+        recipient = held[0][1] or wallet_id
+        if not _mws.DRY_RUN_IMAGE_MODE and await run_io(generation_capacity_blocked, 1):
+            # Nothing is used: the SKUs stay in the account and the photos stay held.
+            await send_whatsapp_text(recipient, SKU_CAPACITY_MESSAGE)
+            return 0
+        started = 0
+        for ingestion_id, sender, message_id in held[:credits]:
+            if await _start_sku_order(db, ingestion_id, wallet_id, sender or wallet_id, message_id or "",
+                                      background_tasks, notify=False):
+                started += 1
+        if not started:
+            return 0
+        left = sku_packs.balance(db, customer_id)
+        waiting = _held_photos_query(db, phone, wallet_id).count()
+        db.commit()
+        logger.info(f"Held photos started after payment: {mask_phone(phone)} started={started} waiting={waiting}")
+        await send_whatsapp_text(recipient, sku_messages.held_photos_started(started, waiting, left))
+        if waiting:
+            await send_collections(recipient)
+        return started
+    except Exception as e:  # noqa: BLE001 -- the photos stay held; the customer can send them again
+        db.rollback()
+        logger.error(f"Held photos not started for {mask_phone(phone)}: {type(e).__name__}: {e}")
+        return 0
+
+
 async def _start_sku_order(
     db: Session, ingestion_id: str, wallet_id: str, sender: str, message_id: str,
-    background_tasks: Optional[BackgroundTasks],
+    background_tasks: Optional[BackgroundTasks], notify: bool = True,
 ) -> bool:
     """Pay for a Clean Studio Shot of this photo with one white-background SKU credit and start it.
 
     The credit and the order status are committed together (like a wallet debit), so a credit is never used without
     an order. False when no usable credit was left (expired, or used meanwhile): the caller falls back to the
-    ordinary flow. No in-flight limit: a pack is meant for bursts, which run a few at a time."""
+    ordinary flow. No in-flight limit: a pack is meant for bursts, which run a few at a time. ``notify=False`` skips
+    the per-photo receipt (the caller sends one summary)."""
     from sqlalchemy.exc import IntegrityError
 
     if not _mws.DRY_RUN_IMAGE_MODE:
@@ -1210,10 +1310,11 @@ async def _start_sku_order(
 
         # A long delay: the bounded runner starts it; the outbox sweep only picks it up if this process dies first.
         job_id = await run_io(outbox.enqueue_order_run, "white", ingestion_id, 900)
-    receipt = sku_messages.photo_received(left)
-    if customer is not None and not customer.email:
-        receipt += "\n\n" + sku_messages.ask_email()
-    await send_whatsapp_text(sender, receipt, reply_to_message_id=message_id)
+    if notify:
+        receipt = sku_messages.photo_received(left)
+        if customer is not None and not customer.email:
+            receipt += "\n\n" + sku_messages.ask_email()
+        await send_whatsapp_text(sender, receipt, reply_to_message_id=message_id)
     if background_tasks is not None:
         background_tasks.add_task(_run_sku_order, job_id, ingestion_id)
     else:
@@ -1670,8 +1771,7 @@ async def receive_webhook(
                 # Never log the body: registration replies carry name, GSTIN and address.
                 logger.info("Text message received: sender={} chars={}", mask_phone(sender), len(raw_text or ""))
 
-                # After "Re-enter GSTIN" the next text is the GSTIN itself
-                # (always False unless GST_VERIFICATION_ENABLED).
+                # After an invalid GSTIN (or "Re-enter GSTIN") the next text is the GSTIN itself.
                 if is_awaiting_gstin(db, sender):
                     await handle_gstin_reply(db, sender, raw_text, on_complete=_confirmation_for(db, sender))
                     continue
@@ -1732,11 +1832,10 @@ async def receive_webhook(
                 if re.search(r"\b(hi|hii|hello|hey|start)\b", lower_text):
                     if await _consent_gate(db, sender):
                         continue
-                    # Two separate messages: welcome first, then the form.
-                    # New / unregistered senders get the registration Flow;
-                    # when it is not configured or Meta rejects it (and for
-                    # registered customers, as before) the text form is sent.
-                    await send_whatsapp_text(sender, WELCOME_MESSAGE)
+                    # ONE message: new / unregistered senders get the registration Flow, whose body is the
+                    # welcome copy and whose button is "Setup Account". When the Flow is not configured or Meta
+                    # rejects it (and for registered customers, as before) the welcome and the text form go
+                    # out together as one text.
                     greet_cust = _find_customer_safe(db, sender)
                     if greet_cust is None or not greet_cust.is_registered:
                         if await send_registration_flow(sender):
@@ -1745,11 +1844,12 @@ async def receive_webhook(
                             "Registration Flow not sent (unconfigured or rejected by Meta) — "
                             "falling back to text registration: sender={}", mask_phone(sender)
                         )
-                    await send_whatsapp_text(sender, REGISTRATION_REQUEST_MESSAGE)
+                    greeting = f"{WELCOME_MESSAGE}\n\n{REGISTRATION_REQUEST_MESSAGE}"
                     # SKU packs: a registered customer without an email is asked for one (their image folder).
                     if (settings.SKU_PACKS_ENABLED and greet_cust is not None and greet_cust.is_registered
                             and not greet_cust.email):
-                        await send_whatsapp_text(sender, sku_messages.ask_email())
+                        greeting += "\n\n" + sku_messages.ask_email()
+                    await send_whatsapp_text(sender, greeting)
                     continue
 
                 recharge_match = re.search(r"\b(?:recharge|pay|add)\s*(?:rs\.?|inr|₹)?\s*(\d+)\b", lower_text)
@@ -1808,13 +1908,19 @@ async def receive_webhook(
                 await _handle_registration_flow(db, event)
                 continue
 
-            # SKU packs: a pack picked from the list menu -> one payment link for it. Other list rows are ignored.
+            # SKU packs: a collection picked from "View Collections" -> its products ("View items"); a pack picked
+            # from the list menu -> one payment link for it. Other list rows are ignored.
             if event_type == "interactive" and event.get("subtype") == "list_reply":
                 row_id = (event.get("list_reply") or {}).get("id")
-                units = pricing.units_for_retailer_id(row_id)
-                creative = 1 if str(row_id or "").lower() == pricing.CREATIVE_RETAILER_ID else 0
-                if settings.SKU_PACKS_ENABLED and (units or creative):
-                    await _send_pack_link(db, event.get("sender", ""), units or 0, event.get("message_id") or None,
+                if settings.SKU_PACKS_ENABLED and row_id in COLLECTION_IDS:
+                    db.commit()          # the product prices are read on their own connection
+                    await send_collection_products(event.get("sender", ""), row_id, event.get("message_id") or None)
+                    continue
+                tier = pricing.parse_retailer_id(row_id)          # studio_sku_N / sku_pack_N rows
+                if settings.SKU_PACKS_ENABLED and tier:
+                    sku, size = tier
+                    white, creative = (size, 0) if sku == SKU_WHITE_BG else (0, size)
+                    await _send_pack_link(db, event.get("sender", ""), white, event.get("message_id") or None,
                                           creative)
                 continue
 
@@ -1832,11 +1938,9 @@ async def receive_webhook(
                 if await handle_gst_button(db, sender, b_id, on_complete=_confirmation_for(db, sender)):
                     continue
 
-                if b_id == COLLECTIONS_BUTTON:
-                    from app.services.meta_whatsapp_service import send_catalogue
-
+                if b_id == COLLECTIONS_BUTTON:          # the earlier "View Collections" reply button
                     db.commit()          # the menu prices are read on their own connection
-                    await send_catalogue(sender)
+                    await send_collections(sender)
                     continue
 
                 if b_id in (consent_service.CONSENT_YES, consent_service.CONSENT_NO):

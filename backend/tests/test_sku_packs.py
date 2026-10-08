@@ -301,6 +301,19 @@ class PackWebhookTests(_SkuBase):
         self.assertIn(f"Valid till: {sku_packs.ist_date(until)}", receipt)
         self.assertTrue(receipt.endswith(payment_routes.PACK_EMAIL_REQUEST_LINE))
 
+    def test_a_pack_payment_sends_the_invoice_and_starts_held_photos(self):
+        from app.api.routes import meta_webhook
+
+        self.customer()
+        start = AsyncMock(return_value=2)
+        with patch.object(meta_webhook, "start_held_photos", new=start):
+            self.assertEqual(self.post(_pack_event()), "ok")
+        self.assertEqual(self.invoice.await_count, 1)
+        start.assert_awaited_once()
+        db, phone, tasks = start.await_args.args
+        self.assertEqual(phone, SENDER)
+        self.assertIsInstance(tasks, BackgroundTasks)
+
     def test_customer_with_an_email_is_not_asked_for_it(self):
         self.customer(email="shop@example.com")
         self.post(_pack_event())
@@ -471,7 +484,7 @@ class PackLinkTests(_SkuBase):
             "whatsapp_id": SENDER, "phone": SENDER, "purpose": "sku_pack", "units": "40", "total_skus": "40",
             "creative_packs": "0", "cart_summary": '{"white_bg":40,"creative_pack":0,"total":800}',
         })
-        self.assertEqual(payload["description"], "Moraa Studio 40 SKUs")
+        self.assertEqual(payload["description"], "Moraa Studio: Studio Shot 40 SKUs")
         self.assertFalse(payload["accept_partial"])
         row = self.db.query(RazorpayPaymentLink).filter_by(link_id="plink_new").one()
         self.assertEqual((row.amount_rupees, row.purpose, row.units, row.whatsapp_id), (800, "sku_pack", 40, SENDER))
