@@ -276,11 +276,26 @@ class PackWebhookTests(PackWebhookBase):
     def test_registered_customer_without_email_is_asked_for_it_once(self):
         _make_customer(self.session, balance=0)
         self._post(_text("hi", message_id="wamid.h1"))
-        self.assertEqual(len(self.sent_texts), 1)                    # welcome, form and email ask: ONE message
-        self.assertTrue(self.sent_texts[0].startswith("Welcome"))
-        self.assertIn("Quick Setup", self.sent_texts[0])
-        self.assertTrue(self.sent_texts[0].endswith(sku_messages.ask_email()))
+        self.assertEqual(self.sent_texts, ["Welcome back, Ananya! 👋\n\nStudio Shot SKUs available: 0\n\n"
+                                           "Send your jewelry photo whenever you're ready 📸\n\n"
+                                           + sku_messages.ask_email()])
+        self.flow.assert_not_awaited()
         self.menu.assert_not_awaited()
+
+    def test_welcome_back_shows_both_sku_balances_and_any_wallet_money(self):
+        from app.models.sku_credit import SKU_CREATIVE
+        from app.services import sku_packs
+
+        cust = _make_customer(self.session, balance=1500)
+        cust.email = "a@b.in"
+        sku_packs.grant_pack_credits(self.session, cust, 20, "pay_wb1")
+        sku_packs.grant_pack_credits(self.session, cust, 5, "pay_wb2", sku=SKU_CREATIVE)
+        self.session.commit()
+        self._post(_text("hello", message_id="wamid.h1"))
+        self.assertEqual(self.sent_texts, ["Welcome back, Ananya! 👋\n\nStudio Shot SKUs available: 20\n"
+                                           "Catalog Pack SKUs available: 5\n"
+                                           f"Wallet Balance: {pricing.format_rupees(1500)}\n\n"
+                                           "Send your jewelry photo whenever you're ready 📸"])
 
     def test_no_email_ask_with_an_email_or_for_a_new_sender(self):
         cust = _make_customer(self.session, balance=0)
@@ -319,9 +334,9 @@ class PacksOffTests(PackWebhookBase):
     def test_greeting_is_unchanged(self):
         _make_customer(self.session, balance=0)
         self._post(_text("hi", message_id="wamid.h1"))
-        self.assertEqual(len(self.sent_texts), 1)
-        self.assertIn("Quick Setup", self.sent_texts[0])
-        self.assertNotIn(sku_messages.ask_email(), self.sent_texts[0])
+        self.assertEqual(self.sent_texts, ["Welcome back, Ananya! 👋\n\n"
+                                           f"Wallet Balance: {pricing.format_rupees(0)}\n\n"
+                                           "Send your jewelry photo whenever you're ready 📸"])
 
 
 if __name__ == "__main__":

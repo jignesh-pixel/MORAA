@@ -20,6 +20,17 @@ PACK_LINK_VALID_SECONDS = 48 * 3600
 RAZORPAY_PAYMENT_LINKS_URL = "https://api.razorpay.com/v1/payment_links"
 
 
+def razorpay_mode() -> str:
+    """"test" for rzp_test_ keys (no real charges), "live" for rzp_live_ keys, "unconfigured" when the key id is
+    empty or unrecognised. Derived from the key id prefix only; the secret is never read."""
+    key_id = (settings.RAZORPAY_KEY_ID or "").strip()
+    if key_id.startswith("rzp_test_"):
+        return "test"
+    if key_id.startswith("rzp_live_"):
+        return "live"
+    return "unconfigured"
+
+
 async def _post_payment_link(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Create a Razorpay Payment Link over async HTTP with a hard timeout (EXT-5).
 
@@ -167,5 +178,8 @@ async def create_pack_payment_link(
     if link_id:
         # So the reconcile sweep can later ask Razorpay whether it was paid (best effort, own I/O pool).
         await run_io(record_payment_link, link_id, customer_phone, int(amount), PURPOSE_SKU_PACK, units)
-    logger.info(f"Created SKU pack payment link ({units} SKUs, {creative_packs} creative) for {mask_phone(customer_phone)}")
+    logger.info(
+        f"Created SKU pack payment link ({units} SKUs, {creative_packs} creative, razorpay_mode={razorpay_mode()}) "
+        f"for {mask_phone(customer_phone)}"
+    )
     return url

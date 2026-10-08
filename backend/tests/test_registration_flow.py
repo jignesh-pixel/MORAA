@@ -217,12 +217,21 @@ class FlowWebhookTests(FundedSlotGateTestCase):
         self.assertEqual(len(self.sent_texts), 1)
         self.assertIn("Quick Setup", self.sent_texts[0])
 
-    def test_registered_customer_hi_is_unchanged(self):
+    def test_registered_customer_hi_gets_a_welcome_back_not_the_form(self):
         _make_customer(self.session, balance=500)
         self._post(_text("hello"))
         self.flow.assert_not_awaited()
-        self.assertEqual(len(self.sent_texts), 1)
-        self.assertIn("Quick Setup", self.sent_texts[0])
+        self.assertEqual(self.sent_texts, ["Welcome back, Ananya! 👋\n\nWallet Balance: ₹500\n\n"
+                                           "Send your jewelry photo whenever you're ready 📸"])
+
+    def test_unregistered_customer_row_still_gets_the_flow(self):
+        # A row without a finished registration (payment-only placeholder, or a GSTIN awaiting Re-enter / Skip).
+        cust = _make_customer(self.session, balance=500)
+        cust.is_registered = False
+        self.session.commit()
+        self._post(_text("hi"))
+        self.flow.assert_awaited_once_with(SENDER)
+        self.assertEqual(self.sent_texts, [])
 
 
 if __name__ == "__main__":

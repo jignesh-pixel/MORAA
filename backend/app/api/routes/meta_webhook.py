@@ -459,6 +459,33 @@ async def _send_registration_confirmation(
     )
 
 
+def _welcome_back_message(db: Session, cust: Customer) -> str:
+    """A greeting from a registered customer: their first name, what they can spend (SKUs with packs on, else the
+    wallet), and a nudge to send a photo. Customers without an email are asked for one when packs are on (their
+    Drive image folder is shared with it)."""
+    first = (cust.full_name or "").strip().split()[0] if (cust.full_name or "").strip() else "there"
+    lines = [f"Welcome back, {first}! 👋", ""]
+    if settings.SKU_PACKS_ENABLED:
+        studio = sku_packs.balance(db, cust.id)
+        catalog = sku_packs.balance(db, cust.id, SKU_CREATIVE)
+        lines.append(f"{pricing.STUDIO_TITLE} SKUs available: {studio}")
+        if catalog:
+            lines.append(f"{pricing.CREATIVE_TITLE} SKUs available: {catalog}")
+        wallet = get_balance(db, cust.whatsapp_id)
+        if wallet > 0:
+            lines.append(f"Wallet Balance: {format_rupees(wallet)}")
+    elif ent.payment_exempt(cust):
+        lines.append("Team access is active." if ent.is_admin(cust)
+                     else f"Complimentary trial credits left: {ent.trial_remaining(cust)}")
+    else:
+        lines.append(f"Wallet Balance: {format_rupees(get_balance(db, cust.whatsapp_id))}")
+    lines += ["", "Send your jewelry photo whenever you're ready 📸"]
+    text = "\n".join(lines)
+    if settings.SKU_PACKS_ENABLED and not cust.email:
+        text += "\n\n" + sku_messages.ask_email()
+    return text
+
+
 def _confirmation_for(db: Session, sender: str):
     """Deferred "You're all set" for a GSTIN resolved after registration
     (Skip button, or a valid re-entered GSTIN)."""
@@ -1832,24 +1859,22 @@ async def receive_webhook(
                 if re.search(r"\b(hi|hii|hello|hey|start)\b", lower_text):
                     if await _consent_gate(db, sender):
                         continue
-                    # ONE message: new / unregistered senders get the registration Flow, whose body is the
-                    # welcome copy and whose button is "Setup Account". When the Flow is not configured or Meta
-                    # rejects it (and for registered customers, as before) the welcome and the text form go
-                    # out together as one text.
                     greet_cust = _find_customer_safe(db, sender)
-                    if greet_cust is None or not greet_cust.is_registered:
-                        if await send_registration_flow(sender):
-                            continue
-                        logger.warning(
-                            "Registration Flow not sent (unconfigured or rejected by Meta) — "
-                            "falling back to text registration: sender={}", mask_phone(sender)
-                        )
-                    greeting = f"{WELCOME_MESSAGE}\n\n{REGISTRATION_REQUEST_MESSAGE}"
-                    # SKU packs: a registered customer without an email is asked for one (their image folder).
-                    if (settings.SKU_PACKS_ENABLED and greet_cust is not None and greet_cust.is_registered
-                            and not greet_cust.email):
-                        greeting += "\n\n" + sku_messages.ask_email()
-                    await send_whatsapp_text(sender, greeting)
+                    if greet_cust is not None and greet_cust.is_registered:
+                        # Already registered: never the form again, a welcome back with what they can use.
+                        await send_whatsapp_text(sender, _welcome_back_message(db, greet_cust))
+                        continue
+                    # New / unregistered (a payment-only placeholder row, or a GSTIN still awaiting Re-enter /
+                    # Skip): ONE message, the registration Flow whose body is the welcome copy and whose button
+                    # is "Setup Account". When the Flow is not configured or Meta rejects it, the welcome and the
+                    # text form go out together as one text.
+                    if await send_registration_flow(sender):
+                        continue
+                    logger.warning(
+                        "Registration Flow not sent (unconfigured or rejected by Meta) — "
+                        "falling back to text registration: sender={}", mask_phone(sender)
+                    )
+                    await send_whatsapp_text(sender, f"{WELCOME_MESSAGE}\n\n{REGISTRATION_REQUEST_MESSAGE}")
                     continue
 
                 recharge_match = re.search(r"\b(?:recharge|pay|add)\s*(?:rs\.?|inr|₹)?\s*(\d+)\b", lower_text)
