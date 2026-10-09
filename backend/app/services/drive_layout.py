@@ -160,16 +160,32 @@ async def ensure_customer_folders(customer_id: str) -> Dict[str, str]:
                    "invoices": await google_drive.create_folder(INVOICES_FOLDER, root),
                    "sheet": await google_drive.create_sheet(
                        USAGE_LOG_NAME, await google_drive.create_folder(LOGS_FOLDER, root))}
-            await google_drive.sheet_append(ids["sheet"], [USAGE_LOG_HEADER])
+            # Stored before any Sheets API call: a sheet that cannot be written must never cost the folder set
+            # (that discarded every new set and left the ids NULL, so delivery stayed on WhatsApp).
             stored = await run_io(_store_folders, customer_id, ids)
         except Exception:
             await _discard(root)
             raise
-        if stored:
-            logger.bind(category="system").info(f"Drive folders created for {mask_phone(info['phone'])}")
-            return ids
-        await _discard(root)                     # another process stored its set first: use that one
-        return _folder_set(await run_io(_customer, customer_id))
+        if not stored:
+            await _discard(root)                 # another process stored its set first: use that one
+            return _folder_set(await run_io(_customer, customer_id))
+        logger.bind(category="system").info(f"Drive folders created for {mask_phone(info['phone'])}")
+        await _start_usage_log(customer_id, ids["sheet"], info["phone"])
+        return ids
+
+
+async def _start_usage_log(customer_id: str, sheet_id: str, phone: str) -> None:
+    """Write the new sheet's header and its rows so far ("Account registered" first). The caller holds the customer
+    lock, so a queued usage_log sync waits and then appends only what is missing. Never raises: an empty sheet is
+    filled by the next sync (header included)."""
+    from app.services import usage_log
+
+    try:
+        await google_drive.sheet_append(sheet_id, [USAGE_LOG_HEADER] + await run_io(usage_log._rows, customer_id))
+    except Exception as e:  # noqa: BLE001 -- the folders are stored; only the sheet waits
+        reason = e.reason if isinstance(e, DriveError) else type(e).__name__
+        logger.error(f"ALERT Activity Log sheet not written for {mask_phone(phone)} ({reason}): is the Google Sheets "
+                     "API enabled for the service account's project?")
 
 
 async def _day_folder(images_id: str, when: Optional[datetime]) -> Tuple[str, str]:

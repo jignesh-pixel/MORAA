@@ -481,7 +481,9 @@ class CustomerFolderTests(DriveDbTestBase):
         self.assertEqual((row.drive_folder_id, row.drive_images_folder_id, row.drive_invoices_folder_id, row.drive_sheet_id),
                          (ids["root"], ids["images"], ids["invoices"], ids["sheet"]))
         self.assertEqual(self.google.files[ids["root"]]["parents"], [DRIVE_ID])
-        self.assertEqual(self.google.sheets[ids["sheet"]], [drive_layout.USAGE_LOG_HEADER])
+        sheet = self.google.sheets[ids["sheet"]]
+        self.assertEqual(sheet[0], drive_layout.USAGE_LOG_HEADER)
+        self.assertEqual([r[1:] for r in sheet[1:]], [["Account registered", 0, 0]])
         before = len(self.google.calls)
         self.assertEqual(asyncio.run(drive_layout.ensure_customer_folders(customer_id)), ids)
         self.assertEqual(len(self.google.calls), before)                 # stored ids: no Drive call at all
@@ -505,6 +507,21 @@ class CustomerFolderTests(DriveDbTestBase):
                 asyncio.run(drive_layout.ensure_customer_folders(customer_id))
         self.assertEqual(self.google.children(DRIVE_ID), [])
         self.assertIsNone(self.customer(customer_id).drive_folder_id)
+
+    def test_a_disabled_sheets_api_still_stores_the_folder_set_and_reuses_it(self):
+        # Live 2026-10-09: Sheets API SERVICE_DISABLED made every call discard its new set and leave the ids NULL.
+        customer_id = self.make_customer()
+        self.google.fail("POST", "/values/", 403, "SERVICE_DISABLED")
+        ids = asyncio.run(drive_layout.ensure_customer_folders(customer_id))
+        row = self.customer(customer_id)
+        self.assertEqual((row.drive_folder_id, row.drive_images_folder_id, row.drive_invoices_folder_id, row.drive_sheet_id),
+                         (ids["root"], ids["images"], ids["invoices"], ids["sheet"]))
+        self.assertEqual(self.google.children(DRIVE_ID), [ids["root"]])
+        self.assertEqual(self.google.sheets[ids["sheet"]], [])
+        self.assertEqual(asyncio.run(drive_layout.ensure_customer_folders(customer_id)), ids)
+        self.assertEqual(self.google.children(DRIVE_ID), [ids["root"]])          # no second set
+        day_id, _label = asyncio.run(drive_layout.ensure_day_folder(customer_id))
+        self.assertEqual(self.google.files[day_id]["parents"], [ids["images"]])
 
     def test_day_folders_use_the_ist_date_and_files_are_numbered(self):
         customer_id = self.make_customer()

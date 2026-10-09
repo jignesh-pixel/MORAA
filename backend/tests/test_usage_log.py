@@ -58,12 +58,15 @@ class UsageLogTests(DriveDbTestBase):
 
     def test_sync_appends_only_the_missing_rows_in_one_call(self):
         self.ledger(ACTION_PURCHASE, 5, 5, "pay_1")
-        self.ledger(ACTION_CONSUME, -1, 4, "ing_1")
-        asyncio.run(drive_layout.ensure_customer_folders(self.customer_id))
-        before = self.appends()
-        self.assertEqual(asyncio.run(usage_log.sync(self.customer_id)), 3)
-        self.assertEqual(self.appends(), before + 1)
+        asyncio.run(drive_layout.ensure_customer_folders(self.customer_id))      # writes header + rows so far
         self.assertEqual(self.sheet()[0], drive_layout.USAGE_LOG_HEADER)
+        self.assertEqual([r[1] for r in self.sheet()[1:]], ["Account registered", "Pack purchased (5 SKUs)"])
+        before = self.appends()
+        self.assertEqual(asyncio.run(usage_log.sync(self.customer_id)), 0)   # nothing written twice
+        self.assertEqual(self.appends(), before)
+        self.ledger(ACTION_CONSUME, -1, 4, "ing_1")
+        self.assertEqual(asyncio.run(usage_log.sync(self.customer_id)), 1)
+        self.assertEqual(self.appends(), before + 1)
         self.assertEqual(len(self.sheet()), 4)
 
         self.ledger(ACTION_CONSUME, -1, 3, "ing_2")
