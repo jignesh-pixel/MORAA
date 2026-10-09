@@ -38,6 +38,12 @@ def pack_link_body(units: int, total: int, creative_packs: int = 0) -> str:
     return "\n".join(lines)
 
 
+def pack_order_body(units: int, total: int, creative_packs: int = 0) -> str:
+    """The same cart summary for the in-chat WhatsApp Pay order, whose button is WhatsApp's own "Review and pay"."""
+    lines = pack_link_body(units, total, creative_packs).split("\n")
+    return "\n".join(lines[:-1] + ["Tap Review and pay to pay here in WhatsApp."])
+
+
 STUDIO_COLLECTION_TITLE = pricing.STUDIO_TITLE
 CATALOG_COLLECTION_TITLE = pricing.CREATIVE_TITLE
 

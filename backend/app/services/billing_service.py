@@ -6,8 +6,10 @@ never touches money. Never raises.
 
     ERPNEXT_INVOICE_ENABLED true + configured + ERPNext succeeds
         -> submitted Sales Invoice (+ Payment Entry) PDF sent on WhatsApp
-    anything else (disabled, not configured, error, timeout, send failure)
-        -> the existing local ReportLab receipt, exactly as before
+    ERPNext made the invoice but the send failed
+        -> "failed": the outbox retries with the same ERPNext invoice
+    anything else (disabled, not configured, unreachable, timeout, 4xx/5xx)
+        -> the existing local ReportLab receipt, at once
 
 A SKU pack purchase (Phase 8) is billed as one line per SKU bought instead of one wallet-recharge line. With Drive
 delivery on, the PDF goes into the customer's {phone}/Invoices/ folder and the customer gets a short text with the
@@ -187,10 +189,11 @@ async def dispatch_payment_invoice(
 ) -> str:
     """Send the invoice PDF for one captured payment. Returns "erpnext", "local" or "failed".
 
-    With ERPNext switched on, ERPNext is the ONLY source of invoice numbers (GST needs one consecutive series): if it
-    cannot produce or send the invoice the result is "failed" and the durable outbox retries later (ERPNext reuses
-    the invoice it already made for this payment id, so a retry never makes a second one). The customer has already
-    been sent the "payment received" message. With ERPNext off, the local payment receipt is sent as before.
+    With ERPNext switched on, an invoice ERPNext made is the one the customer gets: if it cannot be SENT the result is
+    "failed" and the durable outbox retries later (ERPNext reuses the invoice it already made for this payment id, so
+    a retry never makes a second one). If ERPNext produces NO invoice (unreachable, suspended, timed out, 4xx/5xx),
+    the local receipt is sent at once and an ALERT asks for the payment to be booked in ERPNext by hand. The customer
+    has already been sent the "payment received" message. With ERPNext off, the local receipt is sent as before.
     ``local_pdf_fn`` / ``send_document_fn`` are passed in by the caller."""
     try:
         context = await run_io(_payment_context, payment_id, recipient_id)
@@ -199,6 +202,7 @@ async def dispatch_payment_invoice(
         context = {"customer_id": None, "white": 0, "creative": 0}
     is_pack = bool(context["white"] or context["creative"])
     if settings.ERPNEXT_INVOICE_ENABLED:
+        result = None
         try:
             extra = {"lines": pack_invoice_lines(context["white"], context["creative"], amount)} if is_pack else {}
             result = await get_erpnext_service().create_paid_invoice_pdf(
@@ -209,21 +213,29 @@ async def dispatch_payment_invoice(
                 payment_id=payment_id,
                 **extra,
             )
-            if result:
-                pdf_bytes, invoice_name = result
+        except Exception as e:  # noqa: BLE001 -- treated like "no invoice": the local receipt goes out below
+            logger.warning(f"ERPNext invoice failed for {payment_id}: {type(e).__name__}: {e}")
+        if result:
+            # ERPNext made the invoice: only ITS number may reach the customer, so a failed send is retried (ERPNext
+            # reuses the invoice for this payment id), never replaced by a local receipt with a second number.
+            pdf_bytes, invoice_name = result
+            try:
                 sent, drive = await _send_invoice(recipient_id, context["customer_id"], pdf_bytes, invoice_name,
                                                   send_document_fn)
-                if sent:
-                    logger.info(f"ERPNext invoice {invoice_name} sent to {mask_phone(recipient_id)} (payment={payment_id})")
-                    await _note_invoice(payment_id, recipient_id, amount, "sent", invoice_name, drive)
-                    return "erpnext"
-                logger.warning(f"ERPNext invoice {invoice_name} could not be sent; it will be retried")
-            else:
-                logger.warning(f"ERPNext produced no invoice for {payment_id}; it will be retried")
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"ERPNext invoice dispatch failed for {payment_id}: {e}; it will be retried")
-        await _note_invoice(payment_id, recipient_id, amount, "failed")
-        return "failed"
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"ERPNext invoice {invoice_name} send failed ({type(e).__name__}); it will be retried")
+                sent, drive = False, None
+            if sent:
+                logger.info(f"ERPNext invoice {invoice_name} sent to {mask_phone(recipient_id)} (payment={payment_id})")
+                await _note_invoice(payment_id, recipient_id, amount, "sent", invoice_name, drive)
+                return "erpnext"
+            logger.warning(f"ERPNext invoice {invoice_name} could not be sent; it will be retried")
+            await _note_invoice(payment_id, recipient_id, amount, "failed")
+            return "failed"
+        # ERPNext unreachable, suspended, timed out or refused (4xx/5xx): send the local receipt NOW instead of
+        # leaving the customer waiting on outbox retries. The payment is NOT in ERPNext: book it there by hand.
+        logger.error(f"ALERT ERPNext produced no invoice for payment={payment_id} (₹{amount}); local receipt sent "
+                     "instead. Book this payment in ERPNext when it is back.")
 
     # Existing local ReportLab receipt (unchanged numbering and content).
     try:

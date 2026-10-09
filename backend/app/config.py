@@ -347,6 +347,9 @@ class Settings(BaseSettings):
     ERPNEXT_PRICES_INCLUDE_TAX: bool = True
     # Upper bound for the whole background invoice job (all ERPNext calls).
     ERPNEXT_JOB_TIMEOUT_SECONDS: float = 60.0
+    # Cap on every single ERPNext HTTP call (connect, read, write, pool). Short so an unreachable or suspended
+    # ERPNext fails fast and the local invoice is sent at once; raise it if PDF downloads time out on a live ERPNext.
+    ERPNEXT_HTTP_TIMEOUT_SECONDS: float = 2.0
 
     # --- Razorpay Payments (wallet recharge) ---
     # API credentials used to create dynamic recharge payment links.

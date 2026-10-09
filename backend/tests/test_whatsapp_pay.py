@@ -276,6 +276,72 @@ class WhatsAppPayTests(FundedSlotGateTestCase):
         self.assertEqual(kwargs["customer_snapshot"]["gst_number"], "24AAAPS1234C1Z5")
         self.assertEqual(self.pay_text.await_count, 1)  # receipt text still sent inline
 
+    # ── SKU pack cart (native) ──────────────────────────────────────────
+    def _pack_checkout(self, white=5, creative=1):
+        import asyncio
+        from app.services import pricing
+        _make_customer(self.session, balance=100)
+        self.pack_link = AsyncMock(return_value="https://rzp.io/pack")
+        p = patch.object(razorpay_service, "create_pack_payment_link", new=self.pack_link)
+        p.start()
+        self.addCleanup(p.stop)
+        total = pricing.pack_total(white, self.session) + creative * pricing.creative_pack_price()
+        sent = asyncio.run(self.webhook_module._send_pack_link(self.session, SENDER, white, None, creative))
+        return sent, total
+
+    def test_pack_checkout_sends_native_review_and_pay_order(self):
+        self._enable()
+        sent, total = self._pack_checkout()
+        self.assertTrue(sent)
+        payload = self.post.await_args.args[0]
+        inter = payload["interactive"]
+        self.assertEqual((inter["type"], inter["action"]["name"]), ("order_details", "review_and_pay"))
+        params = inter["action"]["parameters"]
+        gateway = params["payment_settings"][0]["payment_gateway"]
+        self.assertEqual((gateway["type"], gateway["configuration_name"]), ("razorpay", "moraa_studio_razorpay"))
+        self.assertEqual(gateway["razorpay"]["receipt"], params["reference_id"])
+        self.assertEqual(params["total_amount"], {"value": total * 100, "offset": 100})
+        items = params["order"]["items"]
+        self.assertEqual(sum(i["amount"]["value"] * i["quantity"] for i in items), params["order"]["subtotal"]["value"])
+        self.assertEqual(params["order"]["subtotal"]["value"], total * 100)
+        self.assertTrue(all(i["importer_address"] and len(i["name"]) <= 60 for i in items))
+        self.assertNotIn("http", inter["body"]["text"])
+        o = self._order()
+        self.assertEqual((o.purpose, o.white_units, o.creative_packs, o.amount_rupees, o.reference_id),
+                         ("sku_pack", 5, 1, total, params["reference_id"]))
+        self.pack_link.assert_not_awaited()
+        self.cta.assert_not_awaited()
+
+    def test_captured_pack_order_grants_sku_credits_not_wallet_rupees(self):
+        from app.models.sku_credit import SKU_CREATIVE
+        from app.services import sku_packs
+        self._enable()
+        _sent, total = self._pack_checkout()
+        o = self._order()
+        lookup = AsyncMock(return_value=_lookup(o.reference_id, value=total * 100, pay_id="pay_PACK1"))
+        with patch.object(pay, "lookup_payment", new=lookup):
+            self._post(_payment_webhook(o.reference_id, pay_id="pay_PACK1"))
+            self._post(_payment_webhook(o.reference_id, pay_id="pay_PACK1"))      # Meta retry
+        self.session.expire_all()
+        customer = pay.find_customer_by_phone(self.session, SENDER)
+        self.assertEqual(self._balance(), 100)                                  # no wallet rupees
+        self.assertEqual((sku_packs.balance(self.session, customer.id),
+                          sku_packs.balance(self.session, customer.id, SKU_CREATIVE)), (5, 1))
+        o = self._order()
+        self.assertEqual((o.status, o.credited, o.pg_payment_id), ("captured", True, "pay_PACK1"))
+        self.assertEqual(self.session.query(AuditLog).filter_by(
+            action="razorpay_payment_captured", resource_id="pay_PACK1").count(), 1)
+        self.assertEqual(self.pay_text.await_count, 1)                          # one pack receipt
+        self.assertEqual(self.doc.await_count, 1)                               # one invoice
+
+    def test_pack_checkout_with_native_off_keeps_the_pack_link(self):
+        self._enable(WHATSAPP_PAY_ENABLED=False)
+        sent, _total = self._pack_checkout()
+        self.assertTrue(sent)
+        self.post.assert_not_awaited()
+        self.pack_link.assert_awaited_once()
+        self.assertEqual(self.cta.await_args.kwargs["button_label"], "Place Order")
+
 
 
 class WhatsAppPayStrictModeTests(WhatsAppPayTests):
@@ -301,6 +367,35 @@ class WhatsAppPayStrictModeTests(WhatsAppPayTests):
         self._post(self._recharge_text())
         self.assertEqual(self._order().status, "dispatch_failed")
         self._assert_unavailable_no_link()
+
+    def test_strict_pack_checkout_rejected_by_meta_never_sends_a_link(self):
+        self._strict()
+        self.post.return_value = False
+        sent, _total = self._pack_checkout()
+        self.assertFalse(sent)
+        self.assertEqual(self._order().status, "dispatch_failed")
+        self.pack_link.assert_not_awaited()
+        self._assert_unavailable_no_link()
+
+    def test_strict_pack_checkout_with_native_off_never_sends_a_link(self):
+        self._strict(WHATSAPP_PAY_ENABLED=False)
+        sent, _total = self._pack_checkout()
+        self.assertFalse(sent)
+        self.post.assert_not_awaited()
+        self.pack_link.assert_not_awaited()
+        self._assert_unavailable_no_link()
+
+    def test_strict_failed_pack_payment_offers_in_chat_retry_not_link(self):
+        self._strict()
+        self._pack_checkout()
+        o = self._order()
+        self.pay_text.reset_mock()
+        for _ in range(2):
+            self._post(_payment_webhook(o.reference_id, status="pending", tx_status="failed"))
+        self.assertEqual((self._order().status, self._order().fallback_sent), ("failed", True))
+        self.assertEqual([c.args[1] for c in self.pay_text.await_args_list], [pay.PACK_ORDER_FAILED_STRICT_MESSAGE])
+        self.pack_link.assert_not_awaited()
+        self.cta.assert_not_awaited()
 
     def test_strict_with_feature_disabled_never_sends_link(self):
         self._strict(WHATSAPP_PAY_ENABLED=False)

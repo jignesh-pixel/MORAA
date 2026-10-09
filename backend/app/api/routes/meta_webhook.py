@@ -86,6 +86,7 @@ from app.services.whatsapp_pay_service import (
     handle_payment_status_event,
     is_native_pay_active,
     send_payment_unavailable,
+    try_send_native_pack,
     try_send_native_recharge,
 )
 from app.services import entitlement_service as ent
@@ -1127,12 +1128,22 @@ PACK_MENU_WORDS = {"packs", "pack", "buy", "menu", "price", "prices"}
 async def _send_pack_link(
     db: Session, sender: str, units: int, reply_to: Optional[str] = None, creative_packs: int = 0,
 ) -> bool:
-    """One payment link for a whole cart (``units`` white-background SKUs + ``creative_packs`` Catalog Pack
-    Packs) as the cart summary with one pay button. No link -> an apology, never a static link."""
+    """One payment for a whole cart (``units`` white-background SKUs + ``creative_packs`` Catalog Pack SKUs): the
+    native WhatsApp Pay order (Review and pay, in the chat) when it is on for this number; else, unless
+    WHATSAPP_PAY_STRICT, the cart summary with one Razorpay link button. No link -> an apology, never a static
+    link."""
     cust = _find_customer_safe(db, sender)
     name = (cust.full_name if cust is not None else "") or "Customer"
     total = (pricing.pack_total(units, db) if units else 0) + (
         creative_packs * pricing.creative_pack_price() if creative_packs else 0)
+    if await try_send_native_pack(db, sender, units, creative_packs, total,
+                                  sku_messages.pack_order_body(units, total, creative_packs),
+                                  reply_to_message_id=reply_to, site="pack_checkout"):
+        return True
+    if await send_payment_unavailable(sender, "pack_checkout",
+                                      body_text=sku_messages.pack_order_body(units, total, creative_packs),
+                                      reply_to_message_id=reply_to):
+        return False
     db.commit()                          # the Razorpay and Meta calls below must not hold a connection
     try:
         url = await razorpay_service.create_pack_payment_link(

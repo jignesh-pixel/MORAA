@@ -55,8 +55,10 @@ _REQUIRED_ENV_VARS = (
 )
 
 #: Strict timeout for every ERPNext HTTP call (seconds), applied to
-#: connect / read / write / pool uniformly.
-_DEFAULT_TIMEOUT_SECONDS = 8.0
+#: connect / read / write / pool uniformly. ERPNEXT_HTTP_TIMEOUT_SECONDS
+#: overrides it: a dead or suspended ERPNext must fail fast so the local
+#: invoice goes out at once.
+_DEFAULT_TIMEOUT_SECONDS = 2.0
 
 # Process-level flag so the "credentials missing" warning is logged once
 # instead of spamming the logs on every sync attempt.
@@ -78,7 +80,7 @@ class ERPNextService:
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
         company: Optional[str] = None,
-        timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+        timeout_seconds: Optional[float] = None,
     ) -> None:
         """Initialise the connector.
 
@@ -101,8 +103,13 @@ class ERPNextService:
             api_secret if api_secret is not None else str(_cfg("ERPNEXT_API_SECRET"))
         )
         self.company: str = company if company is not None else str(_cfg("ERPNEXT_COMPANY"))
-        # Strict 8-second timeout: uniform cap on connect, read, write, pool.
-        self.timeout: httpx.Timeout = httpx.Timeout(timeout_seconds)
+        # Strict timeout (default 2 s): uniform cap on connect, read, write, pool.
+        if timeout_seconds is None:
+            try:
+                timeout_seconds = float(_cfg("ERPNEXT_HTTP_TIMEOUT_SECONDS", _DEFAULT_TIMEOUT_SECONDS))
+            except (TypeError, ValueError):
+                timeout_seconds = _DEFAULT_TIMEOUT_SECONDS
+        self.timeout: httpx.Timeout = httpx.Timeout(timeout_seconds if timeout_seconds > 0 else _DEFAULT_TIMEOUT_SECONDS)
 
     # ------------------------------------------------------------------
     # Configuration helpers

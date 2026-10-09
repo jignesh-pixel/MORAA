@@ -65,6 +65,7 @@ ORDER_FAILED_STRICT_MESSAGE = (
     "Your in-chat payment didn't go through. "
     "Reply *recharge {amount}* to try again."
 )
+PACK_ORDER_FAILED_STRICT_MESSAGE = "Your in-chat payment didn't go through. Reply *packs* to choose your pack again."
 
 
 # ─── Activation ──────────────────────────────────────────────────────────
@@ -146,6 +147,40 @@ def order_totals(amount_rupees: int) -> Dict[str, int]:
     return {"subtotal": subtotal, "tax": tax, "total": subtotal + tax}
 
 
+def _order_item(retailer_id: str, name: str, paise: int) -> Dict[str, Any]:
+    """One order line (quantity 1). Without a catalog_id Meta requires the origin and importer fields."""
+    return {
+        "retailer_id": retailer_id,
+        "name": name[:60],
+        "amount": _money(paise),
+        "quantity": 1,
+        "country_of_origin": settings.WHATSAPP_PAY_COUNTRY_OF_ORIGIN,
+        "importer_name": settings.WHATSAPP_PAY_IMPORTER_NAME,
+        "importer_address": _importer_address(),
+    }
+
+
+def pack_order_items(white_units: int, creative_packs: int, total_rupees: int) -> List[Dict[str, Any]]:
+    """Order lines for a SKU pack cart whose amounts add up exactly to ``total_rupees`` (GST-inclusive prices): the
+    Catalog Pack SKUs at today's creative pack price, the white-background SKUs at the rest."""
+    from app.services import pricing
+
+    white_units, creative_packs, total = int(white_units), int(creative_packs), int(total_rupees)
+    creative_total = creative_packs * pricing.creative_pack_price() if creative_packs else 0
+    white_total = total - creative_total
+    white_name = f"{pricing.STUDIO_TITLE} {pricing.pack_title(white_units)}" if white_units else ""
+    creative_name = f"{pricing.CREATIVE_TITLE} {pricing.pack_title(creative_packs)}" if creative_packs else ""
+    if white_units and creative_packs and white_total > 0:
+        return [_order_item(pricing.pack_retailer_id(white_units), white_name, white_total * INR_OFFSET),
+                _order_item(pricing.catalog_retailer_id(creative_packs), creative_name, creative_total * INR_OFFSET)]
+    if white_units and creative_packs:          # cannot happen for a priced cart: one line, never a negative one
+        return [_order_item(f"sku_cart_{white_units}_{creative_packs}", f"{white_name} + {creative_name}",
+                            total * INR_OFFSET)]
+    if creative_packs:
+        return [_order_item(pricing.catalog_retailer_id(creative_packs), creative_name, total * INR_OFFSET)]
+    return [_order_item(pricing.pack_retailer_id(white_units), white_name, total * INR_OFFSET)]
+
+
 def build_order_details_payload(
     recipient_id: str,
     whatsapp_id: str,
@@ -153,18 +188,15 @@ def build_order_details_payload(
     amount_rupees: int,
     body_text: str,
     expires_at: datetime,
+    items: Optional[List[Dict[str, Any]]] = None,
+    expiry_text: str = "This recharge order has expired.",
 ) -> Dict[str, Any]:
-    """Pure builder for the interactive order_details message (no I/O)."""
+    """Pure builder for the interactive order_details message (no I/O). ``items`` (a SKU pack cart) must add up to
+    ``amount_rupees``; without them the order is one wallet-recharge line."""
     totals = order_totals(amount_rupees)
-    item = {
-        "retailer_id": f"wallet_recharge_{int(amount_rupees)}",
-        "name": (settings.WHATSAPP_PAY_ITEM_NAME or "Wallet Recharge")[:60],
-        "amount": _money(totals["subtotal"]),
-        "quantity": 1,
-        "country_of_origin": settings.WHATSAPP_PAY_COUNTRY_OF_ORIGIN,
-        "importer_name": settings.WHATSAPP_PAY_IMPORTER_NAME,
-        "importer_address": _importer_address(),
-    }
+    order_items = items or [_order_item(
+        f"wallet_recharge_{int(amount_rupees)}", settings.WHATSAPP_PAY_ITEM_NAME or "Wallet Recharge", totals["subtotal"],
+    )]
     tax = _money(totals["tax"])
     if settings.WHATSAPP_PAY_TAX_DESCRIPTION:
         tax["description"] = settings.WHATSAPP_PAY_TAX_DESCRIPTION[:60]
@@ -200,9 +232,9 @@ def build_order_details_payload(
                         "status": "pending",
                         "expiration": {
                             "timestamp": str(int(expires_at.timestamp())),
-                            "description": "This recharge order has expired.",
+                            "description": expiry_text[:120],
                         },
-                        "items": [item],
+                        "items": order_items,
                         "subtotal": _money(totals["subtotal"]),
                         "tax": tax,
                     },
@@ -227,6 +259,51 @@ async def try_send_native_recharge(
     send_payment_unavailable (strict mode) or its Razorpay-link code.
     Every exit is logged with the gate / Meta error that caused it.
     """
+    return await _send_native_order(db, recipient_id, amount_rupees, body_text, reply_to_message_id, site)
+
+
+async def try_send_native_pack(
+    db: Session,
+    recipient_id: str,
+    white_units: int,
+    creative_packs: int,
+    total_rupees: int,
+    body_text: str,
+    reply_to_message_id: Optional[str] = None,
+    site: str = "pack_checkout",
+) -> bool:
+    """Send a SKU pack cart as a native order_details order (Review and pay). Never raises.
+
+    The amount is the cart total priced by the server (pricing.py), never a recharge minimum. When Meta confirms the
+    payment, reconcile_order grants the SKU credits instead of crediting the wallet. False = not active / no
+    customer / rejected: the caller sends the strict "unavailable" notice or its payment link."""
+    from app.services.sku_packs import MAX_PACK_UNITS, PURPOSE_SKU_PACK
+
+    counts = (white_units, creative_packs)
+    if any(isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= MAX_PACK_UNITS for n in counts) \
+            or white_units + creative_packs < 1 or int(total_rupees) <= 0:
+        _plog.warning(f"WhatsApp Pay pack refused: units={white_units!r} creative={creative_packs!r} "
+                      f"total={total_rupees!r} site={site}")
+        return False
+    return await _send_native_order(
+        db, recipient_id, int(total_rupees), body_text, reply_to_message_id, site,
+        purpose=PURPOSE_SKU_PACK, white_units=white_units, creative_packs=creative_packs,
+    )
+
+
+async def _send_native_order(
+    db: Session,
+    recipient_id: str,
+    amount_rupees: int,
+    body_text: str,
+    reply_to_message_id: Optional[str],
+    site: str,
+    purpose: Optional[str] = None,
+    white_units: int = 0,
+    creative_packs: int = 0,
+) -> bool:
+    """Record one order and send its order_details message. ``purpose`` None = wallet recharge (the amount is raised
+    to the recharge minimum), "sku_pack" = the exact cart total. Never raises."""
     try:
         reason = native_pay_block_reason(recipient_id)
         if reason:
@@ -237,7 +314,7 @@ async def try_send_native_recharge(
             # wallet row required for crediting; link path handles placeholders
             _log_native_skip(recipient_id, site, "gate5_no_customer: no wallet row for this number")
             return False
-        amount = max(int(amount_rupees), pricing.min_recharge())
+        amount = int(amount_rupees) if purpose else max(int(amount_rupees), pricing.min_recharge())
         expiry = max(int(settings.WHATSAPP_PAY_ORDER_EXPIRY_SECONDS), 300)
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=expiry)
         order = WhatsAppPaymentOrder(
@@ -248,12 +325,17 @@ async def try_send_native_recharge(
             status="created",
             configuration_name=settings.WHATSAPP_PAY_CONFIGURATION_NAME.strip(),
             expires_at=expires_at,
+            purpose=purpose,
+            white_units=white_units if purpose else None,
+            creative_packs=creative_packs if purpose else None,
         )
         db.add(order)
         db.commit()
 
+        pack_items = pack_order_items(white_units, creative_packs, amount) if purpose else None
         payload = build_order_details_payload(
-            recipient_id, customer.whatsapp_id, order.reference_id, amount, body_text, expires_at
+            recipient_id, customer.whatsapp_id, order.reference_id, amount, body_text, expires_at,
+            items=pack_items, expiry_text="This order has expired." if purpose else "This recharge order has expired.",
         )
         _plog.info(
             f"WhatsApp Pay native attempt: site={site} recipient={mask_phone(recipient_id)} "
@@ -313,7 +395,8 @@ async def send_payment_unavailable(
     return True
 
 
-async def send_order_status(recipient_id: str, reference_id: str, status: str, description: str = "") -> bool:
+async def send_order_status(recipient_id: str, reference_id: str, status: str, description: str = "",
+                            body_text: str = "Wallet recharge update") -> bool:
     order: Dict[str, Any] = {"status": status}
     if description:
         order["description"] = description[:120]
@@ -324,7 +407,7 @@ async def send_order_status(recipient_id: str, reference_id: str, status: str, d
         "type": "interactive",
         "interactive": {
             "type": "order_status",
-            "body": {"text": "Wallet recharge update"},
+            "body": {"text": body_text},
             "action": {"name": "review_order", "parameters": {"reference_id": reference_id, "order": order}},
         },
     }
@@ -476,6 +559,8 @@ async def reconcile_order(db: Session, order: WhatsAppPaymentOrder) -> str:
             "currency": "INR",
             "source": "whatsapp_pay",
             "reference_id": order.reference_id,
+            **({"purpose": order.purpose, "units": int(order.white_units or 0),
+                "creative_packs": int(order.creative_packs or 0)} if _is_pack(order) else {}),
         }),
     ))
     try:
@@ -490,7 +575,9 @@ async def reconcile_order(db: Session, order: WhatsAppPaymentOrder) -> str:
         return "already_credited"
 
     try:
-        if credit_wallet(
+        if _is_pack(order):
+            _grant_pack_order(db, order, pay_id)
+        elif credit_wallet(
             db, order.whatsapp_id, order.amount_rupees, commit=False,
             kind=KIND_CREDIT_WHATSAPP_PAY, ref=pay_id,
         ) != 1:
@@ -508,12 +595,38 @@ async def reconcile_order(db: Session, order: WhatsAppPaymentOrder) -> str:
         logger.error(f"WhatsApp Pay credit failed for {order.reference_id}: {e}")
         return "credit_failed"
 
+    what = (f"SKU pack ({int(order.white_units or 0)} white + {int(order.creative_packs or 0)} catalog) for "
+            if _is_pack(order) else "")
     logger.info(
-        f"WhatsApp Pay credited ₹{order.amount_rupees} to {mask_phone(order.whatsapp_id)} "
+        f"WhatsApp Pay credited {what}₹{order.amount_rupees} to {mask_phone(order.whatsapp_id)} "
         f"(ref={order.reference_id}, payment={pay_id})"
     )
     await _send_receipt(db, order)
     return "credited"
+
+
+def _is_pack(order: WhatsAppPaymentOrder) -> bool:
+    from app.services.sku_packs import PURPOSE_SKU_PACK
+
+    return order.purpose == PURPOSE_SKU_PACK
+
+
+def _grant_pack_order(db: Session, order: WhatsAppPaymentOrder, pay_id: str) -> None:
+    """Grant the SKUs a captured pack order bought, in the caller's transaction, keyed on the Razorpay payment id
+    (as a pack link payment is, so refunds claw it back the same way). Raises when nothing can be granted."""
+    from app.models.sku_credit import SKU_CREATIVE
+    from app.services import sku_packs
+
+    customer = find_customer_by_phone(db, order.whatsapp_id)
+    if customer is None:
+        raise RuntimeError("no customer row for this pack order")
+    white, creative = int(order.white_units or 0), int(order.creative_packs or 0)
+    if white + creative < 1:
+        raise RuntimeError("pack order without SKUs")
+    if white:
+        sku_packs.grant_pack_credits(db, customer, white, pay_id)
+    if creative:
+        sku_packs.grant_pack_credits(db, customer, creative, pay_id, sku=SKU_CREATIVE)
 
 
 # Orders that ended without a credit (Meta rejected the message, the payment failed, or it expired) are still
@@ -652,15 +765,25 @@ async def _send_receipt(db: Session, order: WhatsAppPaymentOrder) -> None:
         from app.services.invoice_service import generate_invoice_pdf
         from app.services.meta_whatsapp_service import send_document_to_whatsapp
 
-        await send_order_status(order.whatsapp_id, order.reference_id, "completed", "Wallet recharged")
-        await send_whatsapp_text(
-            recipient_id=order.whatsapp_id,
-            message_text=PAYMENT_TIPS_MESSAGE.format(
-                paid=f"{order.amount_rupees:,}",
-                balance=f"{get_balance(db, order.whatsapp_id):,}",
-            ),
-        )
         customer = find_customer_by_phone(db, order.whatsapp_id)
+        if _is_pack(order) and customer is not None:
+            from app.api.routes.payment_routes import _pack_receipt
+
+            await send_order_status(order.whatsapp_id, order.reference_id, "completed", "Pack purchased",
+                                    body_text="Your order update")
+            await send_whatsapp_text(
+                recipient_id=order.whatsapp_id,
+                message_text=_pack_receipt(db, customer, int(order.white_units or 0), int(order.creative_packs or 0)),
+            )
+        else:
+            await send_order_status(order.whatsapp_id, order.reference_id, "completed", "Wallet recharged")
+            await send_whatsapp_text(
+                recipient_id=order.whatsapp_id,
+                message_text=PAYMENT_TIPS_MESSAGE.format(
+                    paid=f"{order.amount_rupees:,}",
+                    balance=f"{get_balance(db, order.whatsapp_id):,}",
+                ),
+            )
         job = dispatch_payment_invoice(
             recipient_id=order.whatsapp_id,
             payment_id=order.pg_payment_id or order.reference_id,
@@ -712,6 +835,26 @@ async def _send_receipt(db: Session, order: WhatsAppPaymentOrder) -> None:
             await job  # local PDF only: same inline behaviour as before
     except Exception as e:
         logger.error(f"WhatsApp Pay receipt dispatch failed for {order.reference_id}: {e}")
+    if _is_pack(order):
+        await _pack_followups(db, order)
+
+
+async def _pack_followups(db: Session, order: WhatsAppPaymentOrder) -> None:
+    """After a granted pack: the Usage Log sheet row and Drive share, then the photos sent before paying. Never
+    raises: the SKUs are already granted."""
+    try:
+        from app.services import sku_packs
+
+        customer = find_customer_by_phone(db, order.whatsapp_id)
+        if customer is None:
+            return
+        await run_io(sku_packs.queue_followups, customer.id)
+        if int(order.white_units or 0):
+            from app.api.routes.meta_webhook import start_held_photos
+
+            await start_held_photos(db, order.whatsapp_id)
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"WhatsApp Pay pack follow-ups failed for {order.reference_id}: {type(e).__name__}: {e}")
 
 
 async def _send_fallback_link_once(db: Session, order: WhatsAppPaymentOrder) -> None:
@@ -720,6 +863,9 @@ async def _send_fallback_link_once(db: Session, order: WhatsAppPaymentOrder) -> 
     Strict mode: no link; an in-chat "reply recharge N to retry" text instead.
     """
     if order.fallback_sent:
+        return
+    if _is_pack(order):
+        await _pack_payment_failed_once(db, order)
         return
     if settings.WHATSAPP_PAY_STRICT:
         try:
@@ -753,3 +899,35 @@ async def _send_fallback_link_once(db: Session, order: WhatsAppPaymentOrder) -> 
     except Exception as e:
         db.rollback()
         logger.error(f"WhatsApp Pay fallback link failed for {order.reference_id}: {e}")
+
+
+async def _pack_payment_failed_once(db: Session, order: WhatsAppPaymentOrder) -> None:
+    """A failed in-chat pack payment. Strict mode: an in-chat "reply packs to try again" text (no URL); otherwise
+    one pack payment link for the same cart. Sent once per order."""
+    try:
+        if settings.WHATSAPP_PAY_STRICT:
+            sent = await send_whatsapp_text(order.whatsapp_id, PACK_ORDER_FAILED_STRICT_MESSAGE)
+        else:
+            from app.services import sku_messages
+            from app.services.meta_whatsapp_service import send_whatsapp_cta_url_button
+            from app.services.razorpay_service import create_pack_payment_link
+
+            customer = find_customer_by_phone(db, order.whatsapp_id)
+            url = await create_pack_payment_link(
+                customer_phone=order.whatsapp_id,
+                customer_name=getattr(customer, "full_name", None) or "Customer",
+                units=int(order.white_units or 0),
+                creative_packs=int(order.creative_packs or 0),
+            )
+            sent = bool(url) and await send_whatsapp_cta_url_button(
+                recipient_id=order.whatsapp_id,
+                body_text=ORDER_FAILED_MESSAGE,
+                button_label=sku_messages.PAY_BUTTON,
+                url=url,
+            )
+        if sent:
+            order.fallback_sent = True
+            db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"WhatsApp Pay pack retry notice failed for {order.reference_id}: {e}")
