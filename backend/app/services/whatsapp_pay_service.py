@@ -27,6 +27,7 @@ order_details / review_and_pay, payment statuses webhook, payment lookup
 
 import asyncio
 import json
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
@@ -130,8 +131,9 @@ def _log_native_skip(recipient_id: str, site: str, reason: str) -> None:
 
 
 def new_reference_id() -> str:
-    """Max 35 chars, [A-Za-z0-9_-.] (Meta constraint)."""
-    return f"mgv_{uuid.uuid4().hex[:24]}"
+    """A fresh id per checkout: mgv_<unix seconds>_<12 hex>, 27 chars. Meta: max 35, [A-Za-z0-9_-.];
+    it is also the Razorpay receipt (max 40), so a completed order is never reloaded."""
+    return f"mgv_{int(time.time())}_{uuid.uuid4().hex[:12]}"
 
 
 def _money(paise: int) -> Dict[str, int]:

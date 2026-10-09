@@ -86,6 +86,13 @@ class WhatsAppPayTests(FundedSlotGateTestCase):
         return self.session.query(WhatsAppPaymentOrder).one()
 
     # ── builder ─────────────────────────────────────────────────────────
+    def test_reference_id_is_fresh_per_checkout_and_within_limits(self):
+        refs = {pay.new_reference_id() for _ in range(500)}
+        self.assertEqual(len(refs), 500)
+        for ref in refs:
+            self.assertRegex(ref, r"^mgv_\d{10}_[0-9a-f]{12}$")
+            self.assertLessEqual(len(ref), 35)      # Meta reference_id; the Razorpay receipt allows 40
+
     def test_builder_matches_meta_order_details_shape(self):
         self._enable()
         ref = pay.new_reference_id()
@@ -101,6 +108,7 @@ class WhatsAppPayTests(FundedSlotGateTestCase):
         self.assertEqual((gw["type"], gw["payment_gateway"]["type"], gw["payment_gateway"]["configuration_name"]),
                          ("payment_gateway", "razorpay", "moraa_studio_razorpay"))
         self.assertEqual(gw["payment_gateway"]["razorpay"]["notes"]["whatsapp_id"], SENDER)
+        self.assertEqual(gw["payment_gateway"]["razorpay"]["receipt"], ref)
         self.assertEqual(p["total_amount"], {"value": 50000, "offset": 100})
         order = p["order"]
         self.assertEqual(order["status"], "pending")
