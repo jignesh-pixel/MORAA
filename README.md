@@ -236,7 +236,7 @@ an optional reference image, via `ImageGenerationManager`
 Customers can also send a photo directly over WhatsApp
 (`POST /api/meta/webhook`). Each image is billed one flat price
 (`WALLET_IMAGE_PRICE_RUPEES`, default ₹500) against the customer's prepaid
-wallet balance before a 7-style catalog pack is generated and delivered
+wallet balance before a full-style catalog pack is generated and delivered
 back over WhatsApp — see `backend/app/services/wallet_service.py` and
 `backend/app/services/meta_whatsapp_service.py`. The wallet-balance check
 is always active; there is no configuration flag to disable it.

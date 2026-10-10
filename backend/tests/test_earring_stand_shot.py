@@ -136,9 +136,10 @@ class StandShotRouteTests(unittest.TestCase):
 
 
 class StandShotPackWiringTests(unittest.TestCase):
-    def test_stand_display_is_the_seventh_and_last_pack_shot(self):
-        self.assertEqual(mws.CATALOG_PACK_STYLES[-1], ("Stand Display", "prompt_stand"))
-        self.assertEqual(len(mws.CATALOG_PACK_STYLES), 7)
+    def test_stand_display_is_the_seventh_pack_shot_followed_by_luxury_drape(self):
+        self.assertEqual(mws.CATALOG_PACK_STYLES[6], ("Stand Display", "prompt_stand"))
+        self.assertEqual(mws.CATALOG_PACK_STYLES[-1], ("Luxury Drape", "prompt_luxury_drape"))
+        self.assertEqual(len(mws.CATALOG_PACK_STYLES), 8)
 
     def test_pack_size_constant_in_config_matches_the_pack(self):
         # config.py cannot import the service (circular); this keeps its "cap below one Pack" warning honest.

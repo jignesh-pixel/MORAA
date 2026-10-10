@@ -1,4 +1,4 @@
-"""E-Com Pack 1: the full 7-shot pack (six original shots + Stand Display). One Pack order generates every style,
+"""E-Com Pack 1: the full 8-shot pack (six original shots + Stand Display + Luxury Drape). One Pack order generates every style,
 with exactly ONE image-generation call per style: no retry and no fallback provider for any style.
 
 All network/AI calls are mocked; no credits are used.
@@ -32,6 +32,7 @@ from app.services.earring_professional_shot_prompt import build_professional_sho
 from app.services.earring_scale_reference_prompt import build_scale_reference_prompt
 from app.services.earring_ugc_style_prompt import build_ugc_style_prompt
 from app.services.earring_on_stand_shot import build_stand_shot_prompt
+from app.services.earring_luxury_drape_shot import build_luxury_drape_prompt
 
 SENDER = "919000000002"
 EXPECTED = [
@@ -42,14 +43,15 @@ EXPECTED = [
     ("Lifestyle Shot", "prompt_complementary"),
     ("UGC Style", "prompt_ugc"),
     ("Stand Display", "prompt_stand"),
+    ("Luxury Drape", "prompt_luxury_drape"),
 ]
 PROMPTS = [build_earring_ecommerce_prompt(), build_close_up_ears_prompt(), build_scale_reference_prompt(),
            build_professional_shot_prompt(), build_complementary_shot_prompt(), build_ugc_style_prompt(),
-           build_stand_shot_prompt()]
+           build_stand_shot_prompt(), build_luxury_drape_prompt()]
 
 
 class PackDefinitionTests(unittest.TestCase):
-    def test_exactly_seven_shots_original_six_first_then_stand(self):
+    def test_exactly_eight_shots_original_six_first_then_stand_then_drape(self):
         self.assertEqual(mws.CATALOG_PACK_STYLES, EXPECTED)
 
     def test_pack_generates_every_style(self):
@@ -57,9 +59,9 @@ class PackDefinitionTests(unittest.TestCase):
         from app.config import Settings
 
         self.assertEqual(mws.pack_generation_count(), len(mws.CATALOG_PACK_STYLES))
-        self.assertEqual(mws.pack_generation_count(), 7)
+        self.assertEqual(mws.pack_generation_count(), 8)
         self.assertEqual(config._PACK_IMAGE_COUNT, mws.pack_generation_count())
-        self.assertIn("generating all 7 styles", mws.CATALOG_PACK_ACK_TEMPLATE)
+        self.assertIn("generating all 8 styles", mws.CATALOG_PACK_ACK_TEMPLATE)
         # No cap left anywhere that could quietly shrink the multi-angle pack the customer paid for.
         self.assertFalse(hasattr(mws, "MAX_IMAGE_CALLS_PER_ORDER"))
         self.assertFalse(hasattr(mws, "MAX_STYLES_PER_PACK"))
@@ -101,7 +103,7 @@ class PackRunTests(unittest.TestCase):
         self.oid = row.id
         db.close()
         self.text = AsyncMock(return_value=True)
-        self.upload = AsyncMock(side_effect=[f"media-{i}" for i in range(1, 8)])
+        self.upload = AsyncMock(side_effect=[f"media-{i}" for i in range(1, len(EXPECTED) + 1)])
         self.deliver = AsyncMock(side_effect=lambda **kw: len(kw["image_urls"]))
         from app.ai import image_generation_manager as igm
         igm._spend_day, igm._spend_count = None, 0  # fresh daily spend counter
@@ -131,7 +133,7 @@ class PackRunTests(unittest.TestCase):
         finally:
             s.close()
 
-    def test_all_seven_shots_generated_once_each_and_delivered(self):
+    def test_all_eight_shots_generated_once_each_and_delivered(self):
         from app.ai.providers.image_base import ImageGenerationResult
 
         gen = AsyncMock(return_value=ImageGenerationResult(
@@ -146,8 +148,8 @@ class PackRunTests(unittest.TestCase):
             self.assertIs(call.kwargs["single_attempt"], True)
             self.assertEqual(call.kwargs["reference_image"], self.photo_bytes)
             self.assertEqual(call.kwargs["context"]["aspect_ratio"], "4:5")
-        self.assertEqual(self.upload.await_count, 7)
-        self.assertEqual(self.deliver.await_args.kwargs["image_urls"], [f"media-{i}" for i in range(1, 8)])
+        self.assertEqual(self.upload.await_count, len(EXPECTED))
+        self.assertEqual(self.deliver.await_args.kwargs["image_urls"], [f"media-{i}" for i in range(1, len(EXPECTED) + 1)])
         # Pack-level charge untouched: no extra debit, no refund.
         self.assertEqual(self._state(), ("delivered", 0, 0))
         self.text.assert_not_awaited()
@@ -169,8 +171,8 @@ class PackRunTests(unittest.TestCase):
             return asyncio.run(mws.process_whatsapp_catalog_pack(self.oid))
 
     def _run_on_drive(self, drive_ok):
-        """Seven styles for a customer with a shared Drive folder; ``drive_ok[i]`` False = Drive refuses style i."""
-        names = iter(range(1, 8))
+        """Eight styles for a customer with a shared Drive folder; ``drive_ok[i]`` False = Drive refuses style i."""
+        names = iter(range(1, len(EXPECTED) + 1))
 
         async def to_drive(image_bytes, customer_id, ingestion_id, style_title):
             index = next(names)
@@ -185,7 +187,7 @@ class PackRunTests(unittest.TestCase):
         return ok, schedule
 
     def test_a_pack_for_a_customer_with_a_drive_folder_stays_out_of_the_chat(self):
-        ok, schedule = self._run_on_drive([True] * 7)
+        ok, schedule = self._run_on_drive([True] * len(EXPECTED))
         self.assertTrue(ok)
         self.deliver.assert_not_awaited()
         self.upload.assert_not_awaited()
@@ -198,37 +200,37 @@ class PackRunTests(unittest.TestCase):
         schedule.assert_called_once_with("cust-1")
 
     def test_styles_drive_could_not_take_are_sent_on_whatsapp_and_the_pack_is_still_whole(self):
-        ok, schedule = self._run_on_drive([True, False, True, True, False, True, True])
+        ok, schedule = self._run_on_drive([True, False, True, True, False, True, True, True])
         self.assertTrue(ok)
         self.assertEqual(self.upload.await_count, 2)                 # only the two Drive could not take go to Meta
         self.assertEqual(len(self.deliver.await_args.kwargs["image_urls"]), 2)
         self.assertEqual(self._state(), ("delivered", 0, 0))
         schedule.assert_called_once_with("cust-1")
 
-    def test_seven_of_seven_is_delivered(self):
-        self.assertTrue(self._run_with([True] * 7))
+    def test_all_of_all_is_delivered(self):
+        self.assertTrue(self._run_with([True] * len(EXPECTED)))
         self.assertEqual(self._state(), ("delivered", 0, 0))
         s = self.Session(); self.assertIsNone(s.get(WhatsAppIngestion, self.oid).error_message); s.close()
         self.text.assert_not_awaited()
 
-    def test_six_of_seven_is_partial_not_delivered(self):
-        self.assertTrue(self._run_with([True, True, False, True, True, True, True]))
-        self.assertEqual(self.upload.await_count, 6)
+    def test_seven_of_eight_is_partial_not_delivered(self):
+        self.assertTrue(self._run_with([True, True, False, True, True, True, True, True]))
+        self.assertEqual(self.upload.await_count, 7)
         # Existing partial status; no extra charge and no refund (existing rule).
         self.assertEqual(self._state(), ("delivered_partial", 0, 0))
-        s = self.Session(); self.assertEqual(s.get(WhatsAppIngestion, self.oid).error_message, "Delivered 6/7 images"); s.close()
-        self.assertIn("6 of 7 images", self.text.await_args.args[1])
+        s = self.Session(); self.assertEqual(s.get(WhatsAppIngestion, self.oid).error_message, "Delivered 7/8 images"); s.close()
+        self.assertIn("7 of 8 images", self.text.await_args.args[1])
 
-    def test_only_the_stand_shot_failing_is_partial_not_delivered(self):
-        self.assertTrue(self._run_with([True] * 6 + [False]))
-        self.assertEqual(self.upload.await_count, 6)
+    def test_only_the_last_shot_failing_is_partial_not_delivered(self):
+        self.assertTrue(self._run_with([True] * 7 + [False]))
+        self.assertEqual(self.upload.await_count, 7)
         self.assertEqual(self._state(), ("delivered_partial", 0, 0))
-        self.assertIn("6 of 7 images", self.text.await_args.args[1])
+        self.assertIn("7 of 8 images", self.text.await_args.args[1])
 
-    def test_one_of_seven_is_partial_not_delivered(self):
-        self.assertTrue(self._run_with([True] + [False] * 6))
+    def test_one_of_eight_is_partial_not_delivered(self):
+        self.assertTrue(self._run_with([True] + [False] * 7))
         self.assertEqual(self._state(), ("delivered_partial", 0, 0))
-        self.assertIn("1 of 7 images", self.text.await_args.args[1])
+        self.assertIn("1 of 8 images", self.text.await_args.args[1])
 
     # ── Daily spend cap (MAX_GENERATIONS_PER_DAY) ──
     def _real_generation(self, cap, already_used=0):
@@ -254,32 +256,32 @@ class PackRunTests(unittest.TestCase):
         shared = spend_counter.used(igm.current_spend_day())      # the shared DB counter when it answers (PostgreSQL)
         return igm._spend_count if shared is None else shared
 
-    def test_pack_runs_all_seven_when_cap_allows(self):
-        ok, provider = self._real_generation(cap=7)
+    def test_pack_runs_all_eight_when_cap_allows(self):
+        ok, provider = self._real_generation(cap=8)
         self.assertTrue(ok)
-        self.assertEqual(provider.await_count, 7)
-        self.assertEqual(self._spend_used(), 7)
+        self.assertEqual(provider.await_count, 8)
+        self.assertEqual(self._spend_used(), 8)
         self.assertEqual(self._state(), ("delivered", 0, 0))
 
-    def test_cap_of_the_old_six_shot_pack_now_blocks_the_whole_pack_and_refunds_once(self):
-        ok, provider = self._real_generation(cap=6)
+    def test_cap_of_the_old_seven_shot_pack_now_blocks_the_whole_pack_and_refunds_once(self):
+        ok, provider = self._real_generation(cap=7)
         self.assertFalse(ok)
-        provider.assert_not_awaited()          # never a 6/7 pack: the reservation is all-or-nothing
+        provider.assert_not_awaited()          # never a 7/8 pack: the reservation is all-or-nothing
         self.assertEqual(self._spend_used(), 0)
         self.assertEqual(self._state(), ("failed", 500, 1))
 
     def test_cap_too_small_blocks_whole_pack_before_any_call_and_refunds_once(self):
         ok, provider = self._real_generation(cap=1)
         self.assertFalse(ok)
-        provider.assert_not_awaited()          # never a 1/7 pack
+        provider.assert_not_awaited()          # never a 1/8 pack
         self.assertEqual(self._spend_used(), 0)  # nothing consumed
         self.assertEqual(self._state(), ("failed", 500, 1))
         self.assertIn("₹500 has been refunded", self.text.await_args.args[1])
 
     def test_partly_used_cap_blocks_the_pack_before_any_call_and_refunds_once(self):
-        ok, provider = self._real_generation(cap=7, already_used=1)
+        ok, provider = self._real_generation(cap=8, already_used=1)
         self.assertFalse(ok)
-        provider.assert_not_awaited()          # 6 slots left cannot hold a 7-style pack
+        provider.assert_not_awaited()          # 7 slots left cannot hold an 8-style pack
         self.assertEqual(self._spend_used(), 1)  # only the pre-used slot
         self.assertEqual(self._state(), ("failed", 500, 1))
         self.assertIn("₹500 has been refunded", self.text.await_args.args[1])

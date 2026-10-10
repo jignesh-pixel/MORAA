@@ -39,9 +39,9 @@ META_MEDIA_UPLOAD_URL = "https://graph.facebook.com/v21.0/{phone_number_id}/medi
 
 SUPPORTED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp"}
 
-# ─── 7-Style Earring Catalog Pack (ordered delivery 1..7) ─────────────────
+# ─── Earring Catalog Pack (ordered delivery 1..N, N = len(CATALOG_PACK_STYLES)) ───
 # Every prompt_type here needs a builder in process_whatsapp_catalog_pack's style_prompt_builders; the pack size
-# (spend reservation, "all N styles" copy, partial-delivery count) follows the length of this list.
+# (spend reservation, "all N styles" copy, partial-delivery count, menu copy) follows the length of this list.
 CATALOG_PACK_STYLES: List[Tuple[str, str]] = [
     ("Clean E-Commerce", "prompt_ecommerce"),
     ("Close-up on Ear", "prompt_close_up"),
@@ -50,6 +50,7 @@ CATALOG_PACK_STYLES: List[Tuple[str, str]] = [
     ("Lifestyle Shot", "prompt_complementary"),
     ("UGC Style", "prompt_ugc"),
     ("Stand Display", "prompt_stand"),
+    ("Luxury Drape", "prompt_luxury_drape"),
 ]
 
 # ─── Image calls per order ────────────────────────────────────────────────
@@ -1995,6 +1996,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
     from app.services.earring_complementary_shot_prompt import build_complementary_shot_prompt
     from app.services.earring_ugc_style_prompt import build_ugc_style_prompt
     from app.services.earring_on_stand_shot import build_stand_shot_prompt
+    from app.services.earring_luxury_drape_shot import build_luxury_drape_prompt
     from app.models.customer import Customer
 
     style_prompt_builders = {
@@ -2005,6 +2007,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         "prompt_complementary": build_complementary_shot_prompt,
         "prompt_ugc": build_ugc_style_prompt,
         "prompt_stand": build_stand_shot_prompt,
+        "prompt_luxury_drape": build_luxury_drape_prompt,
     }
 
     started_at = time.monotonic()

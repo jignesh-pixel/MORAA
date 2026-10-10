@@ -124,7 +124,7 @@ def units_for_retailer_id(retailer_id: Any) -> Optional[int]:
     return parsed[1] if parsed and parsed[0] == SKU_WHITE_BG else None
 
 
-# Catalog Pack (Ecomm Pack 1): one Catalog Pack SKU = one photo's 7-style catalogue pack, sold in the same tiers.
+# Catalog Pack (Ecomm Pack 1): one Catalog Pack SKU = one photo's full-style catalogue pack, sold in the same tiers.
 STUDIO_TITLE = "Studio Shot"
 CREATIVE_TITLE = "Catalog Pack"
 MAX_CART_UNITS = 10000

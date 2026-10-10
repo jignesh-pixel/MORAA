@@ -2062,7 +2062,7 @@ async def receive_webhook(
     description=(
         "Manually retry generation/delivery for an ingestion that failed. "
         "Only works for status 'failed' or 'delivery_failed'. "
-        "Re-runs the 7-style catalog pack and attempts delivery again."
+        "Re-runs the full-style catalog pack and attempts delivery again."
     ),
 )
 def retry_delivery(

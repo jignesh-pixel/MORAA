@@ -9,6 +9,13 @@ from app.services import pricing
 PACK_MENU_BUTTON = "View packs"          # list-message button, 20 characters at most
 
 
+def _pack_styles() -> int:
+    """Photoshoot styles in one Catalog Pack, read from the pack definition so copy never drifts from what is sold."""
+    from app.services.meta_whatsapp_service import pack_generation_count  # lazy: the service imports this module
+
+    return pack_generation_count()
+
+
 def _skus(count: int) -> str:
     """"1 SKU" / "13 SKUs" (never negative)."""
     count = max(int(count), 0)
@@ -54,7 +61,7 @@ def collections_body() -> str:
         "Choose a collection 👇\n\n"
         f"1. {STUDIO_COLLECTION_TITLE}: white-background studio shots, "
         f"{pricing.format_rupees(pricing.sku_price())} per SKU\n"
-        f"2. {CATALOG_COLLECTION_TITLE} (Ecomm Pack 1): 7 jewellery photoshoot styles per photo, "
+        f"2. {CATALOG_COLLECTION_TITLE} (Ecomm Pack 1): {_pack_styles()} jewellery photoshoot styles per photo, "
         f"{pricing.format_rupees(pricing.creative_pack_price())} per SKU\n\n"
         "Tap View Collections, pick one and tap Send."
     )
@@ -66,12 +73,12 @@ def studio_collection_row(db=None) -> str:
 
 
 def catalog_collection_row() -> str:
-    return f"Ecomm Pack 1 · 7 styles · {pricing.format_rupees(pricing.creative_pack_price())} per SKU"
+    return f"Ecomm Pack 1 · {_pack_styles()} styles · {pricing.format_rupees(pricing.creative_pack_price())} per SKU"
 
 
 def catalog_tier_description(units: int) -> str:
     """List row description of one Catalog Pack tier (72 characters at most)."""
-    return f"{_skus(units)} of 7 photoshoot styles · {pricing.format_rupees(units * pricing.creative_pack_price())}"
+    return f"{_skus(units)} of {_pack_styles()} photoshoot styles · {pricing.format_rupees(units * pricing.creative_pack_price())}"
 
 
 def _tiers(unit_price: int) -> str:
@@ -96,7 +103,7 @@ def catalog_pack_body() -> str:
     """Body of the Catalog Pack product list: the SKU tiers and their prices."""
     return (
         f"{_tiers(pricing.creative_pack_price())}\n\n"
-        "1 SKU = 1 photo made in 7 jewellery photoshoot styles. Tap View items, set quantities with + / −, "
+        f"1 SKU = 1 photo made in {_pack_styles()} jewellery photoshoot styles. Tap View items, set quantities with + / −, "
         "then send your cart."
     )
 

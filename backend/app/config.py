@@ -18,8 +18,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Images in a WhatsApp Catalog Pack: one per style in meta_whatsapp_service.CATALOG_PACK_STYLES
 # (= pack_generation_count()); a daily cap below this cannot serve one Pack.
-# Kept equal to len(CATALOG_PACK_STYLES) by tests/test_earring_stand_shot.py.
-_PACK_IMAGE_COUNT = 7
+# A literal because config cannot import the service (circular); kept equal to len(CATALOG_PACK_STYLES) by
+# tests/test_earring_stand_shot.py.
+_PACK_IMAGE_COUNT = 8
 
 
 def _resolve_env_file() -> Optional[str]:
@@ -385,7 +386,7 @@ class Settings(BaseSettings):
     # Trial credits consumed per order (tier = TRIAL). A credit is one
     # complimentary order; the owner sets trial_credits_total per customer.
     TRIAL_CREDITS_PER_WHITE_BG: int = 1   # Clean Studio Shot
-    TRIAL_CREDITS_PER_PACK_1: int = 1     # E-Com Pack 1 (7 images)
+    TRIAL_CREDITS_PER_PACK_1: int = 1     # E-Com Pack 1 (one image per pack style)
 
     # Wallet recharge limits, in whole rupees (read through app/services/pricing.py).
     MIN_RECHARGE_RUPEES: int = 500
@@ -399,7 +400,7 @@ class Settings(BaseSettings):
     # Price of one SKU in whole rupees, GST included. Only the FIRST seed: once scripts/set_price.py has written a
     # price to the price_settings table, the database value is used.
     SKU_PRICE_RUPEES: int = 20
-    # Price of one Catalog Pack SKU (sku_pack_N: one photo in 7 photoshoot styles) in whole rupees, GST included.
+    # Price of one Catalog Pack SKU (sku_pack_N: one photo in every pack photoshoot style) in whole rupees, GST included.
     # Its tiers are N x this price. Kept apart from SKU_PRICE_RUPEES, which prices Studio Shot (studio_sku_N).
     CATALOG_PACK_SKU_PRICE: int = 500
     SKU_PACK_SIZES: str = "1,5,20,50,100"
