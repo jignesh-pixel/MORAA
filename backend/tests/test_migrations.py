@@ -146,7 +146,7 @@ class MigrationChainTests(unittest.TestCase):
         with self.engine.connect() as conn:
             self.assertEqual(conn.execute(text("SELECT count(*) FROM wallet_transactions")).scalar(), 1)
 
-    def test_0022_downgrade_refuses_while_sku_credits_exist(self):
+    def test_phase8_downgrades_refuse_while_sku_credits_exist(self):
         """Credits cannot be rebuilt from anything else, so the downgrade must not drop a non-empty ledger."""
         upgrade_to_head(self.engine)
         with self.engine.begin() as conn:
@@ -155,8 +155,8 @@ class MigrationChainTests(unittest.TestCase):
                 "VALUES ('c-sku', '919000000010', 'S', 'B', 'N/A', 'A', 0)"
             ))
             conn.execute(text(
-                "INSERT INTO customer_sku_credits (id, customer_id, sku, action, quantity, reference_id, created_at) "
-                "VALUES ('k1', 'c-sku', 'PACK_10', 'purchase', 10, 'pay_test1', CURRENT_TIMESTAMP)"
+                "INSERT INTO customer_sku_credits (id, customer_id, sku, action, quantity, balance_after, reference_id, created_at) "
+                "VALUES ('k1', 'c-sku', 'white_bg', 'purchase', 10, 10, 'pay_test1', CURRENT_TIMESTAMP)"
             ))
         with self.assertRaises(RuntimeError):
             _downgrade(self.engine, "0021_chat_dashboard")

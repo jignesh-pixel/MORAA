@@ -10,9 +10,10 @@ from reportlab.lib import colors
 def generate_invoice_pdf(
     customer_name: str,
     invoice_number: str,
-    amount: int = 500,
+    amount: int,
+    description: str = "Wallet Credit Recharge (Moraa AI Transformation)",
 ) -> bytes:
-    """Generate a clean Moraa Studio receipt/invoice in memory."""
+    """Generate a clean Moraa Studio receipt/invoice in memory. ``description`` is the one item line (what was bought)."""
     buffer = io.BytesIO()
     p = canvas.Canvas(buffer, pagesize=letter)
     width, height = letter
@@ -52,7 +53,7 @@ def generate_invoice_pdf(
     p.drawRightString(width - 60, table_top - 20, "Amount (INR)")
 
     p.setFont("Helvetica", 10)
-    p.drawString(60, table_top - 55, "Wallet Credit Recharge (Moraa AI Transformation)")
+    p.drawString(60, table_top - 55, description)
     p.drawRightString(width - 60, table_top - 55, f"₹{amount}.00")
 
     p.setStrokeColor(colors.HexColor("#DDDDDD"))

@@ -29,12 +29,12 @@ LINK_CHECK_WINDOW = timedelta(days=3)
 LINK_MIN_AGE = timedelta(minutes=2)
 BACKOFF_BASE_SECONDS = 120
 BACKOFF_CAP_SECONDS = 6 * 3600       # 2 min, 4, 8 ... up to 6 hours: about ten looks per link over three days
-# Results of process_razorpay_event after which a link needs no further checks: the money is credited, belongs to
-# the WhatsApp Pay path, or is parked in pending_payments / the review rows for a person. Anything else
-# (credit_failed after repeated errors, unparseable, ignored) is looked at again after the backoff.
+# Results of process_razorpay_event after which a link needs no further checks: the money is credited (wallet rupees
+# or SKU pack credits), belongs to the WhatsApp Pay path, or is parked in pending_payments / the review rows for a
+# person. Anything else (credit_failed after repeated errors, unparseable, ignored) is looked at again after the backoff.
 _TERMINAL_RESULTS = frozenset({
     "ok", "already_processed", "whatsapp_pay_order", "whatsapp_pay_order_review", "missing_phone",
-    "unsupported_currency",
+    "unsupported_currency", "pack_units_invalid",
 })
 SWEEP_BATCH = 50
 LOOKUP_TIMEOUT_SECONDS = 10.0

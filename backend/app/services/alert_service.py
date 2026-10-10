@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import List
 
-from sqlalchemy import func
+from sqlalchemy import func, literal
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -141,7 +141,40 @@ def evaluate_alerts(db: Session) -> List[Alert]:
                 f"failures and need a look.",
             ))
 
-    for check in (failure_rate, spend, parked_payments, review_rows, stuck_orders, dead_jobs, daily_cost):
+    def drive_fallbacks() -> None:
+        from app.models.outbox_job import DEAD, OutboxJob
+        from app.models.whatsapp_ingestion import WhatsAppIngestion
+        from app.services.drive_delivery import CHANNEL_WHATSAPP, OUTBOX_KIND
+
+        since = datetime.now(timezone.utc) - timedelta(hours=24)
+        jobs = db.query(OutboxJob).filter(OutboxJob.kind == OUTBOX_KIND, OutboxJob.updated_at >= since)
+        dead = jobs.filter(OutboxJob.status == DEAD).count()
+        fallbacks = jobs.join(WhatsAppIngestion, OutboxJob.dedupe_key == literal("drive:deliver:") + WhatsAppIngestion.id) \
+            .filter(WhatsAppIngestion.delivery_channel == CHANNEL_WHATSAPP).count()
+        if dead or fallbacks:
+            alerts.append(Alert(
+                "drive_fallbacks",
+                f"Moraa alert: in the last 24 hours {fallbacks} image(s) meant for Google Drive were sent on WhatsApp "
+                f"instead and {dead} Drive upload job(s) gave up. Check the Google Drive service account and quota.",
+            ))
+
+    def stuck_drive_pending() -> None:
+        from app.models.whatsapp_ingestion import WhatsAppIngestion
+        from app.services.drive_delivery import DRIVE_PENDING_PATIENCE, STATUS_DRIVE_PENDING
+
+        cutoff = datetime.now(timezone.utc) - DRIVE_PENDING_PATIENCE
+        count = db.query(func.count(WhatsAppIngestion.id)).filter(
+            WhatsAppIngestion.status == STATUS_DRIVE_PENDING, WhatsAppIngestion.updated_at < cutoff,
+        ).scalar()
+        if count:
+            alerts.append(Alert(
+                "drive_pending_stuck",
+                f"Moraa alert: {count} finished image(s) have waited over 3 hours to go into Google Drive. The "
+                f"recovery job sends them on WhatsApp, but Drive delivery is not keeping up.",
+            ))
+
+    for check in (failure_rate, spend, parked_payments, review_rows, stuck_orders, dead_jobs, daily_cost,
+                  drive_fallbacks, stuck_drive_pending):
         guarded(check)
     return alerts
 

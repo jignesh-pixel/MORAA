@@ -58,12 +58,13 @@ class FlowParsingTests(unittest.TestCase):
     def test_g_button_reply_and_other_interactive_unchanged(self):
         btn = {"type": "interactive", "id": "wamid.b", "from": SENDER, "timestamp": "1",
                "interactive": {"type": "button_reply", "button_reply": {"id": "gv_white:x", "title": "t"}}}
-        lst = {"type": "interactive", "id": "wamid.l", "from": SENDER, "timestamp": "1",
-               "interactive": {"type": "list_reply", "list_reply": {"id": "a"}}}
-        ev = parse_webhook_entry(_payload(btn, lst)["entry"][0])
+        other = {"type": "interactive", "id": "wamid.l", "from": SENDER, "timestamp": "1",
+                 "interactive": {"type": "product_list", "product_list": {}}}
+        ev = parse_webhook_entry(_payload(btn, other)["entry"][0])
         self.assertEqual(ev[0]["subtype"], "button_reply")
         self.assertEqual(ev[0]["button_reply"], {"id": "gv_white:x", "title": "t"})
-        self.assertEqual((ev[1]["type"], ev[1]["raw_type"]), ("unsupported", "interactive:list_reply"))
+        # list_reply is parsed since Phase 8 (tests/test_pack_menu.py); other interactive kinds stay unsupported.
+        self.assertEqual((ev[1]["type"], ev[1]["raw_type"]), ("unsupported", "interactive:product_list"))
 
 
 class FlowSenderTests(unittest.IsolatedAsyncioTestCase):
@@ -195,30 +196,42 @@ class FlowWebhookTests(FundedSlotGateTestCase):
         self.assertEqual(self.cta.await_count, 1)
 
     def test_i_hi_sends_flow_for_new_user(self):
+        # ONE message: the Flow carries the welcome copy as its body (no separate welcome text).
         self._post(_text("Hi"))
         self.flow.assert_awaited_once_with(SENDER)
-        self.assertEqual(len(self.sent_texts), 1)
-        self.assertTrue(self.sent_texts[0].startswith("Welcome to Moraa Studio"))
+        self.assertEqual(self.sent_texts, [])
+        self.assertEqual(mws.REGISTRATION_FLOW_BODY, mws.WELCOME_MESSAGE)
+        self.assertEqual(mws.REGISTRATION_FLOW_CTA, "Setup Account")
 
     def test_j_hi_falls_back_to_text_when_flow_not_sent(self):
         self.flow.return_value = False  # unconfigured Flow ID or Meta rejection
         self._post(_text("Hi"))
-        self.assertEqual(len(self.sent_texts), 2)
-        self.assertTrue(self.sent_texts[1].startswith("Quick Setup 📋\n\nPlease reply with your details:"))
+        self.assertEqual(len(self.sent_texts), 1)
+        self.assertTrue(self.sent_texts[0].startswith("Welcome to Moraa Studio"))
+        self.assertIn("Quick Setup 📋\n\nPlease reply with your details:", self.sent_texts[0])
 
     def test_j_real_sender_without_flow_id_falls_back(self):
         self.flow.side_effect = mws.send_registration_flow  # real helper, unconfigured
         with patch.object(settings, "META_REGISTRATION_FLOW_ID", ""):
             self._post(_text("Hi"))
-        self.assertEqual(len(self.sent_texts), 2)
-        self.assertTrue(self.sent_texts[1].startswith("Quick Setup"))
+        self.assertEqual(len(self.sent_texts), 1)
+        self.assertIn("Quick Setup", self.sent_texts[0])
 
-    def test_registered_customer_hi_is_unchanged(self):
+    def test_registered_customer_hi_gets_a_welcome_back_not_the_form(self):
         _make_customer(self.session, balance=500)
         self._post(_text("hello"))
         self.flow.assert_not_awaited()
-        self.assertEqual(len(self.sent_texts), 2)
-        self.assertTrue(self.sent_texts[1].startswith("Quick Setup"))
+        self.assertEqual(self.sent_texts, ["Welcome back, Ananya! 👋\n\nWallet Balance: ₹500\n\n"
+                                           "Send your jewelry photo whenever you're ready 📸"])
+
+    def test_unregistered_customer_row_still_gets_the_flow(self):
+        # A row without a finished registration (payment-only placeholder, or a GSTIN awaiting Re-enter / Skip).
+        cust = _make_customer(self.session, balance=500)
+        cust.is_registered = False
+        self.session.commit()
+        self._post(_text("hi"))
+        self.flow.assert_awaited_once_with(SENDER)
+        self.assertEqual(self.sent_texts, [])
 
 
 if __name__ == "__main__":

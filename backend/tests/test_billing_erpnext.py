@@ -153,6 +153,19 @@ class ERPNextServiceTests(_ERPTestBase):
         fake = FakeERPNext(fail="timeout")
         self.assertIsNone(self._run(fake, lambda: _service().create_paid_invoice_pdf(SENDER, "X", None, 500, "pay_T")))
 
+    def test_a_suspended_site_402_fails_on_the_first_call(self):
+        # Live 2026-10-09: the expired Frappe Cloud site answers every request with 402 Payment Required.
+        fake = FakeERPNext()
+        fake.handler = lambda request: (fake.calls.append(request.url.path), httpx.Response(402, text="<html>"))[1]
+        self.assertIsNone(self._run(fake, lambda: _service().create_paid_invoice_pdf(SENDER, "X", None, 500, "pay_S")))
+        self.assertEqual(len(fake.calls), 1)                      # no further calls after the first refusal
+
+    def test_every_call_is_capped_at_two_seconds_by_default(self):
+        timeout = _service().timeout
+        self.assertEqual((timeout.connect, timeout.read, timeout.write, timeout.pool), (2.0, 2.0, 2.0, 2.0))
+        with patch.object(settings, "ERPNEXT_HTTP_TIMEOUT_SECONDS", 5.0):
+            self.assertEqual(_service().timeout.read, 5.0)
+
     def test_not_configured_is_noop(self):
         fake = FakeERPNext()
         svc = ERPNextService(base_url="", api_key="", api_secret="", company="")
@@ -189,13 +202,14 @@ class BillingDispatchTests(_ERPTestBase):
         kwargs = svc.create_paid_invoice_pdf.await_args.kwargs
         self.assertEqual((kwargs["customer_name"], kwargs["gstin"], kwargs["payment_id"]), ("Moraa Jewels", None, "pay_XYZ9"))
 
-    def test_erpnext_failure_sends_no_local_invoice_and_asks_for_a_retry(self):
-        # ERPNext is the only source of invoice numbers: no second numbering series from a local PDF.
+    def test_erpnext_without_an_invoice_sends_the_local_receipt_at_once(self):
+        # ERPNext down / suspended (402) / timed out: the customer is not left waiting on outbox retries.
         for result, exc in ((None, None), (None, RuntimeError("boom"))):
             outcome, local, send, _ = self._dispatch(erp_result=result, erp_exc=exc)
-            self.assertEqual(outcome, "failed")
-            local.assert_not_called()
-            send.assert_not_awaited()
+            self.assertEqual(outcome, "local")
+            local.assert_called_once()
+            self.assertEqual(send.await_count, 1)
+            self.assertEqual(send.await_args.kwargs["document_bytes"], b"%PDF local")
 
     def test_a_failed_whatsapp_send_of_the_erpnext_pdf_is_retried_not_replaced(self):
         outcome, local, send, _ = self._dispatch(erp_result=(PDF, "ACC-SINV-0001"), send_ok=False)

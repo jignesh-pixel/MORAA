@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phase 8 Developer Plan</title>
+<style>
+  :root { --fg:#1a2230; --muted:#5b6474; --line:#d8dde5; --bg:#ffffff; --code:#eef1f5; --accent:#1c5a7b; }
+  body { font: 15px/1.6 "Segoe UI", "Helvetica Neue", Arial, sans-serif; color: var(--fg); background: var(--bg); max-width: 980px; margin: 0 auto; padding: 32px 20px 80px; }
+  h1 { font-size: 30px; margin: 0 0 4px; } h2 { font-size: 21px; margin: 36px 0 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+  h3 { font-size: 16px; margin: 20px 0 6px; } p, li { max-width: 74ch; } .muted { color: var(--muted); }
+  code { font-family: Consolas, "SFMono-Regular", monospace; font-size: 0.88em; background: var(--code); padding: 0 4px; border-radius: 3px; }
+  pre { background: var(--code); padding: 12px 14px; border-radius: 4px; overflow-x: auto; font-size: 13px; line-height: 1.45; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; margin: 8px 0 14px; }
+  th, td { border: 1px solid var(--line); padding: 6px 9px; text-align: left; vertical-align: top; }
+  th { background: #f4f6f9; font-weight: 600; }
+  .box { border: 1px solid var(--line); border-radius: 6px; padding: 10px 14px; background: #fafbfc; }
+  ul.check { list-style: none; padding-left: 0; } ul.check li::before { content: "☐ "; color: var(--accent); }
+  @media print { body { max-width: none; padding: 0; } h2 { break-after: avoid; } table, pre { break-inside: avoid; } }
+</style>
+</head>
+<body>
+
+<h1>Phase 8 Developer Plan</h1>
+<p class="muted">SKU packs, WhatsApp catalogue and per-customer Google Drive delivery · branch <code>phase-8-sku-drive</code> from <code>b9a971b</code> · written 7 Oct 2026 before the code, updated 8 Oct 2026 to match what was built (see "As built" below)</p>
+
+<div class="box">
+<p><strong>As built (differences from the first version of this plan).</strong></p>
+<ul>
+  <li><strong>Cart:</strong> the WhatsApp catalogue cart can mix SKU bundles (<code>pack_5/20/50/100</code>, <code>pack_1</code> hidden) and <strong>Creative Studio Pack 1</strong> (<code>creative_pack_1</code>, 7 photoshoot styles, priced like the Full Catalog Pack). One link for the grand total; message "Your Cart is ready! / Total SKUs / Total Amount (incl. GST)" with a "💳 Pay via Razorpay" button. Link notes: <code>purpose</code>, <code>units</code>, <code>total_skus</code>, <code>creative_packs</code>, <code>phone</code>, <code>cart_summary</code>.</li>
+  <li><strong>Two credit types:</strong> the ledger keeps white-background credits and Creative Studio Pack credits apart (column <code>sku</code>; per-SKU balance, expiry and claw-back). A photo from a customer with only white credits is processed straight away; a customer with Creative credits gets the two buttons, and the tapped product uses its credit before any wallet money.</li>
+  <li><strong>After registration</strong> (packs on): "You're all set" + the collections message (WhatsApp native catalogue when <code>META_CATALOG_ID</code> is set, else the list menu). The registration Flow asks Name, Business, Email (required) and Address, GSTIN (optional).</li>
+  <li><strong>Safety rules added by the audit:</strong> a pack payment is honoured only if it matches a pack link we created (purpose, units, amount); pack links expire after 48 hours; images and invoices go to Drive only when the customer's folder is shared with their email (otherwise WhatsApp as before, and a share is queued).</li>
+  <li><strong>Schema:</strong> 0022 was already pushed, so Phase 8 additions are in <code>0023_sku_packs_drive</code>.</li>
+  <li><strong>Template:</strong> <code>BATCH_NOTIFY_TEMPLATE_NAME</code> defaults to <code>sku_batch_ready</code> (must be approved by Meta).</li>
+  <li>Audit results and open items: <code>docs/PHASE_8_AUDIT_REPORT.html</code>.</li>
+</ul>
+</div>
+
+<div class="box">
+<p><strong>In one paragraph.</strong> Customers buy white-background e-com packs of 1, 5, 20, 50 or 100 SKUs at a flat ₹20 per SKU (GST included) through one Razorpay payment link. Paid SKUs go into a credit ledger that is separate from the rupee wallet. Each photo they then send uses one credit and makes one white-background image. Finished images go into the customer's own folder in the business Google Workspace shared drive, not into the chat. When nothing is left in progress, the customer gets one WhatsApp message with the day's folder link and the SKUs left. Everything new is switched off by default (<code>SKU_PACKS_ENABLED=false</code>, <code>DRIVE_DELIVERY_ENABLED=false</code>), so production behaves exactly as today until the owner switches it on.</p>
+</div>
+
+<h2>1. Business rules</h2>
+<ul>
+  <li>Pack sizes 1, 5, 20, 50, 100 (a setting). The 1-SKU pack works in code but is hidden from menus unless <code>ECOM_PACK1_ENABLED=true</code>.</li>
+  <li>Price ₹20 per SKU including GST, flat. It lives in the database (<code>price_settings</code>); <code>python scripts/set_price.py --sku-price 25</code> changes it with no code change or restart. Packs already paid keep the credits they bought; new links use the new price from that moment.</li>
+  <li>1 SKU = 1 white-background shot = 1 credit. Credits are valid for 90 days; buying another pack extends every unused credit to 90 days from that purchase.</li>
+  <li>A failed image gives its credit back (exactly once). The customer re-sends the photo for free.</li>
+  <li>Delivery goes to Drive. If the Drive upload still fails after 6 outbox attempts, the image is sent on WhatsApp as today. Only if that also fails is the credit given back. Nobody is left without their image or their credit.</li>
+  <li>Folder <code>{phone}/</code> is shared with the customer's email (reader). If Google refuses (for example a non-Google address and outside sharing is blocked), the folder stays private, the customer is asked for a Google email, and an alert is raised. "Anyone with the link" is never used.</li>
+  <li>Email is collected at registration (Flow field, or by sending it in chat). Orders are never blocked for a missing email: the folder is created anyway and shared once the email arrives.</li>
+  <li>Delivered images are deleted from Drive after 90 days. Invoices stay (8-year accounting rule).</li>
+  <li>The wallet (rupees), the ₹50 Studio Shot and the ₹500 Catalog Pack keep working unchanged for customers who use them.</li>
+</ul>
+
+<h2>2. How it works</h2>
+<h3>Buying a pack</h3>
+<pre>customer taps a pack in the catalogue / list menu  (Meta "order" or "list_reply" message, retailer id pack_N)
+  -> server computes the price itself (Meta cart prices are ignored)
+  -> one Razorpay payment link, notes {whatsapp_id, purpose: "sku_pack", units}; recorded in razorpay_payment_links (purpose, units)
+  -> Razorpay webhook / link-reconcile sweep: same once-only claim as today (audit "razorpay_payment_captured")
+       purpose == sku_pack -> sku_packs.grant_pack_credits(units)   (wallet_balance untouched)
+  -> receipt "20 SKUs added, valid till 6 Jan 2027" + invoice job + Usage Logs sync + folder share job</pre>
+<h3>Sending photos</h3>
+<pre>photo arrives -> stored (unchanged) -> customer has credits?
+   yes -> consume_credit + status white_queued + credit_source "sku"  (ONE transaction, like the wallet debit today)
+          -> "Photo received, 13 SKUs left" -> order run (outbox) -> process_whatsapp_white_bg (prompt unchanged)
+   no  -> today's flow (buttons for wallet customers); with SKU_PACKS_ENABLED and no funds: pack menu instead of recharge</pre>
+<h3>Delivering</h3>
+<pre>image generated
+   DRIVE_DELIVERY_ENABLED and Drive configured
+      -> image kept on local disk, status "drive_pending", outbox job "drive_deliver"
+      -> upload to {phone}/Images/{7 Oct 2026}/007.png (streamed, resumable upload) -> status "delivered", delivery_channel "drive"
+      -> "batch_notify" job (debounced BATCH_NOTIFY_DELAY_SECONDS): when the customer has nothing in progress,
+         ONE message: day-folder link + SKUs left (utility template if outside the 24-hour window)
+      -> job dead after 6 attempts -> send on WhatsApp as today (delivery_channel "whatsapp"); that fails too -> credit back
+   otherwise -> exactly today's WhatsApp delivery</pre>
+
+<h2>3. Data model</h2>
+<p>Migration <code>0022_phase8_foundations</code> (already on <code>main</code>): wider status/product/resource columns, <code>customers.email</code> and Drive id columns, <code>price_settings</code>, <code>customer_sku_credits</code>. 0022 is already pushed, so Phase 8 additions go into a new migration <code>0023_sku_packs_drive</code>:</p>
+<table>
+<tr><th>Table</th><th>0023 change</th><th>Why</th></tr>
+<tr><td><code>customer_sku_credits</code></td><td>Rebuilt (only if empty) with <code>balance_after</code> (CHECK &gt;= 0) and <code>expires_at</code>; keeps UNIQUE(<code>reference_id</code>, <code>action</code>), CHECK quantity &lt;&gt; 0</td><td>The database refuses a negative balance and a second grant/consume/refund for the same reference</td></tr>
+<tr><td><code>price_settings</code></td><td>+ <code>effective_from</code>, <code>changed_by</code></td><td>Current price with who/when; every change also writes an audit row (<code>price_changed</code>), which is the history</td></tr>
+<tr><td><code>whatsapp_ingestions</code></td><td>+ <code>credit_source</code> (wallet/sku/trial/admin), <code>delivery_channel</code> (whatsapp/drive), <code>drive_file_id</code></td><td>Refund the right thing; retention finds Drive images</td></tr>
+<tr><td><code>razorpay_payment_links</code></td><td>+ <code>purpose</code> (NULL = wallet recharge, <code>sku_pack</code>), <code>units</code></td><td>Reconcile sweep knows what a link was for</td></tr>
+<tr><td><code>invoice_records</code></td><td>+ <code>drive_file_id</code>, <code>drive_link</code></td><td>Invoice PDF in <code>{phone}/Invoices/</code></td></tr>
+</table>
+<p>Ledger rule: a customer's credits = <code>SUM(quantity)</code> = <code>balance_after</code> of the newest row. Actions: <code>purchase</code> (+units, reference = payment id), <code>consume</code> (−1, reference = ingestion id), <code>refund</code> (+1, reference = ingestion id), <code>expire</code> (−balance), <code>clawback</code> (−n, reference = Razorpay refund/dispute id). The Usage Logs sheet is only a view of this table and can be rebuilt at any time.</p>
+
+<h2>4. Settings (all in <code>backend/app/config.py</code>, documented in <code>docs/ENV_TO_ADD.md</code>)</h2>
+<table>
+<tr><th>Setting</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>SKU_PACKS_ENABLED</code></td><td>false</td><td>Pack menus, catalogue orders, pack links. Paid credits are always honoured, even when off.</td></tr>
+<tr><td><code>SKU_PRICE_RUPEES</code></td><td>20</td><td>First seed of the per-SKU price (the database value wins once set)</td></tr>
+<tr><td><code>SKU_PACK_SIZES</code></td><td>1,5,20,50,100</td><td>Pack sizes that can be bought</td></tr>
+<tr><td><code>ECOM_PACK1_ENABLED</code></td><td>false</td><td>Show the 1-SKU pack in menus</td></tr>
+<tr><td><code>SKU_GST_PERCENT</code></td><td>18</td><td>For the net + tax split of the GST-inclusive price</td></tr>
+<tr><td><code>SKU_CREDIT_VALIDITY_DAYS</code></td><td>90</td><td>Credit validity</td></tr>
+<tr><td><code>SKU_ERPNEXT_ITEM_CODE</code></td><td>(empty)</td><td>ERPNext item for packs (falls back to the recharge item)</td></tr>
+<tr><td><code>MIN_RECHARGE_RUPEES</code> / <code>MAX_RECHARGE_RUPEES</code></td><td>500 / 50000</td><td>Wallet recharge limits (were hard-coded)</td></tr>
+<tr><td><code>DRIVE_DELIVERY_ENABLED</code></td><td>false</td><td>Deliver white-background images to Drive</td></tr>
+<tr><td><code>GOOGLE_SA_KEY_FILE</code></td><td>(empty)</td><td>Path to the service-account JSON key (never logged)</td></tr>
+<tr><td><code>DRIVE_SHARED_DRIVE_ID</code></td><td>(empty)</td><td>The business shared drive</td></tr>
+<tr><td><code>DRIVE_IMAGES_RETENTION_DAYS</code></td><td>90</td><td>Delete delivered Drive images after this</td></tr>
+<tr><td><code>BATCH_NOTIFY_DELAY_SECONDS</code></td><td>60</td><td>Quiet time before the one "ready" message</td></tr>
+<tr><td><code>BATCH_NOTIFY_TEMPLATE_NAME</code> / <code>_LANG</code></td><td>(empty) / en</td><td>Approved utility template for out-of-window notices; empty = log and alert only</td></tr>
+<tr><td><code>META_CATALOG_ID</code></td><td>(empty)</td><td>Catalogue that <code>set_price.py</code> updates</td></tr>
+</table>
+<p>Retired: <code>GOOGLE_DRIVE_CLIENT_ID</code>, <code>GOOGLE_DRIVE_CLIENT_SECRET</code>, <code>GOOGLE_DRIVE_REFRESH_TOKEN</code> (personal OAuth). The dashboard archive (<code>drive_archive.py</code>, <code>DRIVE_ENABLED</code>, <code>DRIVE_FOLDER_ID</code>) moves onto the same service account and shared drive. An old <code>.env</code> that still has the retired keys loads fine.</p>
+
+<h2>5. Files and functions</h2>
+<table>
+<tr><th>File</th><th>Contents</th></tr>
+<tr><td><code>app/services/pricing.py</code> (new)</td><td>The only code that knows prices: <code>sku_price()</code>, <code>pack_sizes()</code>, <code>menu_pack_sizes()</code>, <code>pack_total(units)</code>, <code>gst_split(total)</code>, <code>erpnext_pack_line(units, unit_price)</code>, <code>white_bg_price()</code>, <code>catalog_pack_price()</code>, <code>min_recharge()</code>, <code>max_recharge()</code>, <code>format_rupees()</code>, <code>pack_title()</code>, <code>pack_retailer_id()</code>, <code>units_for_retailer_id()</code>, <code>set_sku_price()</code>, <code>price_summary()</code></td></tr>
+<tr><td><code>scripts/set_price.py</code> (new)</td><td><code>--sku-price N [--by NAME] [--dry-run]</code>: writes the price + audit row, then pushes catalogue prices through the Graph API when <code>META_CATALOG_ID</code> and the token are set (else prints the manual step)</td></tr>
+<tr><td><code>app/services/sku_packs.py</code> (new)</td><td><code>balance()</code>, <code>valid_until()</code>, <code>grant_pack_credits()</code>, <code>consume_credit()</code>, <code>refund_credit()</code>, <code>expire_due_credits()</code>, <code>claw_back_pack()</code>; row lock on the customer for every change</td></tr>
+<tr><td><code>app/services/google_drive.py</code> (new)</td><td>Service-account JWT token, Drive + Sheets REST calls with retry on 403-rate/429/5xx, folders, resumable streamed upload, permissions, rename, delete, sheet append/clear</td></tr>
+<tr><td><code>app/services/drive_layout.py</code> (new)</td><td>Customer folder set (stored ids, guarded update, per-customer lock), day folder, next number <code>007.png</code>, upload delivery image, upload invoice, share to email, customer erasure, retention delete</td></tr>
+<tr><td><code>app/services/usage_log.py</code> (new)</td><td>Usage Logs sheet = ledger rows; <code>sync()</code> appends what is missing, <code>rebuild()</code> rewrites it</td></tr>
+<tr><td><code>app/services/drive_delivery.py</code> (new)</td><td>Outbox job <code>drive_deliver</code> + dead-job fallback to WhatsApp</td></tr>
+<tr><td><code>app/services/batch_notify.py</code> (new)</td><td>Debounced one-message notifier (<code>batch_notify</code> outbox job)</td></tr>
+<tr><td><code>app/services/sku_messages.py</code> (new)</td><td>Customer-facing copy for menus, collections, cart summary, receipts, "photo received", "ready", "send your email", "buy more"</td></tr>
+<tr><td><code>scripts/set_price.py</code> + <code>pricing.quote_cart()</code></td><td>Cart pricing on the server (Meta prices ignored); catalogue price push</td></tr>
+<tr><td><code>meta_whatsapp_service.py</code></td><td>Parse <code>order</code> and <code>list_reply</code>; send list and template messages; white-background worker hands delivery to Drive when enabled</td></tr>
+<tr><td><code>meta_webhook.py</code></td><td>Short branches: pack menu/list/order handling, credit consumption at photo intake, email in the Flow</td></tr>
+<tr><td><code>payment_routes.py</code>, <code>razorpay_service.py</code>, <code>razorpay_link_reconcile.py</code>, <code>wallet_service.py</code></td><td>Pack links, pack grant inside the once-only claim, refund/dispute claw-back of credits</td></tr>
+<tr><td><code>billing_service.py</code>, <code>erpnext_service.py</code></td><td>Pack invoice (qty × unit price), PDF into <code>Invoices/</code> named <code>2026-10-07 INV-xxxx.pdf</code>, link text; WhatsApp document only as fallback</td></tr>
+<tr><td><code>data_lifecycle.py</code></td><td>Drive image retention (90 days), erasure of Drive images and usage log, unshare, rename root to <code>erased-&lt;id&gt;</code>, keep invoices; refuse erasure while credits remain</td></tr>
+<tr><td><code>outbox.py</code></td><td>New kinds <code>drive_deliver</code>, <code>drive_share</code>, <code>usage_log_sync</code>, <code>batch_notify</code>; optional "on dead" hook per kind</td></tr>
+<tr><td><code>dashboard_service.py</code>, <code>alert_service.py</code></td><td>Packs sold, credits outstanding, Drive link per customer; alerts for Drive failures, share refusals, fallbacks</td></tr>
+</table>
+
+<h2>6. Build steps and acceptance checks</h2>
+<table>
+<tr><th>#</th><th>Step</th><th>Done when</th></tr>
+<tr><td>1</td><td>Settings, migration 0023, models, <code>pricing.py</code>, <code>set_price.py</code>, outbox kinds</td><td>Migration tests pass on SQLite and PostgreSQL (parity unchanged); price change visible on the next link</td></tr>
+<tr><td>2</td><td>Credits and payments</td><td>Duplicate webhook / reconcile grants once; 40 SKUs = one ₹800 link; refund of a pack payment takes credits back, shortfall flagged</td></tr>
+<tr><td>3</td><td>Drive core</td><td>Four concurrent workers create exactly one folder set; sheet rows match the ledger and re-sync adds no duplicates; refusal to share never creates a public link</td></tr>
+<tr><td>4</td><td>Customer flow</td><td>List reply and catalogue order produce one link; email from the Flow is stored; Pack 1 hidden unless enabled</td></tr>
+<tr><td>5</td><td>Integration: intake, delivery, notifier, refunds, sweeps</td><td>100 photos with 20 credits consume exactly 20; failed image restores one credit; Drive failure falls back to WhatsApp; both failing refunds once; one ready message per batch</td></tr>
+<tr><td>6</td><td>Invoices, retention, erasure, dashboard, alerts</td><td>Erasure keeps invoices and removes images; retention deletes 90-day-old Drive images only</td></tr>
+<tr><td>7</td><td>Tests, rupee guard, gate</td><td>No rupee amount hard-coded outside <code>pricing.py</code> (config seeds excepted); full suite on SQLite and PostgreSQL; prompt snapshot <code>changed: 0</code></td></tr>
+</table>
+
+<h2>7. The 15 aspects</h2>
+<table>
+<tr><th>Aspect</th><th>What Phase 8 does</th></tr>
+<tr><td>1 Architecture</td><td>New logic in new modules; the two big files only get short branches. Prompt builders untouched.</td></tr>
+<tr><td>2 Concurrency</td><td>Customer folders: stored ids + guarded UPDATE (loser deletes its copy) + per-customer lock. Credits: customer row lock + CHECK balance_after &gt;= 0. SKU photo runs bounded (BULK_CONCURRENCY per process).</td></tr>
+<tr><td>3 Queueing</td><td>Drive uploads, sharing, sheet rows, invoices and the ready message go through <code>outbox_jobs</code> (6 attempts, back-off 30 s → 1 h).</td></tr>
+<tr><td>4 Outside services</td><td>Drive/Sheets REST with service account; Razorpay link <code>purpose=sku_pack</code>; Meta <code>order</code>/<code>list_reply</code>.</td></tr>
+<tr><td>5 Data</td><td>Migrations 0022 + 0023 (section 3).</td></tr>
+<tr><td>6 Money</td><td>Separate credit ledger, once-only per reference; wallet untouched by packs; sheet is a derived view.</td></tr>
+<tr><td>7 Security</td><td>Key file path only, never logged; server-side prices; folder shared to the customer's email only; Drive ids not logged.</td></tr>
+<tr><td>8 Privacy</td><td>Erasure removes images and usage log, unshares, renames root, keeps invoices; refused while credits remain. Consent text prepared, not switched on.</td></tr>
+<tr><td>9 Observability</td><td>Metrics and alerts for Drive failures, WhatsApp fallbacks, share refusals; dashboard shows packs and credits.</td></tr>
+<tr><td>10 Config</td><td>Section 4; everything new is off by default.</td></tr>
+<tr><td>11 Deployment</td><td>Migrate first (0009-0023), then start the code. Google setup checklist below. Flag-gated rollout.</td></tr>
+<tr><td>12 Testing</td><td>Drive/Sheets fakes with <code>httpx.MockTransport</code>; SQLite + PostgreSQL; existing tests updated where they mocked delivery or hard-coded prices.</td></tr>
+<tr><td>13 Cost</td><td>Daily generation cap and spend counter unchanged; sheet rows coalesced per run; WhatsApp image sends drop to almost zero.</td></tr>
+<tr><td>14 Maintainability</td><td>New files, short commented hooks, one place for prices and one for message copy.</td></tr>
+<tr><td>15 Customer experience</td><td>Menu, pack receipt, "photo received, N left", one "ready + link + N left", "send your email", "buy more".</td></tr>
+</table>
+
+<h2>8. Outside setup</h2>
+<h3>Google (business Workspace only)</h3>
+<ol>
+  <li>Create a shared drive (for example "Moraa Customers"). In the Admin console allow sharing outside the organisation for it, and with non-Google accounts if wanted.</li>
+  <li>In Google Cloud under the business organisation: enable the Drive API and the Sheets API, create a service account, download its JSON key.</li>
+  <li>Add the service account's email to the shared drive as <strong>Content manager</strong>.</li>
+  <li>Put the key file on the server outside the code folder; set <code>GOOGLE_SA_KEY_FILE</code> and <code>DRIVE_SHARED_DRIVE_ID</code> (the id in the shared drive's URL).</li>
+</ol>
+<h3>Meta / WhatsApp</h3>
+<ol>
+  <li>Publish the registration Flow from <code>docs/whatsapp_registration_flow.json</code> (now with an email field).</li>
+  <li>Create the catalogue with retailer ids <code>pack_1</code>, <code>pack_5</code>, <code>pack_20</code>, <code>pack_50</code>, <code>pack_100</code>; set <code>META_CATALOG_ID</code>; run <code>set_price.py</code> once to push prices.</li>
+  <li>Submit a utility template for the out-of-window "images ready" notice; set <code>BATCH_NOTIFY_TEMPLATE_NAME</code> once approved.</li>
+</ol>
+<h3>Razorpay and ERPNext</h3>
+<ol>
+  <li>Test-mode keys and webhook secret; register the HTTPS webhook URL in the test dashboard.</li>
+  <li>ERPNext sandbox: item code for packs (<code>SKU_ERPNEXT_ITEM_CODE</code>), tax templates; the accountant confirms invoice timing (at purchase) and HSN/SAC.</li>
+</ol>
+
+<h2>9. Rollout and rollback</h2>
+<ol>
+  <li>Back up the database, run <code>scripts/release.py</code> (migrates to 0023), start the new code. With both flags off nothing changes for customers.</li>
+  <li>Turn on <code>SKU_PACKS_ENABLED</code> for a test number first (team phone), buy a ₹20 pack in Razorpay test mode, send one photo.</li>
+  <li>Turn on <code>DRIVE_DELIVERY_ENABLED</code> after the Google checklist; check one folder, one share, one sheet.</li>
+  <li>Rollback: switch the two flags off (immediate, no deploy). Code rollback: previous release; the 0023 downgrade refuses while credits exist, so leave the schema in place.</li>
+</ol>
+
+<h2>10. Real-world test checklist</h2>
+<ul class="check">
+  <li>Google: shared-drive id; service-account JSON key; Drive and Sheets APIs enabled; outside sharing allowed; 3 test emails (one Gmail, one Google Workspace business email, one non-Google)</li>
+  <li>Razorpay test mode: key id, secret, webhook secret; public HTTPS webhook URL registered</li>
+  <li>Meta: test phone number id, access token, app secret, verify token; 2-3 real test phones; published Flow with email; catalogue id + retailer ids; approved utility template</li>
+  <li>ERPNext sandbox: URL, API key/secret, item code, tax templates (in-state and inter-state); accountant's answers on invoice timing and HSN/SAC</li>
+  <li>AI: Gemini key (and OpenAI fallback) with a small test budget</li>
+  <li>Infrastructure: staging Postgres, staging server with the Docker volume, <code>.env</code> from <code>docs/ENV_TO_ADD.md</code>, a developer for about half a day</li>
+  <li>Owner approvals: message wording, consent text (with the lawyer), retention periods, the price</li>
+  <li>Run: buy a 5-pack → send 6 photos → 5 images in <code>Images/&lt;today&gt;/</code>, one link message, sheet shows 5 used / 0 left, 6th photo gets "buy more", invoice in <code>Invoices/</code></li>
+  <li>Share to Gmail works; share to the non-Google email is refused, folder stays private, customer asked for a Google email, alert raised</li>
+  <li>Stop Drive (wrong key) → image arrives on WhatsApp after the retries; credit unchanged</li>
+  <li>Compare provider spend (<code>provider_calls</code>) and Google billing with the money taken</li>
+</ul>
+
+<h2>11. Known limits</h2>
+<ul>
+  <li>Only fakes are used before the real-world session: real folder sharing, the real catalogue and real Razorpay payments are untested until then.</li>
+  <li>Day-folder search and file numbering are locked per process; with several server processes two uploads can rarely get the same number (Drive keeps both). A database counter can replace it if that matters.</li>
+  <li>Credit validity is rolling (a new pack extends unused credits). Per-pack expiry needs a decision from the owner.</li>
+  <li>The ₹500 Catalog Pack / Creative Studio Pack (7 styles) still delivers on WhatsApp.</li>
+  <li>Capacity: one shared drive holds 400,000 items, which full-speed traffic (100 images a minute) with 90-day storage would fill in about 3 days; the outbox runs one job at a time per process. See the audit report before full launch.</li>
+  <li>Drive image retention runs only with <code>RETENTION_ENABLED=true</code>.</li>
+</ul>
+<p class="muted">Open questions for the owner are listed in <code>docs/QUESTIONS_FOR_MORNING.md</code>. This document is updated at the end to match what was built.</p>
+</body>
+</html>

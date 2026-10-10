@@ -219,12 +219,12 @@ async def send_trial_exhausted_card(db, customer: Any, reply_to_message_id: Opti
     """Exhaustion alert + the standard recharge card (native WhatsApp Pay if
     enabled, else the Razorpay link CTA)."""
     from app.services import meta_whatsapp_service as mws
-    from app.services import razorpay_service
+    from app.services import pricing, razorpay_service
     from app.services.whatsapp_pay_service import send_payment_unavailable, try_send_native_recharge
 
     total = int(customer.trial_credits_total or 0)
     body = EXHAUSTED_TEMPLATE.format(used=total, total=total)
-    amount = 500
+    amount = pricing.min_recharge()
     try:
         if await try_send_native_recharge(db, customer.whatsapp_id, amount, body,
                                           reply_to_message_id=reply_to_message_id,

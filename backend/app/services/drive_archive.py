@@ -1,78 +1,41 @@
 """Archive customer photos and the images we produced to Google Drive (for the chat dashboard).
 
-Off until DRIVE_ENABLED=true and the Google credentials are set. Runs as durable outbox jobs ("drive_archive") after a
-file is saved, never during a customer's chat: a slow or failing Drive only delays the archive copy, retried with growing
-waits like every outbox job. Uses Google's REST API directly (no extra libraries) with an OAuth refresh token of the Drive
-owner's account, so a personal Google account with a big plan works (a robot account has no storage of its own).
+Off until DRIVE_ENABLED=true and the business service account is set up (GOOGLE_SA_KEY_FILE, DRIVE_SHARED_DRIVE_ID;
+see app/services/google_drive.py, the same account and shared drive as the Phase 8 customer folders). Runs as durable
+outbox jobs ("drive_archive") after a file is saved, never during a customer's chat: a slow or failing Drive only
+delays the archive copy, retried with growing waits like every outbox job. Files go into DRIVE_FOLDER_ID (a folder
+inside the shared drive), else the top of the shared drive, streamed from disk.
 
-Settings: DRIVE_ENABLED, GOOGLE_DRIVE_CLIENT_ID, GOOGLE_DRIVE_CLIENT_SECRET, GOOGLE_DRIVE_REFRESH_TOKEN, DRIVE_FOLDER_ID.
+Settings: DRIVE_ENABLED, DRIVE_FOLDER_ID (plus the service-account settings above).
 The dashboard shows the local copy as a preview and links to the Drive copy for zoom and download.
 """
 
 from __future__ import annotations
 
-import json
-import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-import httpx
-
 from app.config import settings
+from app.services import google_drive
 from app.utils.executors import run_io
 from app.utils.logger import logger
 
-TOKEN_URL = "https://oauth2.googleapis.com/token"
-UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files"
 OUTBOX_KIND = "drive_archive"
-
-_token: Dict[str, Any] = {"value": None, "expires": 0.0}
 
 
 def configured() -> bool:
-    return bool(settings.DRIVE_ENABLED and settings.GOOGLE_DRIVE_CLIENT_ID and settings.GOOGLE_DRIVE_CLIENT_SECRET
-                and settings.GOOGLE_DRIVE_REFRESH_TOKEN)
+    return bool(settings.DRIVE_ENABLED) and google_drive.configured()
 
 
 def reset_for_tests() -> None:
-    _token.update(value=None, expires=0.0)
+    google_drive.reset_for_tests()
 
 
-async def _access_token(client: httpx.AsyncClient) -> str:
-    if _token["value"] and time.monotonic() < _token["expires"] - 60:
-        return _token["value"]
-    response = await client.post(TOKEN_URL, data={
-        "client_id": settings.GOOGLE_DRIVE_CLIENT_ID, "client_secret": settings.GOOGLE_DRIVE_CLIENT_SECRET,
-        "refresh_token": settings.GOOGLE_DRIVE_REFRESH_TOKEN, "grant_type": "refresh_token",
-    })
-    if response.status_code != 200:
-        raise RuntimeError(f"Google refused the Drive credentials (HTTP {response.status_code})")
-    data = response.json()
-    _token.update(value=data["access_token"], expires=time.monotonic() + float(data.get("expires_in", 3000)))
-    return _token["value"]
-
-
-async def upload_file(name: str, data: bytes, mime_type: str) -> Dict[str, str]:
-    """Upload one file to the configured folder. Returns {"id", "link"}. Raises on any failure (the outbox retries)."""
-    metadata: Dict[str, Any] = {"name": name}
-    if settings.DRIVE_FOLDER_ID:
-        metadata["parents"] = [settings.DRIVE_FOLDER_ID]
-    boundary = "moraa-drive-boundary"
-    body = (
-        f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{json.dumps(metadata)}\r\n"
-        f"--{boundary}\r\nContent-Type: {mime_type}\r\n\r\n"
-    ).encode("utf-8") + data + f"\r\n--{boundary}--".encode("utf-8")
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        token = await _access_token(client)
-        response = await client.post(
-            UPLOAD_URL, params={"uploadType": "multipart", "fields": "id,webViewLink", "supportsAllDrives": "true"},
-            headers={"Authorization": f"Bearer {token}", "Content-Type": f"multipart/related; boundary={boundary}"},
-            content=body,
-        )
-    if response.status_code not in (200, 201):
-        raise RuntimeError(f"Drive upload failed (HTTP {response.status_code})")
-    info = response.json()
-    return {"id": info["id"], "link": info.get("webViewLink") or f"https://drive.google.com/file/d/{info['id']}/view"}
+async def upload_file(path: str, name: str, mime_type: str) -> Dict[str, str]:
+    """Upload one file (streamed from disk) to the archive folder. Returns {"id", "link"}. Raises
+    google_drive.DriveError on any failure (the outbox retries)."""
+    folder = (settings.DRIVE_FOLDER_ID or "").strip() or google_drive.shared_drive_id()
+    return await google_drive.upload_file(path, name, folder, mime_type)
 
 
 def _load(kind: str, item_id: str) -> Optional[Dict[str, Any]]:
@@ -116,8 +79,7 @@ async def archive(kind: str, item_id: str) -> bool:
     job = await run_io(_load, kind, item_id)
     if job is None:
         return True
-    data = await run_io(lambda: Path(job["path"]).read_bytes())
-    info = await upload_file(job["name"], data, job["mime"])
+    info = await upload_file(job["path"], job["name"], job["mime"])
     await run_io(_save, kind, item_id, info)
     logger.bind(category="system").info(f"Archived a {kind} to Drive")
     return True
@@ -126,31 +88,9 @@ async def archive(kind: str, item_id: str) -> bool:
 def delete_files_sync(ids) -> int:
     """(blocking) Delete archived copies from Drive (retention and erasure). Best effort: a file that is already gone
     counts as deleted; any other failure is logged and that copy stays (the dashboard no longer lists it). Returns how
-    many are gone."""
-    ids = [i for i in ids if i]
-    if not ids or not configured():
-        return 0
-    deleted = 0
-    try:
-        with httpx.Client(timeout=30.0) as client:
-            token = client.post(TOKEN_URL, data={
-                "client_id": settings.GOOGLE_DRIVE_CLIENT_ID, "client_secret": settings.GOOGLE_DRIVE_CLIENT_SECRET,
-                "refresh_token": settings.GOOGLE_DRIVE_REFRESH_TOKEN, "grant_type": "refresh_token",
-            })
-            if token.status_code != 200:
-                logger.warning("Drive copies could not be deleted: Google refused the credentials")
-                return 0
-            headers = {"Authorization": f"Bearer {token.json()['access_token']}"}
-            for file_id in ids:
-                response = client.delete(f"https://www.googleapis.com/drive/v3/files/{file_id}",
-                                         headers=headers, params={"supportsAllDrives": "true"})
-                if response.status_code in (200, 204, 404):
-                    deleted += 1
-                else:
-                    logger.warning(f"A Drive copy could not be deleted (HTTP {response.status_code})")
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"Drive copies could not be deleted ({type(e).__name__})")
-    return deleted
+    many are gone. Works whenever the service account is set up, so copies made while the archive was on are still
+    removed after DRIVE_ENABLED is switched off."""
+    return google_drive.delete_files_sync(ids)
 
 
 def enqueue(kind: str, item_id: str) -> None:

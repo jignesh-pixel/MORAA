@@ -655,7 +655,7 @@ async def scenario_f() -> Dict[str, Any]:
     wa = new_phone(); make_customer(wa, 0)
     for _ in range(3):
         await deliver(webhook_payload([text_msg(wa, "wamid.HI-DUP", "hi")]))
-    welcomes = sum(1 for _, t in REC.texts if t == mw.WELCOME_MESSAGE)
+    welcomes = sum(1 for _, t in REC.texts if t.startswith(mw.WELCOME_MESSAGE))
     for _ in range(3):
         await deliver(webhook_payload([text_msg(wa, "wamid.PAY-DUP", "recharge 500")]))
     res["f5_duplicate_text_x3"] = {"welcome_messages_sent_for_3_identical_deliveries": welcomes, "recharge_links_sent_for_3_identical_deliveries": REC.cta_links}

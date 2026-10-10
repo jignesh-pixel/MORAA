@@ -18,8 +18,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Images in a WhatsApp Catalog Pack: one per style in meta_whatsapp_service.CATALOG_PACK_STYLES
 # (= pack_generation_count()); a daily cap below this cannot serve one Pack.
-# Kept equal to len(CATALOG_PACK_STYLES) by tests/test_earring_stand_shot.py.
-_PACK_IMAGE_COUNT = 7
+# A literal because config cannot import the service (circular); kept equal to len(CATALOG_PACK_STYLES) by
+# tests/test_earring_stand_shot.py.
+_PACK_IMAGE_COUNT = 8
 
 
 def _resolve_env_file() -> Optional[str]:
@@ -347,6 +348,9 @@ class Settings(BaseSettings):
     ERPNEXT_PRICES_INCLUDE_TAX: bool = True
     # Upper bound for the whole background invoice job (all ERPNext calls).
     ERPNEXT_JOB_TIMEOUT_SECONDS: float = 60.0
+    # Cap on every single ERPNext HTTP call (connect, read, write, pool). Short so an unreachable or suspended
+    # ERPNext fails fast and the local invoice is sent at once; raise it if PDF downloads time out on a live ERPNext.
+    ERPNEXT_HTTP_TIMEOUT_SECONDS: float = 2.0
 
     # --- Razorpay Payments (wallet recharge) ---
     # API credentials used to create dynamic recharge payment links.
@@ -381,8 +385,50 @@ class Settings(BaseSettings):
 
     # Trial credits consumed per order (tier = TRIAL). A credit is one
     # complimentary order; the owner sets trial_credits_total per customer.
-    TRIAL_CREDITS_PER_WHITE_BG: int = 1   # ₹50 Clean Studio Shot
-    TRIAL_CREDITS_PER_PACK_1: int = 1     # ₹500 E-Com Pack 1 (7 images)
+    TRIAL_CREDITS_PER_WHITE_BG: int = 1   # Clean Studio Shot
+    TRIAL_CREDITS_PER_PACK_1: int = 1     # E-Com Pack 1 (one image per pack style)
+
+    # Wallet recharge limits, in whole rupees (read through app/services/pricing.py).
+    MIN_RECHARGE_RUPEES: int = 500
+    MAX_RECHARGE_RUPEES: int = 50_000
+
+    # --- Phase 8: SKU packs (app/services/pricing.py, app/services/sku_packs.py) ---
+    # A pack of N SKUs = N white-background shots, paid once through one Razorpay link. Credits live in their own
+    # ledger (customer_sku_credits), never in wallet_balance. Off by default: no menus, no catalogue orders, no pack
+    # links. Credits already paid for are always honoured, even when this is off.
+    SKU_PACKS_ENABLED: bool = False
+    # Price of one SKU in whole rupees, GST included. Only the FIRST seed: once scripts/set_price.py has written a
+    # price to the price_settings table, the database value is used.
+    SKU_PRICE_RUPEES: int = 20
+    # Price of one Catalog Pack SKU (sku_pack_N: one photo in every pack photoshoot style) in whole rupees, GST included.
+    # Its tiers are N x this price. Kept apart from SKU_PRICE_RUPEES, which prices Studio Shot (studio_sku_N).
+    CATALOG_PACK_SKU_PRICE: int = 500
+    SKU_PACK_SIZES: str = "1,5,20,50,100"
+    # The 1-SKU pack can always be bought by retailer id (pack_1) but is only shown in menus when this is true.
+    ECOM_PACK1_ENABLED: bool = False
+    SKU_GST_PERCENT: int = 18                 # splits the GST-inclusive price into net + tax for invoices
+    SKU_CREDIT_VALIDITY_DAYS: int = 90        # a new pack extends every unused credit to this many days
+    SKU_ERPNEXT_ITEM_CODE: str = ""           # ERPNext item for packs; empty = ERPNEXT_RECHARGE_ITEM_CODE
+    META_CATALOG_ID: str = ""                 # WhatsApp catalogue that scripts/set_price.py updates
+    # Debug: when Meta refuses the Step-2 product_list message, False = log the exact Meta error and tell the customer
+    # to try again (no silent radio list); True = fall back to the radio list menu.
+    PRODUCT_LIST_FALLBACK_ENABLED: bool = False
+
+    # --- Phase 8: Google Drive delivery (app/services/google_drive.py, drive_layout.py) ---
+    # Finished white-background images go to {phone}/Images/{day}/ in the business shared drive instead of the chat,
+    # followed by one "ready" message. Off by default: delivery stays on WhatsApp exactly as before.
+    DRIVE_DELIVERY_ENABLED: bool = False
+    # True = each customer's root Drive folder is also "anyone with the link can view" (so the link opens without
+    # signing in). Customer images and invoices sit under that folder: set False to share by email address only.
+    DRIVE_LINK_PUBLIC: bool = True
+    GOOGLE_SA_KEY_FILE: str = ""              # path to the service-account JSON key (business Workspace); never logged
+    DRIVE_SHARED_DRIVE_ID: str = ""
+    DRIVE_IMAGES_RETENTION_DAYS: int = 90     # delivered images are deleted from Drive after this; invoices stay
+    BATCH_NOTIFY_DELAY_SECONDS: int = 60      # quiet time before the one "your images are ready" message
+    # Approved Meta utility template for out-of-window "ready" notices (parameters: folder link, SKUs left); empty =
+    # alert only. Until Meta approves it, an out-of-window send fails and is retried, then alerted.
+    BATCH_NOTIFY_TEMPLATE_NAME: str = "sku_batch_ready"
+    BATCH_NOTIFY_TEMPLATE_LANG: str = "en"
 
     # Razorpay (or any PSP) payment-page URL used by the "Pay ₹<price>" CTA
     # URL button. Leave empty to fall back to the interactive reply button
@@ -470,11 +516,11 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_ID: str = ""
     DASHBOARD_HISTORY_DAYS: int = 90
     # Google Drive archive of customer photos and the images we produced (see app/services/drive_archive.py). OFF until
-    # DRIVE_ENABLED=true and the OAuth credentials of the Drive owner's account are set.
+    # DRIVE_ENABLED=true and the service account is set up (GOOGLE_SA_KEY_FILE, DRIVE_SHARED_DRIVE_ID above). Files go
+    # into DRIVE_FOLDER_ID (a folder inside the shared drive), else the top of the shared drive. The personal-OAuth
+    # settings GOOGLE_DRIVE_CLIENT_ID, GOOGLE_DRIVE_CLIENT_SECRET and GOOGLE_DRIVE_REFRESH_TOKEN were removed; an old
+    # .env that still sets them loads fine (extra="ignore").
     DRIVE_ENABLED: bool = False
-    GOOGLE_DRIVE_CLIENT_ID: str = ""
-    GOOGLE_DRIVE_CLIENT_SECRET: str = ""
-    GOOGLE_DRIVE_REFRESH_TOKEN: str = ""
     DRIVE_FOLDER_ID: str = ""
     CHAT_LOG_ENABLED: bool = True
     RETENTION_CHAT_DAYS: int = 90

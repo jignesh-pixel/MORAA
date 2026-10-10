@@ -30,10 +30,16 @@ JOB_TIMEOUT_SECONDS = 120.0
 
 Handler = Callable[[Dict[str, Any]], Awaitable[Any]]
 _handlers: Dict[str, Handler] = {}
+# Called once with the job's payload when a job of that kind gives up (dead), e.g. Drive delivery falls back to WhatsApp.
+_dead_handlers: Dict[str, Handler] = {}
 
 
 def register_handler(kind: str, handler: Handler) -> None:
     _handlers[kind] = handler
+
+
+def register_dead_handler(kind: str, handler: Handler) -> None:
+    _dead_handlers[kind] = handler
 
 
 def _now() -> datetime:
@@ -108,23 +114,27 @@ def _claim_next() -> Optional[Dict[str, Any]]:
     return None
 
 
-def _finish(job_id: int, error: Optional[str], attempts: int) -> None:
+def _finish(job_id: int, error: Optional[str], attempts: int) -> bool:
+    """Record a job's outcome. True when this call marked it dead."""
     from app.database import SessionLocal
 
     with SessionLocal() as db:
         job = db.get(OutboxJob, job_id)
         if job is None:
-            return
+            return False
+        died = False
         if error is None:
             job.status, job.last_error = DONE, None
         elif attempts >= MAX_ATTEMPTS:
             job.status, job.last_error = DEAD, error[:500]
+            died = True
             logger.bind(category="system").error(f"OUTBOX job {job_id} ({job.kind}) gave up after {attempts} attempts")
         else:
             wait = BACKOFF_SECONDS[min(attempts - 1, len(BACKOFF_SECONDS) - 1)]
             job.status, job.last_error = PENDING, error[:500]
             job.next_attempt_at = _now() + timedelta(seconds=wait)
         db.commit()
+        return died
 
 
 # Kinds that take minutes (a paid order being generated). The sweep starts them as separate tasks instead of waiting
@@ -156,9 +166,18 @@ async def _execute(job: Dict[str, Any]) -> None:
         except Exception as e:  # noqa: BLE001
             error = f"{type(e).__name__}: {e}"
     try:
-        await run_io(_finish, job["id"], error, job["attempts"])
+        died = await run_io(_finish, job["id"], error, job["attempts"])
     except Exception as e:  # noqa: BLE001 -- the job stays 'running' and is taken over when stale
         logger.warning(f"Outbox could not record the result of job {job['id']}: {type(e).__name__}")
+        return
+    on_dead = _dead_handlers.get(job["kind"]) if died else None
+    if on_dead is not None:
+        try:
+            await on_dead(job["payload"])
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 -- the dead job stays visible to the operations alerts
+            logger.error(f"Outbox fallback for dead job {job['id']} ({job['kind']}) failed: {type(e).__name__}: {e}")
 
 
 async def drain_once(limit: int = 20) -> int:
@@ -355,12 +374,49 @@ async def _handle_drive_archive(payload: Dict[str, Any]) -> Any:
     return await drive_archive.handle_outbox_job(payload)
 
 
+# ── Phase 8 kinds (each handler lives in its own module; imported only when a job runs) ────────────────────
+
+async def _handle_drive_deliver(payload: Dict[str, Any]) -> Any:
+    from app.services import drive_delivery
+
+    return await drive_delivery.handle_outbox_job(payload)
+
+
+async def _handle_drive_deliver_dead(payload: Dict[str, Any]) -> Any:
+    from app.services import drive_delivery
+
+    return await drive_delivery.handle_dead_job(payload)
+
+
+async def _handle_drive_share(payload: Dict[str, Any]) -> Any:
+    from app.services import drive_layout
+
+    return await drive_layout.handle_share_job(payload)
+
+
+async def _handle_usage_log_sync(payload: Dict[str, Any]) -> Any:
+    from app.services import usage_log
+
+    return await usage_log.handle_outbox_job(payload)
+
+
+async def _handle_batch_notify(payload: Dict[str, Any]) -> Any:
+    from app.services import batch_notify
+
+    return await batch_notify.handle_outbox_job(payload)
+
+
 def ensure_default_handlers() -> None:
     _handlers.setdefault("drive_archive", _handle_drive_archive)
     _handlers.setdefault("burst_prompt", _handle_burst_prompt)
     _handlers.setdefault("order_run", _handle_order_run)
     _handlers.setdefault("ops_forward", _handle_ops_forward)
     _handlers.setdefault("payment_invoice", _handle_payment_invoice)
+    _handlers.setdefault("drive_deliver", _handle_drive_deliver)
+    _handlers.setdefault("drive_share", _handle_drive_share)
+    _handlers.setdefault("usage_log_sync", _handle_usage_log_sync)
+    _handlers.setdefault("batch_notify", _handle_batch_notify)
+    _dead_handlers.setdefault("drive_deliver", _handle_drive_deliver_dead)
 
 
 def kinds() -> List[str]:

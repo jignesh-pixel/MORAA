@@ -61,10 +61,11 @@ class NewRegistrationTemplateTests(FundedSlotGateTestCase):
 
     def test_hi_sends_the_new_registration_request(self):
         self._post(_text("Hi"))
+        # Welcome and form in ONE message (the Flow is not configured in tests).
         self.assertEqual(self.sent_texts, [
-            "Welcome to Moraa Studio ✨\n\n"
-            "We transform your raw jewelry photos into studio-grade product visuals in seconds.\n\n"
-            "Let’s quickly set up your account!",
+            "Welcome to Moraa Studio ✨\n"
+            "We transform your raw jewelry photos into studio-grade product visuals in seconds.\n"
+            "Let’s quickly set up your account!\n\n"
             "Quick Setup 📋\n\nPlease reply with your details:\n\n"
             "• Name:\n• Brand Name:\n• City:\n• GSTIN (Optional):",
         ])

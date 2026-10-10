@@ -83,3 +83,8 @@ nul
 
 # Local tooling / experiment artifacts (kept on disk, not tracked)
 graphify-out/
+
+# Google service-account keys (Phase 8): never commit them
+secrets/
+*service-account*.json
+*-sa.json

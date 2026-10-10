@@ -28,6 +28,7 @@ import httpx
 from app.config import settings
 from app.services import metrics
 from app.services import chat_log
+from app.services import pricing, sku_messages
 from app.utils.executors import run_io
 from app.utils.logger import logger, mask_phone
 # ─── Constants ────────────────────────────────────────────────────────────
@@ -38,9 +39,9 @@ META_MEDIA_UPLOAD_URL = "https://graph.facebook.com/v21.0/{phone_number_id}/medi
 
 SUPPORTED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp"}
 
-# ─── 7-Style Earring Catalog Pack (ordered delivery 1..7) ─────────────────
+# ─── Earring Catalog Pack (ordered delivery 1..N, N = len(CATALOG_PACK_STYLES)) ───
 # Every prompt_type here needs a builder in process_whatsapp_catalog_pack's style_prompt_builders; the pack size
-# (spend reservation, "all N styles" copy, partial-delivery count) follows the length of this list.
+# (spend reservation, "all N styles" copy, partial-delivery count, menu copy) follows the length of this list.
 CATALOG_PACK_STYLES: List[Tuple[str, str]] = [
     ("Clean E-Commerce", "prompt_ecommerce"),
     ("Close-up on Ear", "prompt_close_up"),
@@ -49,6 +50,7 @@ CATALOG_PACK_STYLES: List[Tuple[str, str]] = [
     ("Lifestyle Shot", "prompt_complementary"),
     ("UGC Style", "prompt_ugc"),
     ("Stand Display", "prompt_stand"),
+    ("Luxury Drape", "prompt_luxury_drape"),
 ]
 
 # ─── Image calls per order ────────────────────────────────────────────────
@@ -175,6 +177,21 @@ def parse_webhook_entry(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "flow_name": nfm_reply.get("name", ""),
                         "flow_response": parse_flow_response_json(nfm_reply.get("response_json")),
                     })
+                elif interactive_type == "list_reply":
+                    # A row picked from a list message (the SKU pack menu, Phase 8).
+                    list_reply = interactive_data.get("list_reply") or {}
+                    events.append({
+                        "type": "interactive",
+                        "subtype": "list_reply",
+                        "message_id": msg_id,
+                        "sender": sender,
+                        "timestamp": timestamp,
+                        "list_reply": {
+                            "id": list_reply.get("id", ""),
+                            "title": list_reply.get("title", ""),
+                        },
+                        "raw_type": "interactive:list_reply",     # the chat dashboard keeps recording it as before
+                    })
                 else:
                     events.append({
                         "type": "unsupported",
@@ -183,6 +200,22 @@ def parse_webhook_entry(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "timestamp": timestamp,
                         "raw_type": f"interactive:{interactive_type}",
                     })
+            elif msg_type == "order":
+                # A WhatsApp catalogue cart (SKU packs, Phase 8). Only the retailer ids and quantities are kept: the
+                # prices in the cart are ignored, the server computes every price itself (pricing.py).
+                order = message.get("order") or {}
+                events.append({
+                    "type": "order",
+                    "message_id": msg_id,
+                    "sender": sender,
+                    "timestamp": timestamp,
+                    "catalog_id": order.get("catalog_id", ""),
+                    "items": [
+                        {"retailer_id": item.get("product_retailer_id", ""), "quantity": item.get("quantity")}
+                        for item in (order.get("product_items") or [])
+                        if isinstance(item, dict)
+                    ],
+                })
             else:
                 events.append({
                     "type": "unsupported",
@@ -712,14 +745,224 @@ async def send_interactive_cta_button(
     return await _post_message_payload(payload, "interactive CTA button", reply_to_message_id=reply_to_message_id)
 
 
+# ─── List and template messages, SKU pack menu (Phase 8) ────────────────
+
+
+async def send_list_message(
+    recipient_id: str,
+    body_text: str,
+    button_text: str,
+    rows: List[Tuple[str, str, str]],
+    reply_to_message_id: Optional[str] = None,
+) -> bool:
+    """Send an interactive list with one section of up to 10 rows [(id, title, description)].
+
+    Meta limits a list button to 20 characters, a row title to 24 and a row description to 72.
+    """
+    if not recipient_id or not body_text or not button_text or not rows:
+        return False
+    list_rows = []
+    for row_id, title, description in rows[:10]:
+        row = {"id": row_id, "title": title[:24]}
+        if description:
+            row["description"] = description[:72]
+        list_rows.append(row)
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient_id,
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "body": {"text": body_text},
+            "action": {"button": button_text[:20], "sections": [{"rows": list_rows}]},
+        },
+    }
+    return await _post_message_payload(payload, "list message", reply_to_message_id=reply_to_message_id)
+
+
+async def send_whatsapp_template(recipient_id: str, name: str, language: str, body_params: List[str]) -> bool:
+    """Send an approved (utility) template, the only kind of message Meta delivers outside the 24-hour window.
+
+    ``body_params`` fill the body's {{1}}, {{2}}, ... in order.
+    """
+    if not recipient_id or not name:
+        return False
+    template: Dict[str, Any] = {"name": name, "language": {"code": language or "en"}}
+    if body_params:
+        template["components"] = [
+            {"type": "body", "parameters": [{"type": "text", "text": str(p)} for p in body_params]}
+        ]
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient_id,
+        "type": "template",
+        "template": template,
+    }
+    return await _post_message_payload(payload, "template message")
+
+
+def _pack_menu_rows() -> List[Tuple[str, str, str]]:
+    """(retailer id, title, description) for every pack shown in menus, priced from one session. Blocking."""
+    from app.database import SessionLocal
+
+    with SessionLocal() as db:
+        sizes = pricing.menu_pack_sizes()
+        return [
+            (pricing.pack_retailer_id(n), f"{pricing.STUDIO_TITLE} · {pricing.pack_title(n)}",
+             pricing.pack_description(n, db))
+            for n in sizes
+        ] + [
+            (pricing.catalog_retailer_id(n), f"{pricing.CREATIVE_TITLE} · {pricing.pack_title(n)}",
+             sku_messages.catalog_tier_description(n))
+            for n in sizes
+        ]
+
+
+async def send_pack_menu(recipient_id: str, reply_to_message_id: Optional[str] = None) -> bool:
+    """The SKU pack list menu: one row per pack (pack_N ids), every price computed by the server."""
+    rows = await run_io(_pack_menu_rows)
+    return await send_list_message(
+        recipient_id, sku_messages.pack_menu_body(), sku_messages.PACK_MENU_BUTTON, rows,
+        reply_to_message_id=reply_to_message_id,
+    )
+
+
+COLLECTIONS_BUTTON = "gv_collections"          # the earlier reply button; still answered for messages already sent
+COLLECTIONS_LIST_BUTTON = "View Collections"
+COLLECTION_STUDIO = "gv_col_studio"
+COLLECTION_CATALOG = "gv_col_catalog"
+COLLECTION_IDS = (COLLECTION_STUDIO, COLLECTION_CATALOG)
+
+
+def _collection_rows() -> List[Tuple[str, str, str]]:
+    """(row id, title, description) for the two collections, priced from one session. Blocking."""
+    from app.database import SessionLocal
+
+    with SessionLocal() as db:
+        return [
+            (COLLECTION_STUDIO, sku_messages.STUDIO_COLLECTION_TITLE, sku_messages.studio_collection_row(db)),
+            (COLLECTION_CATALOG, sku_messages.CATALOG_COLLECTION_TITLE, sku_messages.catalog_collection_row()),
+        ]
+
+
+async def send_collections(
+    recipient_id: str, reply_to_message_id: Optional[str] = None, intro: str = "",
+) -> bool:
+    """The "View Collections" list: 1. Studio Shot, 2. Catalog Pack (Ecomm Pack 1). Picking one and tapping Send
+    comes back as a ``list_reply`` with COLLECTION_STUDIO / COLLECTION_CATALOG (``send_collection_products``).
+    ``intro`` opens the body (e.g. the photo receipt), so it stays one message."""
+    rows = await run_io(_collection_rows)
+    body = await run_io(sku_messages.collections_body)
+    if intro:
+        body = f"{intro}\n\n{body}"
+    return await send_list_message(recipient_id, body, COLLECTIONS_LIST_BUTTON, rows,
+                                   reply_to_message_id=reply_to_message_id)
+
+
+def _collection_retailer_ids(collection_id: str) -> List[str]:
+    """Catalogue items of one collection: its SKU tiers (studio_sku_N for Studio Shot, sku_pack_N for Catalog
+    Pack)."""
+    if collection_id == COLLECTION_STUDIO:
+        return [pricing.pack_retailer_id(n) for n in pricing.menu_pack_sizes()]
+    if collection_id == COLLECTION_CATALOG:
+        return [pricing.catalog_retailer_id(n) for n in pricing.menu_pack_sizes()]
+    return []
+
+
+async def send_collection_products(
+    recipient_id: str, collection_id: str, reply_to_message_id: Optional[str] = None,
+) -> bool:
+    """A picked collection's products as WhatsApp's multi-product message ("View items"): the customer sets each
+    tier's quantity with + / -, then sends the cart (an ``order``). Prices shown there come from the catalogue
+    (``set_price.py`` keeps them equal to pricing.py); the cart is always re-priced by the server. Without
+    META_CATALOG_ID, or if Meta refuses the message, the list menu only with PRODUCT_LIST_FALLBACK_ENABLED; otherwise
+    the refusal is logged in full (Meta's code and message, the catalogue id and the exact retailer ids sent)."""
+    retailer_ids = _collection_retailer_ids(collection_id)
+    catalog_id = (settings.META_CATALOG_ID or "").strip()
+    if not retailer_ids:
+        return False
+    if not catalog_id:
+        logger.error("META_CATALOG_ID is not set: cannot send the collection product list")
+        return await _product_list_failed(recipient_id, reply_to_message_id)
+    studio = collection_id == COLLECTION_STUDIO
+    title = sku_messages.STUDIO_COLLECTION_TITLE if studio else sku_messages.CATALOG_COLLECTION_TITLE
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient_id,
+        "type": "interactive",
+        "interactive": {
+            "type": "product_list",
+            "header": {"type": "text", "text": title[:60]},
+            "body": {"text": sku_messages.PRODUCT_LIST_BODY},
+            "action": {
+                "catalog_id": catalog_id,
+                "sections": [{
+                    "title": title[:24],
+                    "product_items": [{"product_retailer_id": rid} for rid in retailer_ids[:30]],
+                }],
+            },
+        },
+    }
+    error: Dict[str, Any] = {}
+    if await _post_message_payload(payload, "collection products", reply_to_message_id=reply_to_message_id,
+                                   error_out=error):
+        return True
+    logger.error(
+        f"product_list refused by Meta: collection={collection_id} catalog_id={catalog_id} "
+        f"retailer_ids={retailer_ids[:30]} meta_error={error}"
+    )
+    return await _product_list_failed(recipient_id, reply_to_message_id)
+
+
+async def _product_list_failed(recipient_id: str, reply_to_message_id: Optional[str]) -> bool:
+    """The product list could not be sent: the radio list menu with PRODUCT_LIST_FALLBACK_ENABLED, else a short text
+    (never silence) so the customer can ask again."""
+    if settings.PRODUCT_LIST_FALLBACK_ENABLED:
+        return await send_pack_menu(recipient_id, reply_to_message_id)
+    await send_whatsapp_text(recipient_id, "Sorry, we couldn't load the items right now. Please tap View Collections "
+                                           "and try again in a moment.", reply_to_message_id=reply_to_message_id)
+    return False
+
+
+async def send_catalogue(recipient_id: str, reply_to_message_id: Optional[str] = None) -> bool:
+    """WhatsApp's native catalogue (META_CATALOG_ID): customers add packs to a cart and send it as an ``order``.
+    Without a catalogue, or if Meta refuses it, the list menu."""
+    if not (settings.META_CATALOG_ID or "").strip():
+        return await send_pack_menu(recipient_id, reply_to_message_id)
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient_id,
+        "type": "interactive",
+        "interactive": {
+            "type": "catalog_message",
+            "body": {"text": await run_io(sku_messages.collections_body)},
+            "action": {
+                "name": "catalog_message",
+                "parameters": {"thumbnail_product_retailer_id": pricing.pack_retailer_id(
+                    (pricing.menu_pack_sizes() or pricing.pack_sizes() or [1])[0])},
+            },
+        },
+    }
+    if await _post_message_payload(payload, "collections catalogue", reply_to_message_id=reply_to_message_id):
+        return True
+    return await send_pack_menu(recipient_id, reply_to_message_id)       # catalogue refused: the list still works
+
+
 # ─── WhatsApp Flow (registration form) ──────────────────────────────────
 
 REGISTRATION_FLOW_TOKEN_PREFIX = "moraa_reg_"
 REGISTRATION_FLOW_CTA = "Setup Account"
-REGISTRATION_FLOW_BODY = (
-    "Quick Setup 📋\n\n"
-    "Tap below to share your name, brand name, address and GSTIN (optional)."
+WELCOME_MESSAGE = (
+    "Welcome to Moraa Studio ✨\n"
+    "We transform your raw jewelry photos into studio-grade product visuals in seconds.\n"
+    "Let’s quickly set up your account!"
 )
+# Onboarding is ONE message: the welcome copy is the Flow's body and "Setup Account" its button.
+REGISTRATION_FLOW_BODY = WELCOME_MESSAGE
 
 
 async def send_registration_flow(
@@ -993,6 +1236,15 @@ def _refund_failed_ingestion(db, ingestion) -> None:
         from app.models.wallet_transaction import KIND_DEBIT_ORDER, KIND_REFUND_ORDER, WalletTransaction
         from app.services.wallet_service import credit_wallet
 
+        if getattr(ingestion, "credit_source", None) == "sku":
+            from app.services import sku_packs, usage_log
+
+            if sku_packs.refund_credit(db, ingestion_id):
+                consumed_by = sku_packs.customer_for_order(db, ingestion_id)
+                if consumed_by:
+                    usage_log.queue_sync(consumed_by)
+            return
+
         already = (
             db.query(AuditLog.id)
             .filter(
@@ -1154,7 +1406,12 @@ async def _notify_failed_order(db, ingestion, product_label: str) -> None:
     failure wording. States a refund only when a refund row exists. Never raises."""
     refunded = _refunded_amount(db, ingestion)
     text = f"Sorry, we couldn't create your {product_label} this time. "
-    if refunded:
+    if getattr(ingestion, "credit_source", None) == "sku":
+        from app.services import sku_packs
+
+        if sku_packs.credit_returned(db, ingestion.id):
+            text += "Your SKU credit has been returned, so please send the photo again."
+    elif refunded:
         text += f"₹{refunded} has been refunded to your wallet."
     elif not ingestion.amount_charged:
         text += "You were not charged."
@@ -1262,6 +1519,7 @@ async def recover_unrefunded_failed_orders(older_than) -> int:
                     {WhatsAppIngestion.updated_at: datetime.now(timezone.utc)}, synchronize_session=False)
                 db.commit()
                 logger.error(f"Refund still not possible: ingestion_id={row_id}; needs manual review")
+        recovered += await _recover_unreturned_credits(db, cutoff)
     except Exception as e:
         logger.error(f"Unrefunded failed order recovery failed: {e}")
         try:
@@ -1271,6 +1529,34 @@ async def recover_unrefunded_failed_orders(older_than) -> int:
     finally:
         db.close()
     return recovered
+
+
+async def _recover_unreturned_credits(db, cutoff) -> int:
+    """Failed orders paid by a SKU credit whose credit was never given back (a crash between the failure and the
+    refund): give it back now. Returns how many."""
+    from sqlalchemy import exists
+
+    from app.models.sku_credit import ACTION_CONSUME, ACTION_REFUND, CustomerSkuCredit
+    from app.models.whatsapp_ingestion import WhatsAppIngestion
+
+    ids = [row[0] for row in db.query(WhatsAppIngestion.id).filter(
+        WhatsAppIngestion.status.in_(("failed", "delivery_failed")),
+        WhatsAppIngestion.credit_source == "sku",
+        WhatsAppIngestion.updated_at < cutoff,
+        exists().where(CustomerSkuCredit.action == ACTION_CONSUME, CustomerSkuCredit.reference_id == WhatsAppIngestion.id),
+        ~exists().where(CustomerSkuCredit.action == ACTION_REFUND, CustomerSkuCredit.reference_id == WhatsAppIngestion.id),
+    ).limit(50).all()]
+    db.commit()
+    returned = 0
+    for ingestion_id in ids:
+        row = db.get(WhatsAppIngestion, ingestion_id)
+        if row is None or row.status not in ("failed", "delivery_failed"):
+            continue
+        logger.error(f"Failed order still holds the customer's SKU credit, returning it: ingestion_id={ingestion_id}")
+        _refund_failed_ingestion(db, row)
+        await _notify_failed_order(db, row, "Clean Studio Shot" if row.product_code == "WHITE_BG" else "Full Catalog Pack")
+        returned += 1
+    return returned
 
 
 async def release_abandoned_choice_claims(older_than) -> int:
@@ -1395,6 +1681,9 @@ async def run_recovery_sweep_forever(stuck_after) -> None:
             unrefunded = await recover_unrefunded_failed_orders(FAILED_REFUND_GRACE)
             released = await release_abandoned_choice_claims(CHOICE_CLAIM_GRACE)
             await recover_interrupted_photos(INTERRUPTED_PHOTO_GRACE)
+            from app.services import drive_delivery
+
+            await drive_delivery.recover_stalled_deliveries()
             from app.services.message_dedupe import purge_old_processed_messages
 
             await asyncio.to_thread(purge_old_processed_messages)
@@ -1420,7 +1709,7 @@ async def recover_stuck_paid_orders(older_than) -> int:
     """
     from datetime import datetime, timezone
 
-    from sqlalchemy import or_
+    from sqlalchemy import and_, or_
 
     from app.database import SessionLocal
     from app.models.whatsapp_ingestion import PRODUCT_WHITE_BG, WhatsAppIngestion
@@ -1437,9 +1726,13 @@ async def recover_stuck_paid_orders(older_than) -> int:
             db.query(WhatsAppIngestion)
             .filter(
                 WhatsAppIngestion.status.in_(STUCK_PAID_STATUSES),
-                WhatsAppIngestion.amount_charged > 0,
+                or_(WhatsAppIngestion.amount_charged > 0, WhatsAppIngestion.credit_source == "sku"),
                 WhatsAppIngestion.updated_at < cutoff,
-                or_(WhatsAppIngestion.group_id.is_(None), WhatsAppIngestion.updated_at < bulk_cutoff),
+                or_(
+                    and_(WhatsAppIngestion.group_id.is_(None),
+                         or_(WhatsAppIngestion.credit_source.is_(None), WhatsAppIngestion.credit_source != "sku")),
+                    WhatsAppIngestion.updated_at < bulk_cutoff,
+                ),
                 or_(
                     WhatsAppIngestion.status != "generated",
                     WhatsAppIngestion.updated_at < generated_cutoff,
@@ -1565,8 +1858,49 @@ async def _generate_single_pack_style(
         return None
 
 
+# A style that went to the customer's Drive folder comes back from _generate_and_upload_style as
+# DRIVE_RESULT_PREFIX + the Drive file name, where a style sent through Meta comes back as its media id.
+DRIVE_RESULT_PREFIX = "drive:"
+
+
+def _image_mime(image_bytes: bytes) -> str:
+    if image_bytes[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if image_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"
+
+
+async def _upload_style_to_drive(
+    image_bytes: bytes, customer_id: str, ingestion_id: str, style_title: Optional[str]
+) -> Optional[str]:
+    """Put one finished style in the customer's Generated Images/{day} folder (named "NNN - {style}") and keep the
+    dashboard copy, as _upload_and_keep does. Returns the Drive file name, or None when Drive failed (the caller
+    then sends that style through Meta, so a paid style is never lost)."""
+    import tempfile
+    from pathlib import Path
+
+    from app.services import drive_layout
+
+    mime = _image_mime(image_bytes)
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "style" + drive_layout.IMAGE_EXTENSIONS.get(mime, ".png"))
+            await run_io(Path(path).write_bytes, image_bytes)
+            uploaded = await drive_layout.upload_delivery_image(
+                customer_id, path, mime, datetime.now(timezone.utc), label=style_title or "",
+            )
+    except Exception as e:  # noqa: BLE001 -- the style goes through Meta instead
+        logger.error(f"Catalog pack style '{style_title}' not saved to Drive ({type(e).__name__}); sending on WhatsApp")
+        return None
+    info = chat_log.write_output_file(ingestion_id, image_bytes) if chat_log.enabled() else None
+    if info:
+        chat_log.fire(chat_log.register_output, ingestion_id, style_title, 0, info, None)
+    return uploaded["name"]
+
+
 async def _generate_and_upload_style(
-    generate_deadline_seconds: float = 0.0, **kwargs: Any
+    generate_deadline_seconds: float = 0.0, drive_customer_id: Optional[str] = None, **kwargs: Any
 ) -> Tuple[bool, Optional[str]]:
     """Generate one style, then upload it to Meta AT ONCE and let go of the bytes (PERF-5).
 
@@ -1591,6 +1925,12 @@ async def _generate_and_upload_style(
         return False, None
     if not image_bytes:
         return False, None
+    if drive_customer_id:
+        drive_name = await _upload_style_to_drive(
+            image_bytes, drive_customer_id, str(kwargs.get("ingestion_id") or ""), kwargs.get("style_title"))
+        if drive_name:
+            del image_bytes
+            return True, DRIVE_RESULT_PREFIX + drive_name
     media_id = await _upload_and_keep(image_bytes, str(kwargs.get("ingestion_id") or ""), kwargs.get("style_title"))
     del image_bytes
     return True, (media_id or None)
@@ -1656,6 +1996,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
     from app.services.earring_complementary_shot_prompt import build_complementary_shot_prompt
     from app.services.earring_ugc_style_prompt import build_ugc_style_prompt
     from app.services.earring_on_stand_shot import build_stand_shot_prompt
+    from app.services.earring_luxury_drape_shot import build_luxury_drape_prompt
     from app.models.customer import Customer
 
     style_prompt_builders = {
@@ -1666,6 +2007,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         "prompt_complementary": build_complementary_shot_prompt,
         "prompt_ugc": build_ugc_style_prompt,
         "prompt_stand": build_stand_shot_prompt,
+        "prompt_luxury_drape": build_luxury_drape_prompt,
     }
 
     started_at = time.monotonic()
@@ -1787,6 +2129,13 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         quote_id = ingestion.external_message_id
         _release_db(db)
 
+        # Phase 8: a customer whose Drive folder is shared with their email gets the styles there, not in the chat.
+        from app.services import drive_delivery
+
+        drive_customer_id = None
+        if drive_delivery.enabled():
+            drive_customer_id = await run_io(drive_delivery.customer_id_if_ready, recipient_id)
+
         gather_results = await _gather_styles_with_deadline(
             [
                 _generate_and_upload_style(
@@ -1798,6 +2147,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
                     reference_mime_type=reference_mime,
                     request_id=order_request_id,
                     spend_reserved=spend_reserved,
+                    drive_customer_id=drive_customer_id,
                 )
                 for style_title, prompt in style_jobs
             ],
@@ -1808,7 +2158,8 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         # Each style was uploaded to Meta the moment it finished; a style that failed (or was dropped at the
         # deadline) is None. Same order as the styles, failures skipped, exactly as before.
         generated_any = any(r and r[0] for r in gather_results)
-        media_ids: List[str] = [r[1] for r in gather_results if r and r[1]]
+        media_ids: List[str] = [r[1] for r in gather_results if r and r[1] and not r[1].startswith(DRIVE_RESULT_PREFIX)]
+        drive_count = sum(1 for r in gather_results if r and r[1] and r[1].startswith(DRIVE_RESULT_PREFIX))
 
         # Styles that produced nothing (failed, dropped at the deadline) cost nothing: give their reserved
         # slots back to the shared daily counter (COST-1).
@@ -1826,9 +2177,10 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         if not _advance_status(db, ingestion_id, "processing", "generated"):
             return False
 
-        if not media_ids:
+        if not media_ids and not drive_count:
             return await _fail("All Meta media uploads failed", delivery=True)
 
+        from app.services import batch_notify
         from app.services.wallet_service import find_customer_by_phone, get_balance
 
         cust = find_customer_by_phone(db, recipient_id)
@@ -1836,12 +2188,16 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         balance_text = f"₹{rem_bal:,}"
         _release_db(db)
 
-        sent_count = await send_catalog_pack_images_to_whatsapp(
-            recipient_id=recipient_id,
-            image_urls=media_ids,
-            balance_text=balance_text,
-            reply_to_message_id=quote_id,
-        )
+        # Styles saved to Drive are announced by the one batch "ready" message; only the styles Drive could not take
+        # (if any) are sent here.
+        sent_count = drive_count
+        if media_ids:
+            sent_count += await send_catalog_pack_images_to_whatsapp(
+                recipient_id=recipient_id,
+                image_urls=media_ids,
+                balance_text=balance_text,
+                reply_to_message_id=quote_id,
+            )
         # Completion is measured against the styles this pack was meant to
         # produce, not just the images that happened to be generated.
         total_images = len(style_jobs)
@@ -1855,7 +2211,11 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
             if not _advance_status(db, ingestion_id, "generated", "delivered_partial"):
                 return True       # recovery changed the order; the images are already with the customer
             ingestion.error_message = f"Delivered {sent_count}/{total_images} images"
+            if drive_count:
+                ingestion.delivery_channel = drive_delivery.CHANNEL_DRIVE
             db.commit()
+            if drive_count:
+                await run_io(batch_notify.schedule, drive_customer_id)
             logger.warning(
                 f"Catalog pack partially delivered: ingestion_id={ingestion_id} "
                 f"sent={sent_count}/{total_images} recipient={mask_phone(recipient_id)}"
@@ -1875,7 +2235,11 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         if not _advance_status(db, ingestion_id, "generated", "delivered"):
             return True       # images are already with the customer; do not overwrite a swept status
         ingestion.error_message = None
+        if drive_count:
+            ingestion.delivery_channel = drive_delivery.CHANNEL_DRIVE
         db.commit()
+        if drive_count:
+            await run_io(batch_notify.schedule, drive_customer_id)
 
         logger.info(
             f"Catalog pack delivered: ingestion_id={ingestion_id} images={len(media_ids)} "
@@ -2161,6 +2525,24 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
         if not _advance_status(db, ingestion_id, "processing", "generated"):
             return False
 
+        from app.services import drive_delivery
+
+        if output_path is not None and drive_delivery.enabled() and await run_io(drive_delivery.folder_ready, recipient_id):
+            # Phase 8: the kept copy is uploaded to {phone}/Images/{day}/ by an outbox job (retried; WhatsApp is the
+            # fallback); one "ready" message per batch replaces the image message.
+            job_id = await run_io(drive_delivery.hand_over, ingestion_id, str(output_path), "image/png")
+            if job_id is not None:
+                info = chat_log.write_output_file(ingestion_id, generated_bytes) if chat_log.enabled() else None
+                if info:
+                    chat_log.fire(chat_log.register_output, ingestion_id, "Clean Studio Shot", 0, info, None)
+                del generated_bytes
+                from app.services import outbox
+
+                task = asyncio.ensure_future(outbox.run_job_now(job_id))
+                drive_delivery.BACKGROUND.add(task)
+                task.add_done_callback(drive_delivery.BACKGROUND.discard)
+                return True
+
         media_id = await _upload_and_keep(generated_bytes, ingestion_id, "Clean Studio Shot")
         if not media_id:
             return await _fail("Meta media upload failed", delivery=True)
@@ -2171,11 +2553,17 @@ async def process_whatsapp_white_bg(ingestion_id: str) -> bool:
             from app.services.wallet_service import find_customer_by_phone, get_balance
 
             cust = find_customer_by_phone(db, recipient_id)
-            rem_bal = get_balance(db, cust.whatsapp_id) if cust else 0
-            caption = (
-                "Here's your Clean Studio Shot ✨\n"
-                f"Remaining balance: ₹{rem_bal:,}"
-            )
+            if getattr(ingestion, "credit_source", None) == "sku" and cust is not None:
+                from app.services import sku_messages, sku_packs
+
+                left = sku_packs.balance(db, cust.id)
+                caption = f"Here's your Clean Studio Shot ✨\n{sku_messages.skus_left(left)}"
+            else:
+                rem_bal = get_balance(db, cust.whatsapp_id) if cust else 0
+                caption = (
+                    "Here's your Clean Studio Shot ✨\n"
+                    f"Remaining balance: ₹{rem_bal:,}"
+                )
         _release_db(db)
 
         sent = await send_image_to_whatsapp(
