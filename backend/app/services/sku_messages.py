@@ -4,6 +4,7 @@ One place for the words; every amount is formatted by ``pricing.format_rupees`` 
 Interactive bodies stay well under Meta's 1024-character limit, list buttons under 20 characters.
 """
 
+from app.config import settings
 from app.services import pricing
 
 PACK_MENU_BUTTON = "View packs"          # list-message button, 20 characters at most
@@ -14,6 +15,13 @@ def _pack_styles() -> int:
     from app.services.meta_whatsapp_service import pack_generation_count  # lazy: the service imports this module
 
     return pack_generation_count()
+
+
+def _pack_v1_5_styles() -> int:
+    """Photoshoot styles in one Catalog Pack v1.5, read from its own pack definition."""
+    from app.services.meta_whatsapp_service import pack_v1_5_generation_count  # lazy: the service imports this module
+
+    return pack_v1_5_generation_count()
 
 
 def _skus(count: int) -> str:
@@ -32,27 +40,32 @@ def pack_menu_body() -> str:
 PAY_BUTTON = "Place Order"               # cart URL button (opens the Razorpay payment), 20 characters at most
 
 
-def pack_link_body(units: int, total: int, creative_packs: int = 0) -> str:
-    """The cart summary sent with the single payment button. A cart with Catalog Pack SKUs lists both collections."""
-    units, creative_packs = max(int(units), 0), max(int(creative_packs), 0)
+def pack_link_body(units: int, total: int, creative_packs: int = 0, v1_5_packs: int = 0) -> str:
+    """The cart summary sent with the single payment button. A cart with Catalog Pack (or Catalog Pack v1.5) SKUs lists
+    every collection in it."""
+    units, creative_packs, v1_5_packs = max(int(units), 0), max(int(creative_packs), 0), max(int(v1_5_packs), 0)
     lines = ["Your Cart is ready!"]
-    if creative_packs:
+    if creative_packs or v1_5_packs:
         if units:
             lines.append(f"{pricing.STUDIO_TITLE}: {_skus(units)}")
-        lines.append(f"{pricing.CREATIVE_TITLE}: {_skus(creative_packs)}")
-    lines += [f"Total SKUs: {units + creative_packs}",
+        if creative_packs:
+            lines.append(f"{pricing.CREATIVE_TITLE}: {_skus(creative_packs)}")
+        if v1_5_packs:
+            lines.append(f"{pricing.CATALOG_V1_5_TITLE}: {_skus(v1_5_packs)}")
+    lines += [f"Total SKUs: {units + creative_packs + v1_5_packs}",
               f"Total Amount: {pricing.format_rupees(total)} (incl. GST)", "Click below to complete your payment:"]
     return "\n".join(lines)
 
 
-def pack_order_body(units: int, total: int, creative_packs: int = 0) -> str:
+def pack_order_body(units: int, total: int, creative_packs: int = 0, v1_5_packs: int = 0) -> str:
     """The same cart summary for the in-chat WhatsApp Pay order, whose button is WhatsApp's own "Review and pay"."""
-    lines = pack_link_body(units, total, creative_packs).split("\n")
+    lines = pack_link_body(units, total, creative_packs, v1_5_packs).split("\n")
     return "\n".join(lines[:-1] + ["Tap Review and pay to pay here in WhatsApp."])
 
 
 STUDIO_COLLECTION_TITLE = pricing.STUDIO_TITLE
 CATALOG_COLLECTION_TITLE = pricing.CREATIVE_TITLE
+CATALOG_V1_5_COLLECTION_TITLE = pricing.CATALOG_V1_5_TITLE
 
 
 def collections_body() -> str:
@@ -62,9 +75,18 @@ def collections_body() -> str:
         f"1. {STUDIO_COLLECTION_TITLE}: white-background studio shots, "
         f"{pricing.format_rupees(pricing.sku_price())} per SKU\n"
         f"2. {CATALOG_COLLECTION_TITLE} (Ecomm Pack 1): {_pack_styles()} jewellery photoshoot styles per photo, "
-        f"{pricing.format_rupees(pricing.creative_pack_price())} per SKU\n\n"
+        f"{pricing.format_rupees(pricing.creative_pack_price())} per SKU\n"
+        f"{_collection_v1_5_line()}\n"
         "Tap View Collections, pick one and tap Send."
     )
+
+
+def _collection_v1_5_line() -> str:
+    """Line 3 of the collections body: Catalog Pack v1.5, only while CATALOG_V1_5_ENABLED."""
+    if not settings.CATALOG_V1_5_ENABLED:
+        return ""
+    return (f"3. {CATALOG_V1_5_COLLECTION_TITLE}: {_pack_v1_5_styles()} jewellery photoshoot styles per photo, "
+            f"{pricing.format_rupees(pricing.catalog_v1_5_pack_price())} per SKU\n")
 
 
 def studio_collection_row(db=None) -> str:
@@ -74,6 +96,17 @@ def studio_collection_row(db=None) -> str:
 
 def catalog_collection_row() -> str:
     return f"Ecomm Pack 1 · {_pack_styles()} styles · {pricing.format_rupees(pricing.creative_pack_price())} per SKU"
+
+
+def catalog_v1_5_collection_row() -> str:
+    return (f"Pack v1.5 · {_pack_v1_5_styles()} styles · "
+            f"{pricing.format_rupees(pricing.catalog_v1_5_pack_price())} per SKU")
+
+
+def catalog_v1_5_tier_description(units: int) -> str:
+    """List row description of one Catalog Pack v1.5 tier (72 characters at most)."""
+    return (f"{_skus(units)} of {_pack_v1_5_styles()} photoshoot styles · "
+            f"{pricing.format_rupees(units * pricing.catalog_v1_5_pack_price())}")
 
 
 def catalog_tier_description(units: int) -> str:

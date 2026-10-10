@@ -70,16 +70,20 @@ def main() -> int:
         return 2
     print(f"Catalogue {catalog_id}: {len(by_id)} products")
     bad = 0
-    for title, make in ((pricing.STUDIO_TITLE, pricing.pack_retailer_id),
-                        (pricing.CREATIVE_TITLE, pricing.catalog_retailer_id)):
+    collections = [(pricing.STUDIO_TITLE, pricing.pack_retailer_id),
+                   (pricing.CREATIVE_TITLE, pricing.catalog_retailer_id)]
+    if settings.CATALOG_V1_5_ENABLED:          # its tiers must exist in the catalogue before the menu shows them
+        collections.append((pricing.CATALOG_V1_5_TITLE, pricing.catalog_v1_5_retailer_id))
+    for title, make in collections:
         for size in pricing.menu_pack_sizes():
             rid = make(size)
             product = by_id.get(rid)
             issue = ["MISSING from catalogue"] if product is None else problems(product)
             bad += bool(issue)
-            print(f"  {title:<13} {rid:<16} {'OK' if not issue else ', '.join(issue)}")
+            print(f"  {title:<17} {rid:<20} {'OK' if not issue else ', '.join(issue)}")
     extras = sorted(rid for rid in by_id if not rid.startswith((pricing.STUDIO_RETAILER_PREFIX,
-                                                                pricing.CATALOG_RETAILER_PREFIX)))
+                                                                pricing.CATALOG_RETAILER_PREFIX,
+                                                                pricing.CATALOG_V1_5_RETAILER_PREFIX)))
     if extras:
         print(f"Other retailer ids in the catalogue (not sent by the bot): {', '.join(extras[:20])}")
     return 1 if bad else 0

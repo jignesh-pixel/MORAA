@@ -403,9 +403,15 @@ class Settings(BaseSettings):
     # Price of one Catalog Pack SKU (sku_pack_N: one photo in every pack photoshoot style) in whole rupees, GST included.
     # Its tiers are N x this price. Kept apart from SKU_PRICE_RUPEES, which prices Studio Shot (studio_sku_N).
     CATALOG_PACK_SKU_PRICE: int = 500
+    # Price of one Catalog Pack v1.5 SKU (sku_pack_v1_5_N: one photo in 5 photoshoot styles) in whole rupees, GST
+    # included. Its tiers are N x this price. Independent of SKU_PRICE_RUPEES and CATALOG_PACK_SKU_PRICE.
+    CATALOG_V1_5_PACK_SKU_PRICE: int = 350
     SKU_PACK_SIZES: str = "1,5,20,50,100"
     # The 1-SKU pack can always be bought by retailer id (pack_1) but is only shown in menus when this is true.
     ECOM_PACK1_ENABLED: bool = False
+    # Catalog Pack v1.5 is only shown in the "View Collections" list when this is true (create its sku_pack_v1_5_N items
+    # in the catalogue first: scripts/check_catalog.py). It can always be bought by retailer id and used once held.
+    CATALOG_V1_5_ENABLED: bool = False
     SKU_GST_PERCENT: int = 18                 # splits the GST-inclusive price into net + tax for invoices
     SKU_CREDIT_VALIDITY_DAYS: int = 90        # a new pack extends every unused credit to this many days
     SKU_ERPNEXT_ITEM_CODE: str = ""           # ERPNext item for packs; empty = ERPNEXT_RECHARGE_ITEM_CODE

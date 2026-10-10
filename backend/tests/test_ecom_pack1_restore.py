@@ -339,7 +339,7 @@ class PackRunTests(unittest.TestCase):
         openai_call.assert_not_awaited()
         gemini_lines = [line for line in audit_lines if "Gemini Image Call Triggered" in line]
         self.assertEqual(len(gemini_lines), styles)
-        # Every style shares the order's request_id, so the audit counts the order's calls 1..7.
+        # Every style shares the order's request_id, so the audit counts the order's calls 1..N.
         for n, line in enumerate(gemini_lines, start=1):
             self.assertIn(f"[API-AUDIT] Gemini Image Call Triggered: Count {n} request_id=", line)
         self.assertEqual(self._state(), ("delivered", 0, 0))

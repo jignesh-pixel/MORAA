@@ -294,10 +294,10 @@ def erase_customer(db: Session, customer: Customer) -> Dict[str, int]:
             f"Your wallet still holds ₹{int(customer.wallet_balance):,}. Wallet balances are not refunded, so please use "
             "your balance for orders first, then ask again."
         )
-    from app.models.sku_credit import SKU_CREATIVE, SKU_WHITE_BG
+    from app.models.sku_credit import SKU_CREATIVE, SKU_CREATIVE_V1_5, SKU_WHITE_BG
     from app.services import sku_packs
 
-    credits = sku_packs.balance(db, customer.id, SKU_WHITE_BG) + sku_packs.balance(db, customer.id, SKU_CREATIVE)
+    credits = sum(sku_packs.balance(db, customer.id, sku) for sku in (SKU_WHITE_BG, SKU_CREATIVE, SKU_CREATIVE_V1_5))
     if credits > 0:
         raise ErasureRefused(
             f"You still have {credits} unused image credit{'' if credits == 1 else 's'}. Credits are not refunded, so "

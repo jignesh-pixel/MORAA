@@ -145,25 +145,38 @@ async def create_recharge_payment_link(
 
 
 async def create_pack_payment_link(
-    customer_phone: str, customer_name: str, units: int, creative_packs: int = 0,
+    customer_phone: str, customer_name: str, units: int, creative_packs: int = 0, v1_5_packs: int = 0,
 ) -> Optional[str]:
     """One Razorpay Payment Link for a whole cart: ``units`` white-background SKUs plus ``creative_packs`` Creative
-    Studio Packs, priced here at today's prices (never taken from Meta).
+    Studio Packs plus ``v1_5_packs`` Catalog Pack v1.5 SKUs, priced here at today's prices (never taken from Meta).
 
     notes carry purpose "sku_pack", the SKU counts and a short cart summary, so the payment webhook and the reconcile
     sweep grant SKU credits instead of crediting the wallet. Returns the short URL, or None on any failure: there is
     no static fallback, because a static payment page cannot carry the cart."""
-    counts = (units, creative_packs)
+    counts = (units, creative_packs, v1_5_packs)
     if any(isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= MAX_PACK_UNITS for n in counts) \
-            or units + creative_packs < 1:
-        logger.warning(f"SKU pack link refused: units={units!r} creative_packs={creative_packs!r}")
+            or units + creative_packs + v1_5_packs < 1:
+        logger.warning(f"SKU pack link refused: units={units!r} creative_packs={creative_packs!r} "
+                       f"v1_5_packs={v1_5_packs!r}")
         return None
     unit_total = await run_io(pricing.pack_total, units) if units else 0
-    amount = unit_total + (pricing.creative_pack_price() * creative_packs if creative_packs else 0)
+    amount = unit_total + (pricing.creative_pack_price() * creative_packs if creative_packs else 0) + (
+        pricing.catalog_v1_5_pack_price() * v1_5_packs if v1_5_packs else 0)
     summary = {"white_bg": units, "creative_pack": creative_packs, "total": amount}
+    if v1_5_packs:
+        summary["creative_pack_v1_5"] = v1_5_packs
     parts = [f"{pricing.STUDIO_TITLE} {pricing.pack_title(units)}"] if units else []
     if creative_packs:
         parts.append(f"{pricing.CREATIVE_TITLE} {pricing.pack_title(creative_packs)}")
+    if v1_5_packs:
+        parts.append(f"{pricing.CATALOG_V1_5_TITLE} {pricing.pack_title(v1_5_packs)}")
+    notes = {
+        "whatsapp_id": customer_phone, "phone": customer_phone, "purpose": PURPOSE_SKU_PACK,
+        "units": str(units), "total_skus": str(units), "creative_packs": str(creative_packs),
+        "cart_summary": json.dumps(summary, separators=(",", ":")),
+    }
+    if v1_5_packs:
+        notes["catalog_v1_5_packs"] = str(v1_5_packs)
     link = await _post_payment_link(
         {
             "amount": int(amount) * 100,
@@ -176,23 +189,21 @@ async def create_pack_payment_link(
                 "contact": customer_phone,
             },
             "notify": {"sms": False, "email": False},
-            "notes": {
-                "whatsapp_id": customer_phone, "phone": customer_phone, "purpose": PURPOSE_SKU_PACK,
-                "units": str(units), "total_skus": str(units), "creative_packs": str(creative_packs),
-                "cart_summary": json.dumps(summary, separators=(",", ":")),
-            },
+            "notes": notes,
         }
     )
     url = (link or {}).get("short_url")
     if not url:
-        logger.error(f"SKU pack payment link could not be created (units={units} creative_packs={creative_packs})")
+        logger.error(f"SKU pack payment link could not be created (units={units} creative_packs={creative_packs} "
+                     f"v1_5_packs={v1_5_packs})")
         return None
     link_id = str((link or {}).get("id") or "")
     if link_id:
         # So the reconcile sweep can later ask Razorpay whether it was paid (best effort, own I/O pool).
         await run_io(record_payment_link, link_id, customer_phone, int(amount), PURPOSE_SKU_PACK, units)
     logger.info(
-        f"Created SKU pack payment link ({units} SKUs, {creative_packs} creative, razorpay_mode={razorpay_mode()}) "
+        f"Created SKU pack payment link ({units} SKUs, {creative_packs} creative, {v1_5_packs} v1.5, "
+        f"razorpay_mode={razorpay_mode()}) "
         f"for {mask_phone(customer_phone)}"
     )
     return url

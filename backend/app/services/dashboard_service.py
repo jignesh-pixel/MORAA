@@ -262,11 +262,14 @@ def profile(db: Session, phone: str) -> Optional[Dict[str, Any]]:
             "gstin": customer.gst_number, "gst_verified": bool(customer.is_gst_verified), "address": customer.address,
             "tier": customer.tier, "balance": int(customer.wallet_balance or 0), "customer_since": _iso(customer.created_at),
         })
-        from app.models.sku_credit import SKU_CREATIVE, SKU_WHITE_BG
+        from app.models.sku_credit import SKU_CREATIVE, SKU_CREATIVE_V1_5, SKU_WHITE_BG
         from app.services import google_drive, sku_packs
 
         result["sku_credits"] = {"white_bg": sku_packs.balance(db, customer.id, SKU_WHITE_BG),
                                  "creative_pack": sku_packs.balance(db, customer.id, SKU_CREATIVE)}
+        v1_5_credits = sku_packs.balance(db, customer.id, SKU_CREATIVE_V1_5)
+        if v1_5_credits:          # listed only for a customer who holds some: the older two-key shape is unchanged
+            result["sku_credits"]["creative_pack_v1_5"] = v1_5_credits
         result["drive_folder"] = google_drive.folder_link(customer.drive_folder_id) if customer.drive_folder_id else None
         txs = db.query(WalletTransaction).filter(
             WalletTransaction.customer_id == customer.id, WalletTransaction.created_at >= since
@@ -305,7 +308,7 @@ def profile(db: Session, phone: str) -> Optional[Dict[str, Any]]:
 def sku_stats(db: Session) -> Dict[str, Any]:
     """Packs sold and their revenue (captured pack payments) and the credits customers still hold (ledger sum)."""
     from app.models.audit_log import AuditLog
-    from app.models.sku_credit import SKU_CREATIVE, SKU_WHITE_BG, CustomerSkuCredit
+    from app.models.sku_credit import SKU_CREATIVE, SKU_CREATIVE_V1_5, SKU_WHITE_BG, CustomerSkuCredit
     from app.services.sku_packs import PAYMENT_CAPTURED_ACTION, PURPOSE_SKU_PACK
 
     packs = revenue = 0
@@ -322,6 +325,8 @@ def sku_stats(db: Session) -> Dict[str, Any]:
     outstanding = dict(db.query(CustomerSkuCredit.sku, func.coalesce(func.sum(CustomerSkuCredit.quantity), 0))
                        .group_by(CustomerSkuCredit.sku).all())
     credits = {sku: max(int(outstanding.get(sku) or 0), 0) for sku in (SKU_WHITE_BG, SKU_CREATIVE)}
+    if outstanding.get(SKU_CREATIVE_V1_5):      # listed only once some exist: the older two-key shape is unchanged
+        credits[SKU_CREATIVE_V1_5] = max(int(outstanding[SKU_CREATIVE_V1_5]), 0)
     return {"packs_sold": packs, "pack_revenue": revenue, "credits_outstanding": credits}
 
 

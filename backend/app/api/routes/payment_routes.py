@@ -26,7 +26,7 @@ from app.services.meta_whatsapp_service import (
 )
 from app.models.whatsapp_payment_order import WhatsAppPaymentOrder
 from app.models.wallet_transaction import KIND_CREDIT_PAYMENT, KIND_DEBIT_DISPUTE, KIND_DEBIT_REFUND
-from app.models.sku_credit import SKU_CREATIVE
+from app.models.sku_credit import SKU_CREATIVE, SKU_CREATIVE_V1_5
 from app.services import pricing, sku_packs
 from app.services.pending_payment_service import mark_pending_credited, record_pending_payment
 from app.services.wallet_service import (
@@ -395,11 +395,11 @@ def _whole(raw: Any) -> int:
         return -1
 
 
-def _pack_counts(payload: Dict[str, Any]) -> Optional[Tuple[int, int]]:
-    """(white-background SKUs, Catalog Pack SKUs) of a SKU pack payment (notes.purpose "sku_pack"; payment notes
-    first, then the payment link's notes).
+def _pack_counts(payload: Dict[str, Any]) -> Optional[Tuple[int, int, int]]:
+    """(white-background SKUs, Catalog Pack SKUs, Catalog Pack v1.5 SKUs) of a SKU pack payment (notes.purpose
+    "sku_pack"; payment notes first, then the payment link's notes).
 
-    None = not a pack (a wallet recharge, as before). (0, 0) = a pack whose counts are missing or not whole numbers
+    None = not a pack (a wallet recharge, as before). (0, 0, 0) = a pack whose counts are missing or not whole numbers
     from 0 to MAX_PACK_UNITS (at least one item): such a payment is parked for review, never credited."""
     for path in (("payload", "payment", "entity", "notes"), ("payload", "payment_link", "entity", "notes")):
         notes = _nested_get(payload, *path)
@@ -407,10 +407,11 @@ def _pack_counts(payload: Dict[str, Any]) -> Optional[Tuple[int, int]]:
             continue
         units = _whole(notes.get("units", notes.get("total_skus")))
         creative = _whole(notes.get("creative_packs", 0))
+        v1_5 = _whole(notes.get("catalog_v1_5_packs", 0))
         limit = sku_packs.MAX_PACK_UNITS
-        if 0 <= units <= limit and 0 <= creative <= limit and units + creative >= 1:
-            return units, creative
-        return 0, 0
+        if 0 <= units <= limit and 0 <= creative <= limit and 0 <= v1_5 <= limit and units + creative + v1_5 >= 1:
+            return units, creative, v1_5
+        return 0, 0, 0
     return None
 
 
@@ -427,12 +428,14 @@ def _pack_matches_link(db: Session, payload: Dict[str, Any], units: int, amount_
             and int(row.amount_rupees) == int(amount_paid))
 
 
-def _grant_cart(db: Session, customer: Customer, white: int, creative: int, payment_id: str) -> None:
+def _grant_cart(db: Session, customer: Customer, white: int, creative: int, payment_id: str, v1_5: int = 0) -> None:
     """Grant every SKU a cart payment bought, in the caller's transaction (each once: a repeat raises IntegrityError)."""
     if white:
         sku_packs.grant_pack_credits(db, customer, white, payment_id)
     if creative:
         sku_packs.grant_pack_credits(db, customer, creative, payment_id, sku=SKU_CREATIVE)
+    if v1_5:
+        sku_packs.grant_pack_credits(db, customer, v1_5, payment_id, sku=SKU_CREATIVE_V1_5)
 
 
 def _resolve_customer(db: Session, sender_id: str) -> Optional[Customer]:
@@ -442,12 +445,16 @@ def _resolve_customer(db: Session, sender_id: str) -> Optional[Customer]:
     return find_customer_by_phone(db, sender_id)
 
 
-def _pack_receipt(db: Session, customer: Customer, units: int, creative: int = 0) -> str:
+def _pack_receipt(db: Session, customer: Customer, units: int, creative: int = 0, v1_5: int = 0) -> str:
     """The pack receipt with the credits and validity read from the ledger at send time (includes this grant)."""
-    until = sku_packs.valid_until(db, customer.id) if units else sku_packs.valid_until(db, customer.id, SKU_CREATIVE)
+    until = (sku_packs.valid_until(db, customer.id) if units else
+             sku_packs.valid_until(db, customer.id, SKU_CREATIVE) if creative else
+             sku_packs.valid_until(db, customer.id, SKU_CREATIVE_V1_5))
     bought = [f"{pricing.STUDIO_TITLE} {pricing.pack_title(units)}"] if units else []
     if creative:
         bought.append(f"{pricing.CREATIVE_TITLE} {pricing.pack_title(creative)}")
+    if v1_5:
+        bought.append(f"{pricing.CATALOG_V1_5_TITLE} {pricing.pack_title(v1_5)}")
     text = PACK_RECEIPT_MESSAGE.format(
         pack=" + ".join(bought),
         credits=sku_packs.balance(db, customer.id),
@@ -455,6 +462,9 @@ def _pack_receipt(db: Session, customer: Customer, units: int, creative: int = 0
     )
     if creative:
         text += f"\n{pricing.CREATIVE_TITLE} SKUs available: {sku_packs.balance(db, customer.id, SKU_CREATIVE)}"
+    if v1_5:
+        text += (f"\n{pricing.CATALOG_V1_5_TITLE} SKUs available: "
+                 f"{sku_packs.balance(db, customer.id, SKU_CREATIVE_V1_5)}")
     return text if getattr(customer, "email", None) else text + PACK_EMAIL_REQUEST_LINE
 
 
@@ -602,6 +612,7 @@ def _payment_audit_row(
     auto_provisioned: bool = False,
     pack_units: Optional[int] = None,
     creative_packs: int = 0,
+    v1_5_packs: int = 0,
 ) -> AuditLog:
     details: Dict[str, Any] = {
         "sender_id": sender_id,
@@ -611,8 +622,10 @@ def _payment_audit_row(
         # unregistered wallet row until they register.
         "auto_provisioned": auto_provisioned,
     }
-    if pack_units or creative_packs:
+    if pack_units or creative_packs or v1_5_packs:
         details.update({"purpose": sku_packs.PURPOSE_SKU_PACK, "units": pack_units, "creative_packs": creative_packs})
+        if v1_5_packs:
+            details["catalog_v1_5_packs"] = v1_5_packs
     return AuditLog(
         user_id=None,
         action=AUDIT_ACTION_PAYMENT_CAPTURED,
@@ -743,8 +756,8 @@ async def process_razorpay_event(
 
     # A SKU pack payment grants credits instead of rupees; its units come from the notes we set on the link.
     pack = _pack_counts(payload)
-    pack_white, pack_creative = pack if pack else (0, 0)
-    pack_units = (pack_white + pack_creative) if pack else None     # truthy = this payment buys SKU credits
+    pack_white, pack_creative, pack_v1_5 = pack if pack else (0, 0, 0)
+    pack_units = (pack_white + pack_creative + pack_v1_5) if pack else None     # truthy = this payment buys SKU credits
     if pack_units == 0:
         logger.error(
             f"ALERT Razorpay payment {payment_reference} (₹{amount_paid}) is a SKU pack with unusable units; "
@@ -777,7 +790,7 @@ async def process_razorpay_event(
     # transaction as the wallet change, and uq_audit_logs_money_once makes a
     # concurrent duplicate fail -- so a payment credits at most once.
     db.add(_payment_audit_row(payment_reference, clean_sender, amount_paid, customer_was_created, pack_white,
-                              pack_creative))
+                              pack_creative, pack_v1_5))
     try:
         # Claim first: a concurrent duplicate fails here (on PostgreSQL it
         # waits for the winner's commit, then fails) before any credit.
@@ -805,12 +818,12 @@ async def process_razorpay_event(
         if customer_was_created:
             db.flush()      # assigns customer.id; a concurrent first payment conflicts here (IntegrityError)
             if pack_units:
-                _grant_cart(db, customer, pack_white, pack_creative, payment_reference)
+                _grant_cart(db, customer, pack_white, pack_creative, payment_reference, pack_v1_5)
             else:
                 record_ledger(db, customer_id=customer.id, kind=KIND_CREDIT_PAYMENT, amount=amount_paid, ref=payment_reference)
         else:
             if pack_units:
-                _grant_cart(db, customer, pack_white, pack_creative, payment_reference)
+                _grant_cart(db, customer, pack_white, pack_creative, payment_reference, pack_v1_5)
             elif credit_wallet(db, customer.whatsapp_id, amount_paid, commit=False, ref=payment_reference) != 1:
                 raise RuntimeError("customer row not updated")
             if getattr(customer, "full_name", None):
@@ -863,7 +876,9 @@ async def process_razorpay_event(
         # 1. Payment receipt with the balance read from the DB at send time
         # (includes this credit; never echoes the payment amount as balance).
         if pack_units:
-            await send_whatsapp_text(recipient_id=clean_sender, message_text=_pack_receipt(db, customer, pack_white, pack_creative))
+            await send_whatsapp_text(
+                recipient_id=clean_sender,
+                message_text=_pack_receipt(db, customer, pack_white, pack_creative, pack_v1_5))
         else:
             await send_whatsapp_text(
                 recipient_id=clean_sender,

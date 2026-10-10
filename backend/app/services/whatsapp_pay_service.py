@@ -160,12 +160,43 @@ def _order_item(retailer_id: str, name: str, paise: int) -> Dict[str, Any]:
     }
 
 
-def pack_order_items(white_units: int, creative_packs: int, total_rupees: int) -> List[Dict[str, Any]]:
+def _pack_order_items_with_v1_5(
+    white_units: int, creative_packs: int, v1_5_packs: int, total: int,
+) -> List[Dict[str, Any]]:
+    """Order lines for a cart that includes Catalog Pack v1.5 SKUs: one line per product in it, the v1.5 and Catalog
+    Pack SKUs at their own prices and the white-background SKUs at the rest. If the lines cannot add up exactly to
+    ``total`` (cannot happen for a priced cart) it is one combined line, never a negative or a wrong one."""
+    from app.services import pricing
+
+    creative_total = creative_packs * pricing.creative_pack_price() if creative_packs else 0
+    v1_5_total = v1_5_packs * pricing.catalog_v1_5_pack_price()
+    white_total = total - creative_total - v1_5_total
+    lines: List[Dict[str, Any]] = []
+    if white_units:
+        lines.append((pricing.pack_retailer_id(white_units),
+                      f"{pricing.STUDIO_TITLE} {pricing.pack_title(white_units)}", white_total))
+    if creative_packs:
+        lines.append((pricing.catalog_retailer_id(creative_packs),
+                      f"{pricing.CREATIVE_TITLE} {pricing.pack_title(creative_packs)}", creative_total))
+    lines.append((pricing.catalog_v1_5_retailer_id(v1_5_packs),
+                  f"{pricing.CATALOG_V1_5_TITLE} {pricing.pack_title(v1_5_packs)}", v1_5_total))
+    if all(amount > 0 for _id, _name, amount in lines) and sum(amount for _id, _name, amount in lines) == total:
+        return [_order_item(item_id, name, amount * INR_OFFSET) for item_id, name, amount in lines]
+    return [_order_item(f"sku_cart_{white_units}_{creative_packs}_{v1_5_packs}",
+                        " + ".join(name for _id, name, _amount in lines), total * INR_OFFSET)]
+
+
+def pack_order_items(
+    white_units: int, creative_packs: int, total_rupees: int, v1_5_packs: int = 0,
+) -> List[Dict[str, Any]]:
     """Order lines for a SKU pack cart whose amounts add up exactly to ``total_rupees`` (GST-inclusive prices): the
-    Catalog Pack SKUs at today's creative pack price, the white-background SKUs at the rest."""
+    Catalog Pack SKUs at today's creative pack price, the white-background SKUs at the rest. A cart with Catalog Pack
+    v1.5 SKUs gets one more line at its own price; a cart without them is built exactly as it always was."""
     from app.services import pricing
 
     white_units, creative_packs, total = int(white_units), int(creative_packs), int(total_rupees)
+    if int(v1_5_packs):
+        return _pack_order_items_with_v1_5(white_units, creative_packs, int(v1_5_packs), total)
     creative_total = creative_packs * pricing.creative_pack_price() if creative_packs else 0
     white_total = total - creative_total
     white_name = f"{pricing.STUDIO_TITLE} {pricing.pack_title(white_units)}" if white_units else ""
@@ -271,6 +302,7 @@ async def try_send_native_pack(
     body_text: str,
     reply_to_message_id: Optional[str] = None,
     site: str = "pack_checkout",
+    v1_5_packs: int = 0,
 ) -> bool:
     """Send a SKU pack cart as a native order_details order (Review and pay). Never raises.
 
@@ -279,15 +311,15 @@ async def try_send_native_pack(
     customer / rejected: the caller sends the strict "unavailable" notice or its payment link."""
     from app.services.sku_packs import MAX_PACK_UNITS, PURPOSE_SKU_PACK
 
-    counts = (white_units, creative_packs)
+    counts = (white_units, creative_packs, v1_5_packs)
     if any(isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= MAX_PACK_UNITS for n in counts) \
-            or white_units + creative_packs < 1 or int(total_rupees) <= 0:
+            or white_units + creative_packs + v1_5_packs < 1 or int(total_rupees) <= 0:
         _plog.warning(f"WhatsApp Pay pack refused: units={white_units!r} creative={creative_packs!r} "
-                      f"total={total_rupees!r} site={site}")
+                      f"v1_5={v1_5_packs!r} total={total_rupees!r} site={site}")
         return False
     return await _send_native_order(
         db, recipient_id, int(total_rupees), body_text, reply_to_message_id, site,
-        purpose=PURPOSE_SKU_PACK, white_units=white_units, creative_packs=creative_packs,
+        purpose=PURPOSE_SKU_PACK, white_units=white_units, creative_packs=creative_packs, v1_5_packs=v1_5_packs,
     )
 
 
@@ -301,6 +333,7 @@ async def _send_native_order(
     purpose: Optional[str] = None,
     white_units: int = 0,
     creative_packs: int = 0,
+    v1_5_packs: int = 0,
 ) -> bool:
     """Record one order and send its order_details message. ``purpose`` None = wallet recharge (the amount is raised
     to the recharge minimum), "sku_pack" = the exact cart total. Never raises."""
@@ -328,11 +361,12 @@ async def _send_native_order(
             purpose=purpose,
             white_units=white_units if purpose else None,
             creative_packs=creative_packs if purpose else None,
+            catalog_v1_5_packs=v1_5_packs if purpose else None,
         )
         db.add(order)
         db.commit()
 
-        pack_items = pack_order_items(white_units, creative_packs, amount) if purpose else None
+        pack_items = pack_order_items(white_units, creative_packs, amount, v1_5_packs) if purpose else None
         payload = build_order_details_payload(
             recipient_id, customer.whatsapp_id, order.reference_id, amount, body_text, expires_at,
             items=pack_items, expiry_text="This order has expired." if purpose else "This recharge order has expired.",
@@ -560,7 +594,9 @@ async def reconcile_order(db: Session, order: WhatsAppPaymentOrder) -> str:
             "source": "whatsapp_pay",
             "reference_id": order.reference_id,
             **({"purpose": order.purpose, "units": int(order.white_units or 0),
-                "creative_packs": int(order.creative_packs or 0)} if _is_pack(order) else {}),
+                "creative_packs": int(order.creative_packs or 0),
+                **({"catalog_v1_5_packs": int(order.catalog_v1_5_packs)} if order.catalog_v1_5_packs else {})}
+               if _is_pack(order) else {}),
         }),
     ))
     try:
@@ -595,7 +631,8 @@ async def reconcile_order(db: Session, order: WhatsAppPaymentOrder) -> str:
         logger.error(f"WhatsApp Pay credit failed for {order.reference_id}: {e}")
         return "credit_failed"
 
-    what = (f"SKU pack ({int(order.white_units or 0)} white + {int(order.creative_packs or 0)} catalog) for "
+    what = (f"SKU pack ({int(order.white_units or 0)} white + {int(order.creative_packs or 0)} catalog"
+            f"{f' + {int(order.catalog_v1_5_packs)} v1.5' if order.catalog_v1_5_packs else ''}) for "
             if _is_pack(order) else "")
     logger.info(
         f"WhatsApp Pay credited {what}₹{order.amount_rupees} to {mask_phone(order.whatsapp_id)} "
@@ -614,19 +651,22 @@ def _is_pack(order: WhatsAppPaymentOrder) -> bool:
 def _grant_pack_order(db: Session, order: WhatsAppPaymentOrder, pay_id: str) -> None:
     """Grant the SKUs a captured pack order bought, in the caller's transaction, keyed on the Razorpay payment id
     (as a pack link payment is, so refunds claw it back the same way). Raises when nothing can be granted."""
-    from app.models.sku_credit import SKU_CREATIVE
+    from app.models.sku_credit import SKU_CREATIVE, SKU_CREATIVE_V1_5
     from app.services import sku_packs
 
     customer = find_customer_by_phone(db, order.whatsapp_id)
     if customer is None:
         raise RuntimeError("no customer row for this pack order")
     white, creative = int(order.white_units or 0), int(order.creative_packs or 0)
-    if white + creative < 1:
+    v1_5 = int(order.catalog_v1_5_packs or 0)
+    if white + creative + v1_5 < 1:
         raise RuntimeError("pack order without SKUs")
     if white:
         sku_packs.grant_pack_credits(db, customer, white, pay_id)
     if creative:
         sku_packs.grant_pack_credits(db, customer, creative, pay_id, sku=SKU_CREATIVE)
+    if v1_5:
+        sku_packs.grant_pack_credits(db, customer, v1_5, pay_id, sku=SKU_CREATIVE_V1_5)
 
 
 # Orders that ended without a credit (Meta rejected the message, the payment failed, or it expired) are still
@@ -773,7 +813,8 @@ async def _send_receipt(db: Session, order: WhatsAppPaymentOrder) -> None:
                                     body_text="Your order update")
             await send_whatsapp_text(
                 recipient_id=order.whatsapp_id,
-                message_text=_pack_receipt(db, customer, int(order.white_units or 0), int(order.creative_packs or 0)),
+                message_text=_pack_receipt(db, customer, int(order.white_units or 0), int(order.creative_packs or 0),
+                                           int(order.catalog_v1_5_packs or 0)),
             )
         else:
             await send_order_status(order.whatsapp_id, order.reference_id, "completed", "Wallet recharged")
@@ -918,6 +959,7 @@ async def _pack_payment_failed_once(db: Session, order: WhatsAppPaymentOrder) ->
                 customer_name=getattr(customer, "full_name", None) or "Customer",
                 units=int(order.white_units or 0),
                 creative_packs=int(order.creative_packs or 0),
+                **({"v1_5_packs": int(order.catalog_v1_5_packs)} if order.catalog_v1_5_packs else {}),
             )
             sent = bool(url) and await send_whatsapp_cta_url_button(
                 recipient_id=order.whatsapp_id,

@@ -46,6 +46,8 @@ class WhatsAppPaymentOrder(Base):
     purpose: Mapped[str] = mapped_column(String(16), nullable=True, comment='"sku_pack"; NULL = wallet recharge')
     white_units: Mapped[int] = mapped_column(Integer, nullable=True, comment="sku_pack: white-background SKUs bought")
     creative_packs: Mapped[int] = mapped_column(Integer, nullable=True, comment="sku_pack: Catalog Pack SKUs bought")
+    catalog_v1_5_packs: Mapped[int] = mapped_column(
+        Integer, nullable=True, comment="sku_pack: Catalog Pack v1.5 SKUs bought (migration 0025)")
     total_paise: Mapped[int] = mapped_column(Integer, nullable=False, comment="order total_amount.value sent to Meta (subtotal + tax)")
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="created", index=True)
     configuration_name: Mapped[str] = mapped_column(String(60), nullable=True)

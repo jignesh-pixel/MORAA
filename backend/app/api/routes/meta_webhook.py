@@ -40,6 +40,7 @@ from app.models.audit_log import AuditLog
 from app.models.customer import Customer
 from app.models.whatsapp_ingestion import (
     PRODUCT_PACK_1,
+    PRODUCT_PACK_V1_5,
     PRODUCT_WHITE_BG,
     WhatsAppIngestion,
 )
@@ -52,10 +53,12 @@ from app.services.image_prevalidation_service import check_image_quality
 from app.services import meta_whatsapp_service as _mws
 from app.services.meta_whatsapp_service import (
     CATALOG_PACK_ACK_TEMPLATE,
+    CATALOG_V1_5_PACK_ACK_TEMPLATE,
     COLLECTION_IDS,
     COLLECTIONS_BUTTON,
     send_collection_products,
     send_collections,
+    PRODUCT_BUTTON_PACK_V1_5,
     PRODUCT_BUTTON_WHITE,
     parse_product_button_id,
     process_whatsapp_white_bg,
@@ -67,6 +70,7 @@ from app.services.meta_whatsapp_service import (
     get_media_url,
     parse_webhook_entry,
     process_whatsapp_catalog_pack,
+    process_whatsapp_catalog_v1_5,
     send_whatsapp_cta_url_button,
     send_whatsapp_text,
     validate_image,
@@ -101,7 +105,7 @@ from app.services.wallet_service import (
 )
 from app.services import bulk_orders, chat_log, consent_service, data_lifecycle, eta_service
 from app.services import pricing, razorpay_service, sku_messages, sku_packs
-from app.models.sku_credit import SKU_CREATIVE, SKU_WHITE_BG
+from app.models.sku_credit import SKU_CREATIVE, SKU_CREATIVE_V1_5, SKU_WHITE_BG
 from app.models.whatsapp_ingestion import CREDIT_SOURCE_SKU
 from app.utils.logger import logger, mask_phone
 from app.ai.image_generation_manager import generation_capacity_blocked
@@ -238,7 +242,13 @@ async def _trigger_generation(ingestion_id: str) -> None:
 # restarts, multiple workers and late taps). The wallet is debited only when
 # a button is tapped, through wallet_service.charge_customer_balance.
 
-PRODUCT_LABELS = {PRODUCT_WHITE_BG: "Clean Studio Shot", PRODUCT_PACK_1: "Full Catalog Pack"}
+V1_5_NO_CREDIT_MESSAGE = (
+        "You have no Catalog Pack v1.5 SKUs left, so nothing was used. Tap View Collections to buy more, "
+        "or choose another option for this photo 🙏"
+    )
+
+PRODUCT_LABELS = {PRODUCT_WHITE_BG: "Clean Studio Shot", PRODUCT_PACK_1: "Full Catalog Pack",
+                  PRODUCT_PACK_V1_5: "Catalog Pack v1.5"}
 
 REGISTRATION_REQUEST_MESSAGE = (
     "Quick Setup 📋\n\n"
@@ -469,9 +479,12 @@ def _welcome_back_message(db: Session, cust: Customer) -> str:
     if settings.SKU_PACKS_ENABLED:
         studio = sku_packs.balance(db, cust.id)
         catalog = sku_packs.balance(db, cust.id, SKU_CREATIVE)
+        catalog_v1_5 = sku_packs.balance(db, cust.id, SKU_CREATIVE_V1_5)
         lines.append(f"{pricing.STUDIO_TITLE} SKUs available: {studio}")
         if catalog:
             lines.append(f"{pricing.CREATIVE_TITLE} SKUs available: {catalog}")
+        if catalog_v1_5:
+            lines.append(f"{pricing.CATALOG_V1_5_TITLE} SKUs available: {catalog_v1_5}")
         wallet = get_balance(db, cust.whatsapp_id)
         if wallet > 0:
             lines.append(f"Wallet Balance: {format_rupees(wallet)}")
@@ -698,6 +711,8 @@ def _white_bg_price() -> int:
 
 
 def _product_price(product_code: str) -> int:
+    if product_code == PRODUCT_PACK_V1_5:
+        return pricing.catalog_v1_5_pack_price()         # informational: v1.5 is paid by SKU credits, never the wallet
     return _white_bg_price() if product_code == PRODUCT_WHITE_BG else price_per_image()
 
 
@@ -755,6 +770,8 @@ async def _ingest_image_for_choice(
     # Phase 8: paid SKU credits (white-background shots, Catalog Pack SKUs) count as funds, whatever the flags.
     white_credits = sku_packs.balance(db, customer.id) if customer else 0
     creative_credits = sku_packs.balance(db, customer.id, SKU_CREATIVE) if customer else 0
+    v1_5_credits = sku_packs.balance(db, customer.id, SKU_CREATIVE_V1_5) if customer else 0
+    creative_credits += v1_5_credits       # any Catalog-type credit: the customer picks the product with a button
     # SKU packs: a customer without credits is not turned away for funds. The photo is stored and held, the customer
     # gets the "View Collections" list, and the photo is made as soon as a pack is paid (start_held_photos).
     sku_mode = settings.SKU_PACKS_ENABLED and customer is not None and not ent.payment_exempt(customer)
@@ -883,6 +900,7 @@ async def _ingest_image_for_choice(
         pack_price=pack_price,
         balance=current_balance,
         reply_to_message_id=message_id,
+        **({"v1_5_credits": v1_5_credits} if v1_5_credits else {}),
     )
     if not sent:
         logger.error(f"Product selection buttons NOT sent: ingestion_id={new_ingestion_id}")
@@ -1127,27 +1145,32 @@ PACK_MENU_WORDS = {"packs", "pack", "buy", "menu", "price", "prices"}
 
 async def _send_pack_link(
     db: Session, sender: str, units: int, reply_to: Optional[str] = None, creative_packs: int = 0,
+    v1_5_packs: int = 0,
 ) -> bool:
-    """One payment for a whole cart (``units`` white-background SKUs + ``creative_packs`` Catalog Pack SKUs): the
+    """One payment for a whole cart (``units`` white-background SKUs + ``creative_packs`` Catalog Pack SKUs +
+    ``v1_5_packs`` Catalog Pack v1.5 SKUs): the
     native WhatsApp Pay order (Review and pay, in the chat) when it is on for this number; else, unless
     WHATSAPP_PAY_STRICT, the cart summary with one Razorpay link button. No link -> an apology, never a static
     link."""
     cust = _find_customer_safe(db, sender)
     name = (cust.full_name if cust is not None else "") or "Customer"
     total = (pricing.pack_total(units, db) if units else 0) + (
-        creative_packs * pricing.creative_pack_price() if creative_packs else 0)
+        creative_packs * pricing.creative_pack_price() if creative_packs else 0) + (
+        v1_5_packs * pricing.catalog_v1_5_pack_price() if v1_5_packs else 0)
+    v1_5_args = (v1_5_packs,) if v1_5_packs else ()          # a cart without v1.5 is passed on exactly as before
+    v1_5_kwargs = {"v1_5_packs": v1_5_packs} if v1_5_packs else {}
     if await try_send_native_pack(db, sender, units, creative_packs, total,
-                                  sku_messages.pack_order_body(units, total, creative_packs),
-                                  reply_to_message_id=reply_to, site="pack_checkout"):
+                                  sku_messages.pack_order_body(units, total, creative_packs, *v1_5_args),
+                                  reply_to_message_id=reply_to, site="pack_checkout", **v1_5_kwargs):
         return True
     if await send_payment_unavailable(sender, "pack_checkout",
-                                      body_text=sku_messages.pack_order_body(units, total, creative_packs),
+                                      body_text=sku_messages.pack_order_body(units, total, creative_packs, *v1_5_args),
                                       reply_to_message_id=reply_to):
         return False
     db.commit()                          # the Razorpay and Meta calls below must not hold a connection
     try:
         url = await razorpay_service.create_pack_payment_link(
-            customer_phone=sender, customer_name=name, units=units, creative_packs=creative_packs,
+            customer_phone=sender, customer_name=name, units=units, creative_packs=creative_packs, **v1_5_kwargs,
         )
     except Exception as e:  # noqa: BLE001 -- the customer gets the apology below
         logger.error(f"Pack payment link failed for {mask_phone(sender)}: {type(e).__name__}")
@@ -1157,7 +1180,7 @@ async def _send_pack_link(
         return False
     return await send_whatsapp_cta_url_button(
         recipient_id=sender,
-        body_text=sku_messages.pack_link_body(units, total, creative_packs),
+        body_text=sku_messages.pack_link_body(units, total, creative_packs, *v1_5_args),
         button_label=sku_messages.PAY_BUTTON,
         url=url,
         reply_to_message_id=reply_to,
@@ -1171,12 +1194,13 @@ async def _handle_pack_order(db: Session, event: Dict[str, Any]) -> None:
     sender = event.get("sender", "")
     message_id = event.get("message_id") or None
     quote = pricing.quote_cart(event.get("items"), db)
-    if quote["white_units"] + quote["creative_packs"] <= 0:
+    if quote["white_units"] + quote["creative_packs"] + quote["v1_5_packs"] <= 0:
         logger.info(f"Unreadable pack order from {mask_phone(sender)}")
         await send_whatsapp_text(sender, sku_messages.order_unreadable(), reply_to_message_id=message_id)
         await send_pack_menu(sender)
         return
-    await _send_pack_link(db, sender, quote["white_units"], message_id, quote["creative_packs"])
+    await _send_pack_link(db, sender, quote["white_units"], message_id, quote["creative_packs"],
+                          quote["v1_5_packs"])
 
 
 # ─── SKU credit orders (Phase 8) ─────────────────────────────────────────
@@ -1360,6 +1384,11 @@ async def _start_sku_order(
     return True
 
 
+def _outbox_kind(product: str) -> str:
+    """The outbox job kind of an order's product: "white", "pack_v1_5" or (Pack 1, and legacy rows) "pack"."""
+    return "white" if product == PRODUCT_WHITE_BG else "pack_v1_5" if product == PRODUCT_PACK_V1_5 else "pack"
+
+
 def _queue_order_run(background_tasks: BackgroundTasks, job: Tuple[Any, str]) -> None:
     """Start a paid order. With the outbox on, the order is first recorded in the database (so a crash or deploy
     before it starts does not strand it: the sweep starts it) and then run right here as before."""
@@ -1369,7 +1398,8 @@ def _queue_order_run(background_tasks: BackgroundTasks, job: Tuple[Any, str]) ->
 
         job_id = _recorded_runs.pop(ingestion_id, None)       # recorded when the order was queued (see above)
         if job_id is None:
-            kind = "white" if worker is process_whatsapp_white_bg else "pack"
+            kind = ("white" if worker is process_whatsapp_white_bg else
+                    "pack_v1_5" if worker is process_whatsapp_catalog_v1_5 else "pack")
             job_id = outbox.enqueue_order_run(kind, ingestion_id)
         if job_id is not None:
             background_tasks.add_task(outbox.run_job_now, job_id)
@@ -1424,7 +1454,8 @@ async def _handle_product_choice(
        released (the photo can be chosen again after a recharge) and NOTHING
        is queued.
     """
-    product = PRODUCT_WHITE_BG if button == PRODUCT_BUTTON_WHITE else PRODUCT_PACK_1
+    product = {PRODUCT_BUTTON_WHITE: PRODUCT_WHITE_BG, PRODUCT_BUTTON_PACK_V1_5: PRODUCT_PACK_V1_5}.get(
+        button, PRODUCT_PACK_1)
     label = PRODUCT_LABELS[product]
 
     ingestion = db.query(WhatsAppIngestion).filter(WhatsAppIngestion.id == ingestion_id).first()
@@ -1459,7 +1490,9 @@ async def _handle_product_choice(
     # for this order, decline it now with nothing charged and keep the photo choosable. Team (ADMIN) orders
     # are not counted against the daily cap, and dry-run makes no provider calls.
     if not _mws.DRY_RUN_IMAGE_MODE and not (customer is not None and ent.is_admin(customer)):
-        needed = 1 if product == PRODUCT_WHITE_BG else _mws.pack_generation_count()
+        needed = (1 if product == PRODUCT_WHITE_BG else
+                  _mws.pack_v1_5_generation_count() if product == PRODUCT_PACK_V1_5 else
+                  _mws.pack_generation_count())
         db.commit()           # end this transaction first: the counter lookup below needs its own connection
         no_capacity = await run_io(generation_capacity_blocked, needed)
         if no_capacity:
@@ -1505,7 +1538,7 @@ async def _handle_product_choice(
     free_access = None
     if customer is not None and ent.is_admin(customer):
         free_access = "admin"
-    elif customer is not None and ent.has_trial_credits(customer):
+    elif customer is not None and product != PRODUCT_PACK_V1_5 and ent.has_trial_credits(customer):
         if not ent.trial_shot_allowed(customer, product):
             if get_balance(db, customer.whatsapp_id) < price:
                 db.query(WhatsAppIngestion).filter(
@@ -1529,13 +1562,28 @@ async def _handle_product_choice(
             free_access = "trial"
 
     if not free_access and customer is not None and not dry_run:
-        sku = SKU_CREATIVE if product == PRODUCT_PACK_1 else SKU_WHITE_BG
+        sku = {PRODUCT_PACK_1: SKU_CREATIVE, PRODUCT_PACK_V1_5: SKU_CREATIVE_V1_5}.get(product, SKU_WHITE_BG)
         try:
             if sku_packs.balance(db, customer.id, sku) > 0 and sku_packs.consume_credit(db, customer, ingestion_id, sku):
                 free_access = CREDIT_SOURCE_SKU           # committed with the order status below
         except Exception as e:  # noqa: BLE001 -- no credit used: the wallet path below decides
             db.rollback()
             logger.error(f"SKU credit for order {ingestion_id} not used: {type(e).__name__}")
+
+    if not free_access and product == PRODUCT_PACK_V1_5:
+        # Catalog Pack v1.5 has no wallet price: only its own SKU credits (or team access) pay for it. Release the
+        # claim so the photo can be chosen again, and point to the collections to buy some.
+        db.rollback()
+        db.query(WhatsAppIngestion).filter(
+            WhatsAppIngestion.id == ingestion_id,
+            WhatsAppIngestion.status == "choice_claimed",
+        ).update(
+            {WhatsAppIngestion.status: "awaiting_choice", WhatsAppIngestion.product_code: None},
+            synchronize_session=False,
+        )
+        db.commit()
+        await send_whatsapp_text(sender, V1_5_NO_CREDIT_MESSAGE, reply_to_message_id=quote_id)
+        return None
 
     if free_access:
         charged = True
@@ -1632,7 +1680,7 @@ async def _handle_product_choice(
         from app.services import outbox
 
         db.commit()                      # end this transaction: the outbox write below uses its own connection
-        run_id = await run_io(outbox.enqueue_order_run, "white" if product == PRODUCT_WHITE_BG else "pack", ingestion_id)
+        run_id = await run_io(outbox.enqueue_order_run, _outbox_kind(product), ingestion_id)
         if run_id is not None:
             if len(_recorded_runs) > 1000:
                 _recorded_runs.clear()
@@ -1660,6 +1708,14 @@ async def _handle_product_choice(
             reply_to_message_id=quote_id,
         )
         return process_whatsapp_white_bg, ingestion_id
+    if product == PRODUCT_PACK_V1_5:
+        ahead = await _orders_ahead_released(db, ingestion_id)
+        default_tail = "Please allow 20-30 seconds."
+        suffix = eta_service.ack_suffix("pack", ahead, _parallel_orders(_mws.pack_v1_5_generation_count()), default_tail)
+        ack = (CATALOG_V1_5_PACK_ACK_TEMPLATE if suffix == default_tail
+               else CATALOG_V1_5_PACK_ACK_TEMPLATE.replace(default_tail, suffix))
+        await send_whatsapp_text(sender, ack, reply_to_message_id=quote_id)
+        return process_whatsapp_catalog_v1_5, ingestion_id
     # Pack 1 acknowledgement + worker. The time estimate is measured from recent orders (UX-2); until some have
     # been measured the original wording is sent unchanged.
     ahead = await _orders_ahead_released(db, ingestion_id)
@@ -1955,9 +2011,10 @@ async def receive_webhook(
                 tier = pricing.parse_retailer_id(row_id)          # studio_sku_N / sku_pack_N rows
                 if settings.SKU_PACKS_ENABLED and tier:
                     sku, size = tier
-                    white, creative = (size, 0) if sku == SKU_WHITE_BG else (0, size)
+                    white, creative, v1_5 = (size, 0, 0) if sku == SKU_WHITE_BG else (
+                        (0, 0, size) if sku == SKU_CREATIVE_V1_5 else (0, size, 0))
                     await _send_pack_link(db, event.get("sender", ""), white, event.get("message_id") or None,
-                                          creative)
+                                          creative, v1_5)
                 continue
 
             # SKU packs: a catalogue cart -> one payment link for every SKU in it.
@@ -2151,9 +2208,11 @@ def retry_delivery(
     db.refresh(ingestion)
 
     # Dispatch by the STORED product chosen with the reply button.
-    # NULL / PACK_1 -> Pack 1 catalog worker, exactly as before.
+    # NULL / PACK_1 -> Pack 1 catalog worker, exactly as before; PACK_V1_5 -> its own worker.
     if ingestion.product_code == PRODUCT_WHITE_BG:
         background_tasks.add_task(process_whatsapp_white_bg, ingestion.id)
+    elif ingestion.product_code == PRODUCT_PACK_V1_5:
+        background_tasks.add_task(process_whatsapp_catalog_v1_5, ingestion.id)
     else:
         background_tasks.add_task(_trigger_generation, ingestion.id)
 

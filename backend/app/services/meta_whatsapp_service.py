@@ -53,6 +53,19 @@ CATALOG_PACK_STYLES: List[Tuple[str, str]] = [
     ("Luxury Drape", "prompt_luxury_drape"),
 ]
 
+# ─── Catalog Pack v1.5 (ordered delivery 1..5, N = len(CATALOG_V1_5_PACK_STYLES)) ───
+# A third, independent product with its own credits (SKU creative_pack_v1_5) and its own worker
+# (process_whatsapp_catalog_v1_5). It has its own list on purpose: it never reads, shares or changes
+# CATALOG_PACK_STYLES, so editing one pack can never change the other. The same prompt_type keys are used, so the
+# prompt builders are the ones in the catalog worker's style_prompt_builders.
+CATALOG_V1_5_PACK_STYLES: List[Tuple[str, str]] = [
+    ("Clean E-Commerce", "prompt_ecommerce"),
+    ("Close-up on Ear", "prompt_close_up"),
+    ("Scale Reference", "prompt_scale_reference"),
+    ("Professional Studio", "prompt_professional"),
+    ("Stand Display", "prompt_stand"),
+]
+
 # ─── Image calls per order ────────────────────────────────────────────────
 # A Clean Studio Shot makes exactly one image-generation call. A Full Catalog Pack generates EVERY style in
 # CATALOG_PACK_STYLES, one call per style (the styles run in parallel). Each of those calls is a single attempt:
@@ -65,6 +78,11 @@ def pack_generation_count() -> int:
     return len(CATALOG_PACK_STYLES)
 
 
+def pack_v1_5_generation_count() -> int:
+    """How many images one Catalog Pack v1.5 generates: every style in CATALOG_V1_5_PACK_STYLES, one call each."""
+    return len(CATALOG_V1_5_PACK_STYLES)
+
+
 def _pack_style_count_label() -> str:
     """Human-readable style count for user-facing copy, kept in sync with pack_generation_count()."""
     return f"all {pack_generation_count()} styles"
@@ -72,6 +90,11 @@ def _pack_style_count_label() -> str:
 
 CATALOG_PACK_ACK_TEMPLATE = (
     f"✨ Processing your Earring Catalog Pack (generating {_pack_style_count_label()})... "
+    "Please allow 20-30 seconds."
+)
+
+CATALOG_V1_5_PACK_ACK_TEMPLATE = (
+    f"✨ Processing your Earring Catalog Pack v1.5 (generating all {pack_v1_5_generation_count()} styles)... "
     "Please allow 20-30 seconds."
 )
 
@@ -833,7 +856,8 @@ COLLECTIONS_BUTTON = "gv_collections"          # the earlier reply button; still
 COLLECTIONS_LIST_BUTTON = "View Collections"
 COLLECTION_STUDIO = "gv_col_studio"
 COLLECTION_CATALOG = "gv_col_catalog"
-COLLECTION_IDS = (COLLECTION_STUDIO, COLLECTION_CATALOG)
+COLLECTION_CATALOG_V1_5 = "gv_col_catalog_v1_5"
+COLLECTION_IDS = (COLLECTION_STUDIO, COLLECTION_CATALOG, COLLECTION_CATALOG_V1_5)
 
 
 def _collection_rows() -> List[Tuple[str, str, str]]:
@@ -841,17 +865,22 @@ def _collection_rows() -> List[Tuple[str, str, str]]:
     from app.database import SessionLocal
 
     with SessionLocal() as db:
-        return [
+        rows = [
             (COLLECTION_STUDIO, sku_messages.STUDIO_COLLECTION_TITLE, sku_messages.studio_collection_row(db)),
             (COLLECTION_CATALOG, sku_messages.CATALOG_COLLECTION_TITLE, sku_messages.catalog_collection_row()),
         ]
+    if settings.CATALOG_V1_5_ENABLED:
+        rows.append((COLLECTION_CATALOG_V1_5, sku_messages.CATALOG_V1_5_COLLECTION_TITLE,
+                     sku_messages.catalog_v1_5_collection_row()))
+    return rows
 
 
 async def send_collections(
     recipient_id: str, reply_to_message_id: Optional[str] = None, intro: str = "",
 ) -> bool:
-    """The "View Collections" list: 1. Studio Shot, 2. Catalog Pack (Ecomm Pack 1). Picking one and tapping Send
-    comes back as a ``list_reply`` with COLLECTION_STUDIO / COLLECTION_CATALOG (``send_collection_products``).
+    """The "View Collections" list: 1. Studio Shot, 2. Catalog Pack (Ecomm Pack 1), 3. Catalog Pack v1.5 (only with
+    CATALOG_V1_5_ENABLED). Picking one and tapping Send comes back as a ``list_reply`` with COLLECTION_STUDIO /
+    COLLECTION_CATALOG / COLLECTION_CATALOG_V1_5 (``send_collection_products``).
     ``intro`` opens the body (e.g. the photo receipt), so it stays one message."""
     rows = await run_io(_collection_rows)
     body = await run_io(sku_messages.collections_body)
@@ -868,6 +897,8 @@ def _collection_retailer_ids(collection_id: str) -> List[str]:
         return [pricing.pack_retailer_id(n) for n in pricing.menu_pack_sizes()]
     if collection_id == COLLECTION_CATALOG:
         return [pricing.catalog_retailer_id(n) for n in pricing.menu_pack_sizes()]
+    if collection_id == COLLECTION_CATALOG_V1_5:
+        return [pricing.catalog_v1_5_retailer_id(n) for n in pricing.menu_pack_sizes()]
     return []
 
 
@@ -886,8 +917,10 @@ async def send_collection_products(
     if not catalog_id:
         logger.error("META_CATALOG_ID is not set: cannot send the collection product list")
         return await _product_list_failed(recipient_id, reply_to_message_id)
-    studio = collection_id == COLLECTION_STUDIO
-    title = sku_messages.STUDIO_COLLECTION_TITLE if studio else sku_messages.CATALOG_COLLECTION_TITLE
+    title = {
+        COLLECTION_STUDIO: sku_messages.STUDIO_COLLECTION_TITLE,
+        COLLECTION_CATALOG_V1_5: sku_messages.CATALOG_V1_5_COLLECTION_TITLE,
+    }.get(collection_id, sku_messages.CATALOG_COLLECTION_TITLE)
     payload = {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
@@ -1093,22 +1126,28 @@ async def send_catalog_pack_images_to_whatsapp(
     image_urls: list,
     balance_text: str,
     reply_to_message_id: Optional[str] = None,
+    styles: Optional[List[Tuple[str, str]]] = None,
+    pack_name: str = "Earring Catalog Pack",
 ) -> bool:
     """Deliver the generated Earring Catalog Pack styles to WhatsApp with
     contextual quote. Returns the number of images actually sent (0..total)
-    so the caller can tell a partial delivery apart from a total failure."""
+    so the caller can tell a partial delivery apart from a total failure.
+
+    ``styles`` is the pack's own style list (default CATALOG_PACK_STYLES): the captions are "n/N {style}", N being the
+    images sent, and the last one names the pack (``pack_name``)."""
     if not recipient_id or not image_urls:
         return 0
+    styles = CATALOG_PACK_STYLES if styles is None else styles
 
     # Caption counts reflect what is actually delivered, so a pack missing a
     # failed style does not claim to be a complete pack.
     total = len(image_urls)
-    known_styles = len(CATALOG_PACK_STYLES)
+    known_styles = len(styles)
     sent_count = 0
 
     for index, media_id in enumerate(image_urls, start=1):
         style_title = (
-            CATALOG_PACK_STYLES[index - 1][0]
+            styles[index - 1][0]
             if index <= known_styles
             else f"Style {index}"
         )
@@ -1119,7 +1158,7 @@ async def send_catalog_pack_images_to_whatsapp(
         elif index == total:
             caption = (
                 f"{index}/{total} {style_title} ✨\n"
-                "Here's your Earring Catalog Pack 📦\n"
+                f"Here's your {pack_name} 📦\n"
                 f"Remaining balance: {balance_text}"
             )
         else:
@@ -1510,7 +1549,7 @@ async def recover_unrefunded_failed_orders(older_than) -> int:
             _refund_failed_ingestion(db, row)
             refunded_after = _refunded_amount(db, row)
             if refunded_after > 0 and refunded_before == 0:       # only the process that moved the money tells the customer
-                label = "Clean Studio Shot" if product_code == PRODUCT_WHITE_BG else "Full Catalog Pack"
+                label = order_label(product_code)
                 await _notify_failed_order(db, row, label)
                 recovered += 1
             elif refunded_after == 0:
@@ -1554,7 +1593,7 @@ async def _recover_unreturned_credits(db, cutoff) -> int:
             continue
         logger.error(f"Failed order still holds the customer's SKU credit, returning it: ingestion_id={ingestion_id}")
         _refund_failed_ingestion(db, row)
-        await _notify_failed_order(db, row, "Clean Studio Shot" if row.product_code == "WHITE_BG" else "Full Catalog Pack")
+        await _notify_failed_order(db, row, order_label(row.product_code))
         returned += 1
     return returned
 
@@ -1759,7 +1798,7 @@ async def recover_stuck_paid_orders(older_than) -> int:
             db.refresh(row)
             logger.error(f"Stuck paid order recovered: ingestion_id={row.id} {message}")
             _refund_failed_ingestion(db, row)
-            label = "Clean Studio Shot" if row.product_code == PRODUCT_WHITE_BG else "Full Catalog Pack"
+            label = order_label(row.product_code)
             await _notify_failed_order(db, row, label)
             recovered += 1
     except Exception as e:
@@ -1979,12 +2018,15 @@ async def _gather_styles_with_deadline(
 PACK_RUNNABLE_STATUSES = ("pack_queued", "stored")
 
 
-async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
-    """Generate every Catalog Pack style in parallel and deliver them to WhatsApp.
+async def _run_catalog_pack_order(
+    ingestion_id: str, styles: List[Tuple[str, str]], pack_label: str, pack_name: str,
+) -> bool:
+    """Generate every style of ONE catalog pack order in parallel and deliver them (the engine of both Catalog Packs).
 
-    One image call per style in CATALOG_PACK_STYLES (``pack_generation_count()`` calls for the order), each in
-    single_attempt mode (no retry, no fallback provider), so a failed style is final and the pack is delivered
-    with the styles that succeeded.
+    One image call per entry of ``styles`` (the pack's own list), each in single_attempt mode (no retry, no fallback
+    provider), so a failed style is final and the pack is delivered with the styles that succeeded. ``pack_label`` is
+    the product's name in failure / partial-delivery messages, ``pack_name`` its name in the last caption. The public
+    workers below only choose these four things; nothing else differs between the packs.
     """
     from app.database import SessionLocal
     from app.models.image import Image
@@ -2025,7 +2067,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
             _fail_delivery(db, ingestion, message)
         else:
             _fail_ingestion(db, ingestion, message)
-        await _notify_failed_order(db, ingestion, "Full Catalog Pack")
+        await _notify_failed_order(db, ingestion, pack_label)
         return False
 
     try:
@@ -2077,7 +2119,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
             return await _fail("Image file is empty")
 
         style_jobs: List[Tuple[str, str]] = []
-        for style_title, prompt_type in CATALOG_PACK_STYLES:
+        for style_title, prompt_type in styles:
             builder = style_prompt_builders.get(prompt_type)
             if builder is None:
                 continue
@@ -2197,6 +2239,8 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
                 image_urls=media_ids,
                 balance_text=balance_text,
                 reply_to_message_id=quote_id,
+                styles=styles,
+                pack_name=pack_name,
             )
         # Completion is measured against the styles this pack was meant to
         # produce, not just the images that happened to be generated.
@@ -2223,7 +2267,7 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
             try:
                 await send_whatsapp_text(
                     recipient_id,
-                    f"Note: {sent_count} of {total_images} images in your Full Catalog Pack "
+                    f"Note: {sent_count} of {total_images} images in your {pack_label} "
                     "could be created this time.",
                     reply_to_message_id=quote_id,
                 )
@@ -2280,12 +2324,45 @@ async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
         db.close()
 
 
+async def process_whatsapp_catalog_pack(ingestion_id: str) -> bool:
+    """Generate every Catalog Pack (Ecomm Pack 1) style in parallel and deliver them to WhatsApp.
+
+    One image call per style in CATALOG_PACK_STYLES (``pack_generation_count()`` calls for the order), each in
+    single_attempt mode (no retry, no fallback provider), so a failed style is final and the pack is delivered
+    with the styles that succeeded.
+    """
+    return await _run_catalog_pack_order(
+        ingestion_id, CATALOG_PACK_STYLES, "Full Catalog Pack", "Earring Catalog Pack")
+
+
+async def process_whatsapp_catalog_v1_5(ingestion_id: str) -> bool:
+    """Generate every Catalog Pack v1.5 style in parallel and deliver them to WhatsApp.
+
+    Same engine as ``process_whatsapp_catalog_pack`` but strictly over CATALOG_V1_5_PACK_STYLES
+    (``pack_v1_5_generation_count()`` calls for the order): spend reservation, partial delivery ("n of 5") and the
+    Drive / WhatsApp split all follow that list. It never touches CATALOG_PACK_STYLES.
+    """
+    return await _run_catalog_pack_order(
+        ingestion_id, CATALOG_V1_5_PACK_STYLES, "Catalog Pack v1.5", "Earring Catalog Pack v1.5")
+
+
 # ─── White Background E-Commerce Image (₹50, 1 image) ────────────────────
 # The customer picks the product with a WhatsApp reply button AFTER the photo
 # is stored (never from the caption). Button ids carry the ingestion id so the
 # choice is tied to the exact stored photo in the database.
 PRODUCT_BUTTON_WHITE = "gv_white"
 PRODUCT_BUTTON_PACK_1 = "gv_pack1"
+PRODUCT_BUTTON_PACK_V1_5 = "gv_pack_v1_5"      # shown only to a customer holding Catalog Pack v1.5 SKUs
+
+
+def order_label(product_code: Optional[str]) -> str:
+    """The product's name in order messages: Clean Studio Shot, Catalog Pack v1.5, else the Full Catalog Pack (the
+    legacy NULL product code is Pack 1)."""
+    if product_code == "WHITE_BG":
+        return "Clean Studio Shot"
+    if product_code == "PACK_V1_5":
+        return "Catalog Pack v1.5"
+    return "Full Catalog Pack"
 
 # Statuses a paid White order may be (re)generated from: freshly queued by
 # the product-choice handler, or reset to "stored" by the authenticated retry
@@ -2307,7 +2384,8 @@ def product_button_id(button: str, ingestion_id: str) -> str:
 def parse_product_button_id(button_id: str) -> Optional[Tuple[str, str]]:
     """Return (button, ingestion_id) for a product-choice reply id, else None."""
     button, sep, ingestion_id = (button_id or "").partition(":")
-    if not sep or not ingestion_id or button not in (PRODUCT_BUTTON_WHITE, PRODUCT_BUTTON_PACK_1):
+    if not sep or not ingestion_id or button not in (PRODUCT_BUTTON_WHITE, PRODUCT_BUTTON_PACK_1,
+                                                     PRODUCT_BUTTON_PACK_V1_5):
         return None
     return button, ingestion_id
 
@@ -2319,12 +2397,21 @@ async def send_product_selection_buttons(
     pack_price: int,
     balance: int,
     reply_to_message_id: Optional[str] = None,
+    v1_5_credits: int = 0,
 ) -> bool:
-    """Ask which product to create for one stored photo (2 reply buttons).
+    """Ask which product to create for one stored photo (2 reply buttons; a 3rd, Catalog Pack v1.5, only for a
+    customer who holds ``v1_5_credits`` SKUs of it).
 
     Meta limits a reply-button title to 20 characters, so the titles are the
     short forms; the body carries the full product names.
     """
+    # Catalog Pack v1.5 is paid by its own SKU credits only (no wallet price), so its option exists only for a
+    # customer who holds some; everyone else sees the two buttons exactly as before.
+    v1_5_bullet = (
+        f"• Catalog Pack v1.5 ({v1_5_credits} SKU{'' if v1_5_credits == 1 else 's'} left) — "
+        f"{pack_v1_5_generation_count()} commercial styles from your Catalog Pack v1.5 SKUs.\n"
+        if v1_5_credits > 0 else ""
+    )
     payload = {
         "messaging_product": "whatsapp",
         "to": recipient_id,
@@ -2336,7 +2423,8 @@ async def send_product_selection_buttons(
                     "Photo received 📸\n\n"
                     "What would you like to create for this design?\n\n"
                     f"• Clean Studio Shot (₹{white_price}) — 1 polished product image on pure white with natural soft shadows.\n"
-                    f"• Full Catalog Pack (₹{pack_price}) — Multi-angle commercial set with lifestyle staging.\n\n"
+                    f"• Full Catalog Pack (₹{pack_price}) — Multi-angle commercial set with lifestyle staging.\n"
+                    f"{v1_5_bullet}\n"
                     f"Wallet Balance: ₹{balance:,}"
                 ),
             },
@@ -2360,6 +2448,14 @@ async def send_product_selection_buttons(
             },
         },
     }
+    if v1_5_credits > 0:
+        payload["interactive"]["action"]["buttons"].append({
+            "type": "reply",
+            "reply": {
+                "id": product_button_id(PRODUCT_BUTTON_PACK_V1_5, ingestion_id),
+                "title": f"Pack v1.5 ({v1_5_credits} left)"[:20],
+            },
+        })
     return await _post_message_payload(
         payload, "product selection buttons", reply_to_message_id=reply_to_message_id
     )

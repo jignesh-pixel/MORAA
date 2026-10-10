@@ -28,6 +28,7 @@ from app.models.sku_credit import (
     ACTION_PURCHASE,
     ACTION_REFUND,
     SKU_CREATIVE,
+    SKU_CREATIVE_V1_5,
     SKU_WHITE_BG,
     CustomerSkuCredit,
 )
@@ -203,7 +204,9 @@ def _expire_customer(db: Session, customer_id: str, now: datetime, sku: str = SK
     if current < 1 or until is None or until >= now:
         db.rollback()
         return False
-    reference = f"exp:{customer_id}:{until:%Y%m%d}" + ("" if sku == SKU_WHITE_BG else ":c")
+    # One reference per (customer, day, SKU): the ledger is unique on (reference_id, action), so two SKUs expiring the
+    # same day must not share one. White-background and Catalog Pack keep the references they always had.
+    reference = f"exp:{customer_id}:{until:%Y%m%d}" + {SKU_WHITE_BG: "", SKU_CREATIVE_V1_5: ":v15"}.get(sku, ":c")
     expired_before = (
         db.query(CustomerSkuCredit.reference_id)
         .filter(CustomerSkuCredit.customer_id == customer_id, CustomerSkuCredit.action == ACTION_EXPIRE,
@@ -269,6 +272,16 @@ async def run_expiry_forever() -> None:
             logger.error(f"SKU credit expiry pass failed: {type(e).__name__}: {e}")
 
 
+def _pack_value(sku: str, units: int, db: Session) -> int:
+    """What ``units`` SKUs of ``sku`` are worth at today's prices (rupees): used to split a refund when the payment's
+    own amount was not recorded."""
+    if sku == SKU_WHITE_BG:
+        return pricing.pack_total(units, db)
+    if sku == SKU_CREATIVE_V1_5:
+        return units * pricing.catalog_v1_5_pack_price()
+    return units * pricing.creative_pack_price()
+
+
 def claw_back_pack(
     db: Session,
     *,
@@ -294,7 +307,8 @@ def claw_back_pack(
         for row in db.query(CustomerSkuCredit.customer_id, CustomerSkuCredit.sku, CustomerSkuCredit.quantity)
         .filter(
             CustomerSkuCredit.action == ACTION_PURCHASE,
-            CustomerSkuCredit.reference_id.in_([purchase_reference(payment_id, s) for s in (SKU_WHITE_BG, SKU_CREATIVE)]),
+            CustomerSkuCredit.reference_id.in_(
+                [purchase_reference(payment_id, s) for s in (SKU_WHITE_BG, SKU_CREATIVE, SKU_CREATIVE_V1_5)]),
         )
         .all()
     ]
@@ -324,8 +338,7 @@ def claw_back_pack(
         except (TypeError, ValueError, AttributeError):
             paid = 0
         if paid <= 0:   # no record of what was paid: value it at today's prices
-            paid = sum(pricing.pack_total(units, db) if sku == SKU_WHITE_BG else units * pricing.creative_pack_price()
-                       for _cid, sku, units in purchases)
+            paid = sum(_pack_value(sku, units, db) for _cid, sku, units in purchases)
         earlier_refunds = [
             row[0]
             for row in db.query(AuditLog.resource_id)

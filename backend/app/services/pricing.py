@@ -14,13 +14,16 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import settings
-from app.models.sku_credit import PRICE_KEY_SKU, SKU_CREATIVE, SKU_WHITE_BG, PriceSetting
+from app.models.sku_credit import PRICE_KEY_SKU, SKU_CREATIVE, SKU_CREATIVE_V1_5, SKU_WHITE_BG, PriceSetting
 from app.utils.logger import logger
 
 # Retailer ids in the Meta catalogue (Commerce Manager). Studio Shot tiers ("studio_sku_20") buy white-background
 # SKUs; Catalog Pack tiers ("sku_pack_20") buy Catalog Pack SKUs. Each tier is a pack size from SKU_PACK_SIZES.
 STUDIO_RETAILER_PREFIX = "studio_sku_"
 CATALOG_RETAILER_PREFIX = "sku_pack_"
+# Catalog Pack v1.5 tiers ("sku_pack_v1_5_20") buy Catalog Pack v1.5 SKUs. The prefix is tried before "sku_pack_" (its
+# remainder, "v1_5_20", is not a number there, so the two never match the same id).
+CATALOG_V1_5_RETAILER_PREFIX = "sku_pack_v1_5_"
 # The first catalogue's Studio Shot ids ("pack_20"): still read in carts and list replies sent before the switch.
 PACK_RETAILER_PREFIX = "pack_"
 # Studio Shot tiers are catalogue items whose retailer id is the Meta "content id": pack size -> id. Lower case,
@@ -98,20 +101,25 @@ def catalog_retailer_id(units: int) -> str:
     return f"{CATALOG_RETAILER_PREFIX}{int(units)}"
 
 
+def catalog_v1_5_retailer_id(units: int) -> str:
+    """Catalog Pack v1.5 tier id in the catalogue: ``sku_pack_v1_5_20``."""
+    return f"{CATALOG_V1_5_RETAILER_PREFIX}{int(units)}"
+
+
 def _tier_units(text: str, prefix: str) -> Optional[int]:
     number = text[len(prefix):] if text.startswith(prefix) else ""
     return int(number) if number.isdigit() and is_pack_size(int(number)) else None
 
 
 def parse_retailer_id(retailer_id: Any) -> Optional[Tuple[str, int]]:
-    """A Studio Shot content id (``dnv3cpdm89``) or ``studio_sku_20`` -> (white_bg, 20), ``sku_pack_5`` -> (creative_pack, 5); None for anything else (or a size
+    """A Studio Shot content id (``dnv3cpdm89``) or ``studio_sku_20`` -> (white_bg, 20), ``sku_pack_5`` -> (creative_pack, 5), ``sku_pack_v1_5_5`` -> (creative_pack_v1_5, 5); None for anything else (or a size
     that is not a pack size). Prices are never taken from Meta: only the id is used."""
     text = str(retailer_id or "").strip().lower()
     content_units = _STUDIO_UNITS_BY_CONTENT_ID.get(text)
     if content_units and is_pack_size(content_units):
         return SKU_WHITE_BG, content_units
-    for prefix, sku in ((STUDIO_RETAILER_PREFIX, SKU_WHITE_BG), (CATALOG_RETAILER_PREFIX, SKU_CREATIVE),
-                        (PACK_RETAILER_PREFIX, SKU_WHITE_BG)):
+    for prefix, sku in ((STUDIO_RETAILER_PREFIX, SKU_WHITE_BG), (CATALOG_V1_5_RETAILER_PREFIX, SKU_CREATIVE_V1_5),
+                        (CATALOG_RETAILER_PREFIX, SKU_CREATIVE), (PACK_RETAILER_PREFIX, SKU_WHITE_BG)):
         units = _tier_units(text, prefix)
         if units:
             return sku, units
@@ -127,6 +135,7 @@ def units_for_retailer_id(retailer_id: Any) -> Optional[int]:
 # Catalog Pack (Ecomm Pack 1): one Catalog Pack SKU = one photo's full-style catalogue pack, sold in the same tiers.
 STUDIO_TITLE = "Studio Shot"
 CREATIVE_TITLE = "Catalog Pack"
+CATALOG_V1_5_TITLE = "Catalog Pack v1.5"
 MAX_CART_UNITS = 10000
 
 
@@ -135,14 +144,19 @@ def creative_pack_price() -> int:
     return max(int(settings.CATALOG_PACK_SKU_PRICE), 1)
 
 
+def catalog_v1_5_pack_price() -> int:
+    """One Catalog Pack v1.5 SKU (sku_pack_v1_5_N tiers cost N x this), GST included: CATALOG_V1_5_PACK_SKU_PRICE."""
+    return max(int(settings.CATALOG_V1_5_PACK_SKU_PRICE), 1)
+
+
 def quote_cart(items: Any, db: Any = None) -> Dict[str, Any]:
     """Price a WhatsApp catalogue cart on the server (Meta's prices are never used).
 
     ``items`` = [{"retailer_id", "quantity"}]. studio_sku_N items add N white-background SKUs per quantity,
-    sku_pack_N items add N Catalog Pack SKUs; unknown ids and quantities that are not positive whole numbers are
+    sku_pack_N items add N Catalog Pack SKUs, sku_pack_v1_5_N items add N Catalog Pack v1.5 SKUs; unknown ids and quantities that are not positive whole numbers are
     skipped, and each total is capped at MAX_CART_UNITS. Returns {"white_units", "creative_packs", "white_total", "creative_total",
-    "total", "lines": [{"retailer_id", "quantity"}]}."""
-    white = creative = 0
+    "v1_5_packs", "v1_5_total", "total", "lines": [{"retailer_id", "quantity"}]}."""
+    white = creative = v1_5 = 0
     lines: List[Dict[str, Any]] = []
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict):
@@ -159,14 +173,18 @@ def quote_cart(items: Any, db: Any = None) -> Dict[str, Any]:
         sku, size = parsed
         if sku == SKU_WHITE_BG:
             white += size * quantity
+        elif sku == SKU_CREATIVE_V1_5:
+            v1_5 += size * quantity
         else:
             creative += size * quantity
         lines.append({"retailer_id": retailer_id, "quantity": quantity})
-    white, creative = min(white, MAX_CART_UNITS), min(creative, MAX_CART_UNITS)
+    white, creative, v1_5 = min(white, MAX_CART_UNITS), min(creative, MAX_CART_UNITS), min(v1_5, MAX_CART_UNITS)
     white_total = pack_total(white, db) if white else 0
     creative_total = creative * creative_pack_price() if creative else 0
+    v1_5_total = v1_5 * catalog_v1_5_pack_price() if v1_5 else 0
     return {"white_units": white, "creative_packs": creative, "white_total": white_total,
-            "creative_total": creative_total, "total": white_total + creative_total, "lines": lines}
+            "creative_total": creative_total, "v1_5_packs": v1_5, "v1_5_total": v1_5_total,
+            "total": white_total + creative_total + v1_5_total, "lines": lines}
 
 
 def pack_title(units: int) -> str:
@@ -273,6 +291,19 @@ def catalogue_requests(unit_price: int, catalog_unit_price: Optional[int] = None
     ]
 
 
+def catalogue_requests_v1_5(unit_price: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Graph API batch requests that set every Catalog Pack v1.5 tier's catalogue price (paise, INR) by its retailer id
+    (default CATALOG_V1_5_PACK_SKU_PRICE). Kept apart from ``catalogue_requests`` so the two older collections' sync is
+    exactly as it was."""
+    unit = int(unit_price) if unit_price is not None else catalog_v1_5_pack_price()
+    return [
+        {"method": "UPDATE", "retailer_id": catalog_v1_5_retailer_id(size),
+         "data": {"price": size * unit * PAISE_PER_RUPEE, "currency": "INR",
+                  "name": f"{CATALOG_V1_5_TITLE} {pack_title(size)}"}}
+        for size in pack_sizes()
+    ]
+
+
 def push_catalogue_prices(unit_price: int, client: Any = None) -> bool:
     """Update the pack prices in the WhatsApp catalogue (META_CATALOG_ID). True when Meta accepted them; False when
     the catalogue is not configured or Meta refused (the caller tells the operator to change them by hand). Blocking."""
@@ -287,7 +318,7 @@ def push_catalogue_prices(unit_price: int, client: Any = None) -> bool:
         response = client.post(
             f"https://graph.facebook.com/v21.0/{catalog_id}/batch",
             headers={"Authorization": f"Bearer {token}"},
-            json={"requests": catalogue_requests(unit_price)},
+            json={"requests": catalogue_requests(unit_price) + catalogue_requests_v1_5()},
         )
     except httpx.HTTPError as e:
         logger.error(f"Catalogue price update failed ({type(e).__name__})")
@@ -307,9 +338,11 @@ def price_summary(db: Any = None) -> Dict[str, Any]:
     return {
         "sku_price": unit,
         "catalog_pack_sku_price": catalog_unit,
+        "catalog_v1_5_pack_sku_price": catalog_v1_5_pack_price(),
         "gst_percent": int(settings.SKU_GST_PERCENT),
         "packs": {size: size * unit for size in pack_sizes()},
         "catalog_packs": {size: size * catalog_unit for size in pack_sizes()},
+        "catalog_v1_5_packs": {size: size * catalog_v1_5_pack_price() for size in pack_sizes()},
         "menu_sizes": menu_pack_sizes(),
         "white_bg_price": white_bg_price(),
         "catalog_pack_price": catalog_pack_price(),

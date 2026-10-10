@@ -71,17 +71,20 @@ def _payment_context(payment_id: str, recipient_id: str) -> Dict[str, Any]:
     """(blocking) The customer id for this number and the SKUs this payment bought (0 and 0 for a wallet recharge)."""
     from app.database import SessionLocal
     from app.models.customer import Customer
-    from app.models.sku_credit import ACTION_PURCHASE, SKU_CREATIVE, SKU_WHITE_BG, CustomerSkuCredit
+    from app.models.sku_credit import (
+        ACTION_PURCHASE, SKU_CREATIVE, SKU_CREATIVE_V1_5, SKU_WHITE_BG, CustomerSkuCredit,
+    )
     from app.services.sku_packs import purchase_reference
 
     bought = {}
     with SessionLocal() as db:
-        for sku in (SKU_WHITE_BG, SKU_CREATIVE):
+        for sku in (SKU_WHITE_BG, SKU_CREATIVE, SKU_CREATIVE_V1_5):
             bought[sku] = int(db.query(CustomerSkuCredit.quantity).filter(
                 CustomerSkuCredit.reference_id == purchase_reference(payment_id, sku),
                 CustomerSkuCredit.action == ACTION_PURCHASE).scalar() or 0)
         customer_id = db.query(Customer.id).filter(Customer.whatsapp_id == recipient_id).scalar()
-    return {"customer_id": customer_id, "white": bought[SKU_WHITE_BG], "creative": bought[SKU_CREATIVE]}
+    return {"customer_id": customer_id, "white": bought[SKU_WHITE_BG], "creative": bought[SKU_CREATIVE],
+            "v1_5": bought[SKU_CREATIVE_V1_5]}
 
 
 def _pack_line(qty: int, total: int, description: str) -> Dict[str, Any]:
@@ -95,11 +98,41 @@ def _pack_line(qty: int, total: int, description: str) -> Dict[str, Any]:
     return line
 
 
-def pack_invoice_lines(white_units: int, creative_packs: int, amount: int) -> List[Dict[str, Any]]:
+def _pack_invoice_lines_with_v1_5(
+    white_units: int, creative_packs: int, v1_5_packs: int, amount: int,
+) -> List[Dict[str, Any]]:
+    """ERPNext lines for a pack payment that includes Catalog Pack v1.5 SKUs: one line per product bought (qty = SKUs),
+    Catalog Pack and v1.5 at their pack prices and the white-background SKUs at the rest, adding up exactly to
+    ``amount``. Never a negative line: if the pieces cannot be priced that way it is one line for the whole amount."""
+    from app.services.pricing import (
+        CATALOG_V1_5_TITLE, CREATIVE_TITLE, catalog_v1_5_pack_price, creative_pack_price, pack_title,
+    )
+
+    creative_total = creative_packs * creative_pack_price() if creative_packs else 0
+    v1_5_total = v1_5_packs * catalog_v1_5_pack_price()
+    white_total = amount - creative_total - v1_5_total
+    parts = []
+    if white_units:
+        parts.append((white_units, white_total, f"White-background SKUs ({pack_title(white_units)})"))
+    if creative_packs:
+        parts.append((creative_packs, creative_total, f"{CREATIVE_TITLE} SKUs ({pack_title(creative_packs)})"))
+    parts.append((v1_5_packs, v1_5_total, f"{CATALOG_V1_5_TITLE} SKUs ({pack_title(v1_5_packs)})"))
+    if any(total <= 0 for _qty, total, _label in parts):
+        return [_pack_line(1, amount, " + ".join(label for _qty, _total, label in parts))]
+    return [_pack_line(qty, total, label) for qty, total, label in parts]
+
+
+def pack_invoice_lines(
+    white_units: int, creative_packs: int, amount: int, v1_5_packs: int = 0,
+) -> List[Dict[str, Any]]:
     """ERPNext lines for a pack payment that add up exactly to ``amount``: white-background SKUs (qty = units, at the
     unit price actually paid) and Catalog Pack SKUs (qty = packs, at the creative pack price). The white unit
-    price is (amount - creative total) / units, so a price change between the order and the invoice never shows."""
+    price is (amount - creative total) / units, so a price change between the order and the invoice never shows.
+    Catalog Pack v1.5 SKUs, when bought, are one more line at their own price."""
     from app.services.pricing import CREATIVE_TITLE, creative_pack_price, pack_title
+
+    if v1_5_packs:
+        return _pack_invoice_lines_with_v1_5(white_units, creative_packs, v1_5_packs, amount)
 
     white_label = f"White-background SKUs ({pack_title(white_units)})"
     creative_label = f"{CREATIVE_TITLE} SKUs ({pack_title(creative_packs)})"
@@ -114,13 +147,15 @@ def pack_invoice_lines(white_units: int, creative_packs: int, amount: int) -> Li
     return lines
 
 
-def pack_description(white_units: int, creative_packs: int) -> str:
+def pack_description(white_units: int, creative_packs: int, v1_5_packs: int = 0) -> str:
     """What a pack payment bought, for the local receipt."""
-    from app.services.pricing import CREATIVE_TITLE, pack_title
+    from app.services.pricing import CATALOG_V1_5_TITLE, CREATIVE_TITLE, pack_title
 
     parts = [f"{pack_title(white_units)} (white background)"] if white_units else []
     if creative_packs:
         parts.append(f"{CREATIVE_TITLE} {pack_title(creative_packs)}")
+    if v1_5_packs:
+        parts.append(f"{CATALOG_V1_5_TITLE} {pack_title(v1_5_packs)}")
     return " + ".join(parts)
 
 
@@ -200,11 +235,12 @@ async def dispatch_payment_invoice(
     except Exception as e:  # noqa: BLE001 -- then billed as a wallet recharge and sent as a document, as before
         logger.warning(f"Payment {payment_id} lookup for the invoice failed ({type(e).__name__})")
         context = {"customer_id": None, "white": 0, "creative": 0}
-    is_pack = bool(context["white"] or context["creative"])
+    is_pack = bool(context["white"] or context["creative"] or context.get("v1_5"))
     if settings.ERPNEXT_INVOICE_ENABLED:
         result = None
         try:
-            extra = {"lines": pack_invoice_lines(context["white"], context["creative"], amount)} if is_pack else {}
+            extra = ({"lines": pack_invoice_lines(context["white"], context["creative"], amount,
+                                                  context.get("v1_5", 0))} if is_pack else {})
             result = await get_erpnext_service().create_paid_invoice_pdf(
                 whatsapp_id=recipient_id,
                 customer_name=billing_name(customer_snapshot, recipient_id),
@@ -241,7 +277,8 @@ async def dispatch_payment_invoice(
     try:
         inv_suffix = payment_id[-4:] if len(payment_id) >= 4 else "1042"
         inv_number = f"Invoice_MoraaStudio_{inv_suffix}"
-        extra = {"description": pack_description(context["white"], context["creative"])} if is_pack else {}
+        extra = ({"description": pack_description(context["white"], context["creative"], context.get("v1_5", 0))}
+                 if is_pack else {})
         # ReportLab rendering is CPU work: keep it off the event loop.
         pdf_bytes = await run_cpu(local_pdf_fn, customer_name=customer_name, invoice_number=inv_number, amount=amount,
                                   **extra)

@@ -352,7 +352,10 @@ async def _handle_order_run(payload: Dict[str, Any]) -> Any:
     made: a failed order is refunded by the worker, never retried here."""
     from app.services import meta_whatsapp_service as mws
 
-    worker = mws.process_whatsapp_white_bg if payload.get("worker") == "white" else mws.process_whatsapp_catalog_pack
+    worker = {
+        "white": mws.process_whatsapp_white_bg,
+        "pack_v1_5": mws.process_whatsapp_catalog_v1_5,
+    }.get(payload.get("worker"), mws.process_whatsapp_catalog_pack)
     try:
         await worker(payload["ingestion_id"])
     except asyncio.CancelledError:

@@ -20,6 +20,7 @@ from app.database import Base
 # Product codes stored on each paid ingestion. NULL (legacy rows written
 # before migration 0004) is treated as PRODUCT_PACK_1 everywhere.
 PRODUCT_PACK_1 = "PACK_1"
+PRODUCT_PACK_V1_5 = "PACK_V1_5"      # Catalog Pack v1.5: its own SKU credits, never the wallet
 PRODUCT_WHITE_BG = "WHITE_BG"
 
 # credit_source of an order paid by a SKU pack credit (Phase 8): its refund gives the credit back, never rupees.
@@ -133,7 +134,7 @@ class WhatsAppIngestion(Base):
     product_code: Mapped[str] = mapped_column(
         String(64),
         nullable=True,
-        comment="PACK_1 | WHITE_BG. NULL = legacy row, treated as PACK_1",
+        comment="PACK_1 | WHITE_BG | PACK_V1_5. NULL = legacy row, treated as PACK_1",
     )
     amount_charged: Mapped[int] = mapped_column(
         Integer,

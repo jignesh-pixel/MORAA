@@ -28,6 +28,7 @@ ACTION_CLAWBACK = "clawback"     # -n (Razorpay refund / dispute id): the payer 
 
 SKU_WHITE_BG = "white_bg"        # one white-background e-com shot
 SKU_CREATIVE = "creative_pack"   # one Catalog Pack SKU: the full-style photoshoot of one photo
+SKU_CREATIVE_V1_5 = "creative_pack_v1_5"   # one Catalog Pack v1.5 SKU: the 5-style photoshoot of one photo
 
 PRICE_KEY_SKU = "sku_unit"       # price_settings key for the price of one SKU (GST included)
 
