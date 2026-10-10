@@ -9,6 +9,7 @@ from app.services import pricing
 from app.services.sku_packs import MAX_PACK_UNITS, PURPOSE_SKU_PACK
 from app.utils.executors import run_io
 from app.utils.logger import logger, mask_phone
+from app.utils.http_clients import shared_http
 
 # Fallback link used only if the live Razorpay Payment Links API call fails
 # (e.g. credentials missing/invalid, transient API error) -- recharge must
@@ -55,9 +56,9 @@ async def _post_payment_link(payload: Dict[str, Any]) -> Optional[Dict[str, Any]
         return None
     timeout = float(settings.RAZORPAY_API_TIMEOUT_SECONDS or 10.0)
     try:
-        async with httpx.AsyncClient(
+        async with shared_http(
             timeout=httpx.Timeout(timeout, connect=min(timeout, 5.0)),
-            auth=httpx.BasicAuth(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET),
+            basic_auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET),
         ) as client:
             response = await client.post(RAZORPAY_PAYMENT_LINKS_URL, json=payload)
         if response.status_code not in (200, 201):

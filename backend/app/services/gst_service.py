@@ -163,7 +163,7 @@ class HttpGstProvider(GstProvider):
     name = "http"
 
     async def lookup(self, gstin: str) -> Any:
-        import httpx
+        from app.utils.http_clients import shared_http
 
         url_template = str(getattr(settings, "GST_API_URL", "") or "")
         if "{gstin}" not in url_template or not url_template.lower().startswith("https://"):
@@ -173,7 +173,7 @@ class HttpGstProvider(GstProvider):
         if key:
             headers[str(getattr(settings, "GST_API_KEY_HEADER", "x-api-key") or "x-api-key")] = key
         timeout = float(getattr(settings, "GST_API_TIMEOUT_SECONDS", 8.0) or 8.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with shared_http(timeout=timeout) as client:
             response = await client.get(url_template.replace("{gstin}", gstin), headers=headers)
         if response.status_code == 404:
             raise GstLookupNotFound("vendor reports no such GSTIN")

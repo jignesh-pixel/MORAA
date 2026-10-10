@@ -70,12 +70,14 @@ def main() -> int:
         return 2
     print(f"Catalogue {catalog_id}: {len(by_id)} products")
     bad = 0
-    collections = [(pricing.STUDIO_TITLE, pricing.pack_retailer_id),
-                   (pricing.CREATIVE_TITLE, pricing.catalog_retailer_id)]
+    sizes = pricing.menu_pack_sizes()
+    collections = [(pricing.STUDIO_TITLE, pricing.pack_retailer_id, sizes),
+                   (pricing.CREATIVE_TITLE, pricing.catalog_retailer_id, sizes)]
     if settings.CATALOG_V1_5_ENABLED:          # its tiers must exist in the catalogue before the menu shows them
-        collections.append((pricing.CATALOG_V1_5_TITLE, pricing.catalog_v1_5_retailer_id))
-    for title, make in collections:
-        for size in pricing.menu_pack_sizes():
+        collections.append((pricing.CATALOG_V1_5_TITLE, pricing.catalog_v1_5_retailer_id,
+                            pricing.v1_5_menu_pack_sizes()))
+    for title, make, tier_sizes in collections:
+        for size in tier_sizes:
             rid = make(size)
             product = by_id.get(rid)
             issue = ["MISSING from catalogue"] if product is None else problems(product)

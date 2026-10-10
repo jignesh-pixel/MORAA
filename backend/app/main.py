@@ -199,6 +199,12 @@ async def lifespan(app: FastAPI):
     # Everything imported and created so far lives for the whole life of the process. Freezing it keeps
     # Python's garbage collector from re-scanning it on every full collection, which paused the event loop for
     # 50-100 ms at a time under load (standard practice for long-running web servers).
+    # The shared outbound HTTP client (Meta, WhatsApp Pay, Razorpay, GST): its TLS context is built now, not on the
+    # first customer's message.
+    from app.utils.http_clients import warm_up
+
+    await warm_up()
+
     import gc
 
     gc.collect()
@@ -232,6 +238,12 @@ async def lifespan(app: FastAPI):
         await close_openai_client()
     except Exception as e:  # noqa: BLE001 -- shutdown must never fail on this
         logger.bind(category="system").warning(f"Provider client close skipped: {e}")
+    try:
+        from app.utils.http_clients import close_shared_clients
+
+        await close_shared_clients()          # Meta / WhatsApp Pay / Razorpay / GST connection pool
+    except Exception as e:  # noqa: BLE001 -- shutdown must never fail on this
+        logger.bind(category="system").warning(f"Shared HTTP client close skipped: {e}")
     try:
         from app.utils.executors import shutdown_executors
 

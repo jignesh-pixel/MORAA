@@ -32,7 +32,6 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-import httpx
 from sqlalchemy import and_, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -47,6 +46,7 @@ from app.services.wallet_service import credit_wallet, find_customer_by_phone, g
 from app.services.pending_payment_service import mark_pending_credited
 from app.utils.executors import run_io
 from app.utils.logger import logger, mask_phone
+from app.utils.http_clients import shared_http
 from app.utils.phone import normalize_phone
 _plog = logger.bind(category="payments")
 
@@ -509,7 +509,7 @@ async def lookup_payment(configuration_name: str, reference_id: str) -> Optional
         return None
     url = f"{GRAPH_BASE}/{settings.META_PHONE_NUMBER_ID}/payments/{configuration_name}/{reference_id}"
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with shared_http(timeout=20.0) as client:
             resp = await client.get(url, headers={"Authorization": f"Bearer {settings.META_WHATSAPP_TOKEN}"})
         if resp.status_code != 200:
             logger.error(f"WhatsApp Pay lookup failed: status={resp.status_code} body={resp.text[:500]}")

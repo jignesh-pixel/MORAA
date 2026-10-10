@@ -81,6 +81,12 @@ def menu_pack_sizes() -> List[int]:
     return [s for s in pack_sizes() if s != 1 or settings.ECOM_PACK1_ENABLED]
 
 
+def v1_5_menu_pack_sizes() -> List[int]:
+    """Pack sizes shown for Catalog Pack v1.5: every size, the 1-SKU tier included whatever ECOM_PACK1_ENABLED says (that
+    flag only governs the Studio Shot and Catalog Pack menus), so a customer can always buy a single 5-style SKU."""
+    return pack_sizes()
+
+
 def is_pack_size(units: Any) -> bool:
     return isinstance(units, int) and not isinstance(units, bool) and units in pack_sizes()
 

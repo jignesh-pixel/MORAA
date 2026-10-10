@@ -474,6 +474,11 @@ class Settings(BaseSettings):
     # 429 / 5xx answers and connection failures are retried this many times with jittered waits. A timed-out
     # SEND is never retried (it may already have been delivered).
     META_REQUEST_RETRIES: int = 2
+    # Shared outbound HTTP pool (app/utils/http_clients.py: Meta, WhatsApp Pay, Razorpay, GST). An idle connection is
+    # kept this long for the next call (httpx's own default, 5 s, drops it between most chat messages).
+    HTTP_KEEPALIVE_SECONDS: float = 60.0
+    HTTP_MAX_CONNECTIONS: int = 100
+    HTTP_MAX_KEEPALIVE_CONNECTIONS: int = 20
     META_RETRY_BACKOFF_BASE_SECONDS: float = 1.0
     META_RETRY_BACKOFF_CAP_SECONDS: float = 10.0
     # Razorpay API calls (payment-link creation) give up after this long; the static fallback link is used.

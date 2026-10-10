@@ -12,7 +12,6 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional
 
-import httpx
 from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -20,6 +19,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models.razorpay_payment_link import LINK_CREATED, LINK_EXPIRED, LINK_PAID, RazorpayPaymentLink
 from app.utils.logger import logger
+from app.utils.http_clients import shared_http
 
 RAZORPAY_LINKS_URL = "https://api.razorpay.com/v1/payment_links"
 # Links older than this are no longer asked about (a customer paying a 3-day-old link is far rarer than a
@@ -49,9 +49,9 @@ async def fetch_payment_link(link_id: str) -> Optional[Dict[str, Any]]:
     if not settings.RAZORPAY_KEY_ID or not settings.RAZORPAY_KEY_SECRET:
         return None
     try:
-        async with httpx.AsyncClient(
+        async with shared_http(
             timeout=LOOKUP_TIMEOUT_SECONDS,
-            auth=httpx.BasicAuth(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET),
+            basic_auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET),
         ) as client:
             resp = await client.get(f"{RAZORPAY_LINKS_URL}/{link_id}")
         if resp.status_code != 200:

@@ -223,9 +223,21 @@ class MenuTests(LedgerTestBase):
 
     def test_the_v1_5_collection_lists_only_its_own_tier_items(self):
         self.assertEqual(mws._collection_retailer_ids(mws.COLLECTION_CATALOG_V1_5),
-                         [f"sku_pack_v1_5_{n}" for n in pricing.menu_pack_sizes()])
+                         [f"sku_pack_v1_5_{n}" for n in (1, 5, 20, 50, 100)])
         self.assertTrue(all(i.startswith("sku_pack_") and "v1_5" not in i
                             for i in mws._collection_retailer_ids(mws.COLLECTION_CATALOG)))
+
+    def test_the_single_sku_tier_is_always_offered_for_v1_5_whatever_the_pack_1_flag_says(self):
+        for flag in (False, True):
+            with patch.object(settings, "ECOM_PACK1_ENABLED", flag):
+                v1_5 = mws._collection_retailer_ids(mws.COLLECTION_CATALOG_V1_5)
+                catalog = mws._collection_retailer_ids(mws.COLLECTION_CATALOG)
+                studio = mws._collection_retailer_ids(mws.COLLECTION_STUDIO)
+            self.assertEqual(v1_5[0], "sku_pack_v1_5_1", flag)
+            self.assertEqual(len(v1_5), 5, flag)
+            # the older collections keep following the flag, exactly as before
+            self.assertEqual("sku_pack_1" in catalog, flag)
+            self.assertEqual(len(studio), 5 if flag else 4)
 
     def test_picking_the_v1_5_collection_sends_a_product_list_titled_for_it(self):
         with patch.object(settings, "META_CATALOG_ID", "CAT1"), \

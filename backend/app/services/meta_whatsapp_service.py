@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from app.config import settings
+from app.utils.http_clients import shared_http
 from app.services import metrics
 from app.services import chat_log
 from app.services import pricing, sku_messages
@@ -372,7 +373,7 @@ async def get_media_url(media_id: str) -> Optional[str]:
     url = META_MEDIA_URL_TEMPLATE.format(media_id=media_id)
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with shared_http(timeout=30.0) as client:
             response = await _meta_request(
                 lambda: client.get(url, headers={"Authorization": f"Bearer {settings.META_WHATSAPP_TOKEN}"}),
                 "media lookup", idempotent=True,
@@ -418,7 +419,7 @@ async def download_media(media_url: str) -> Optional[Tuple[bytes, str]]:
     }
 
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+        async with shared_http(follow_redirects=True, timeout=60.0) as client:
             response = await _meta_request(
                 lambda: client.get(media_url, headers=headers), "media download", idempotent=True
             )
@@ -578,7 +579,7 @@ async def _post_message_payload(
     url = META_SEND_MESSAGE_URL.format(phone_number_id=settings.META_PHONE_NUMBER_ID)
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with shared_http(timeout=30.0) as client:
             response = await _meta_request(
                 lambda: client.post(
                     url,
@@ -898,7 +899,7 @@ def _collection_retailer_ids(collection_id: str) -> List[str]:
     if collection_id == COLLECTION_CATALOG:
         return [pricing.catalog_retailer_id(n) for n in pricing.menu_pack_sizes()]
     if collection_id == COLLECTION_CATALOG_V1_5:
-        return [pricing.catalog_v1_5_retailer_id(n) for n in pricing.menu_pack_sizes()]
+        return [pricing.catalog_v1_5_retailer_id(n) for n in pricing.v1_5_menu_pack_sizes()]
     return []
 
 
@@ -1088,7 +1089,7 @@ async def send_document_to_whatsapp(
     upload_url = META_MEDIA_UPLOAD_URL.format(phone_number_id=settings.META_PHONE_NUMBER_ID)
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with shared_http(timeout=60.0) as client:
             files = {"file": (filename, document_bytes, "application/pdf")}
             data = {"messaging_product": "whatsapp", "type": "application/pdf"}
             headers = {"Authorization": f"Bearer {settings.META_WHATSAPP_TOKEN}"}
@@ -1220,7 +1221,7 @@ async def upload_media_to_meta(
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with shared_http(timeout=60.0) as client:
                 response = await client.post(
                     url,
                     headers={"Authorization": f"Bearer {settings.META_WHATSAPP_TOKEN}"},
